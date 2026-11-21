@@ -1,0 +1,26 @@
+{
+  "name": "Borden Tempest",
+  "short_name": "Tempest",
+  "description": "Severe weather intelligence, high-res NEXRAD radar, storm cell Time-on-Target tracking, convective environment, and winter/ground-temp monitoring.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#090D16",
+  "theme_color": "#090D16",
+  "categories": ["weather", "utilities"],
+  "icons": [
+    {
+      "src": "./assets/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./assets/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

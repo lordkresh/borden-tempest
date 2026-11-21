@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Borden Tempest</title>
+  <meta name="description" content="Borden Tempest — Severe Weather Intelligence, High-Res NEXRAD Radar, Storm Cell Time-on-Target, Convective & Winter Suite." />
+
+  <!-- iOS Standalone PWA Meta Tags -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Borden Tempest" />
+  <meta name="theme-color" content="#090D16" />
+  <meta name="format-detection" content="telephone=no" />
+
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./assets/icons/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="./assets/icons/favicon.png" />
+  <link rel="icon" type="image/svg+xml" href="./assets/icons/icon.svg" />
+
+  <!-- MapLibre GL JS -->
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" defer></script>
+
+  <link rel="stylesheet" href="./css/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- Top Header Bar -->
+    <header class="top-bar" id="top-bar">
+      <div class="top-bar-left" id="location-picker-trigger" role="button" tabindex="0" aria-label="Change Location">
+        <img src="./assets/icons/icon.svg" alt="Borden Tempest" class="brand-mini-icon" />
+        <div class="location-title-wrap">
+          <div class="location-name-row">
+            <span id="header-location-name" class="header-location-name">Locating...</span>
+            <span class="chevron-down">▾</span>
+          </div>
+          <div id="header-status-sub" class="header-status-sub">Syncing NWS &amp; NEXRAD...</div>
+        </div>
+      </div>
+      <div class="top-bar-right">
+        <button id="btn-siren-stop" class="icon-pill-btn danger hidden" title="Silence Active Siren">
+          🔇 Stop
+        </button>
+        <button id="btn-gps" class="icon-btn" title="Use Current GPS Location" aria-label="Use GPS">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>
+        </button>
+        <button id="btn-refresh" class="icon-btn" title="Refresh All Feeds" aria-label="Refresh">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- OTA Update Banner (Hidden unless an update is available) -->
+    <div id="update-banner" class="update-banner hidden">
+      <div class="update-banner-text">
+        <strong id="update-banner-title">Update Available</strong>
+        <span id="update-banner-sub">Tap to install the latest Borden Tempest release.</span>
+      </div>
+      <button id="btn-install-update" class="btn-update-now">Update</button>
+    </div>
+
+    <!-- Main Tab Views -->
+    <main class="main-content" id="main-content">
+      <!-- TAB 1: DASHBOARD -->
+      <section id="tab-dashboard" class="tab-view active" aria-label="Dashboard">
+        <div id="ios-install-banner" class="ios-install-card hidden">
+          <div class="ios-install-head">
+            <span class="badge-cyan">iPhone Install</span>
+            <button id="btn-dismiss-ios-banner" class="text-btn-sm">Dismiss</button>
+          </div>
+          <p class="ios-install-copy">
+            Install <strong>Borden Tempest</strong> on your iPhone Home Screen (free, never expires, auto-updates):
+            tap <strong>Share</strong> <span class="share-glyph">⎋</span> in Safari, then tap <strong>Add to Home Screen</strong>.
+          </p>
+        </div>
+
+        <div id="dashboard-alert-strip" class="alert-strip hidden"></div>
+        <div id="dashboard-content" class="stack-gap">
+          <div class="card skeleton-card">
+            <div class="skeleton-line lg"></div>
+            <div class="skeleton-line md"></div>
+            <div class="skeleton-line sm"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: RADAR -->
+      <section id="tab-radar" class="tab-view radar-view" aria-label="Radar">
+        <div id="radar-map-container" class="radar-map-container"></div>
+
+        <!-- Radar Top Floating Controls -->
+        <div class="radar-top-overlay">
+          <div class="radar-chip-row" id="radar-product-chips">
+            <button class="radar-chip active" data-product="CONUS_MOSAIC">CONUS</button>
+            <button class="radar-chip" data-product="N0B">Refl N0B</button>
+            <button class="radar-chip" data-product="N0G">Vel N0G</button>
+            <button class="radar-chip" data-product="N0C">CC ρhv</button>
+            <button class="radar-chip" data-product="N0X">ZDR N0X</button>
+            <button class="radar-chip" data-product="EET">Tops EET</button>
+          </div>
+          <div class="radar-sub-row">
+            <button id="btn-radar-site" class="radar-pill-btn">
+              <span class="dot-live"></span>
+              <span id="radar-site-label">Site: Auto</span>
+            </button>
+            <button id="btn-radar-layers" class="radar-pill-btn">Layers</button>
+            <button id="btn-radar-recenter" class="radar-pill-btn" title="Recenter on Location">◎</button>
+          </div>
+        </div>
+
+        <!-- Radar Bottom Playback Controls -->
+        <div class="radar-bottom-overlay">
+          <div class="radar-legend-bar" id="radar-legend-bar"></div>
+          <div class="radar-controls-card">
+            <button id="btn-radar-play" class="radar-play-btn" aria-label="Play/Pause Radar">▶</button>
+            <div class="radar-scrubber-wrap">
+              <div class="radar-meta-row">
+                <span id="radar-frame-time" class="radar-frame-time">Loading radar...</span>
+                <span id="radar-feed-tag" class="radar-feed-tag">IEM High-Res</span>
+              </div>
+              <input type="range" id="radar-scrubber" min="0" max="9" value="9" class="radar-slider" />
+            </div>
+            <button id="btn-radar-speed" class="radar-speed-btn">1x</button>
+          </div>
+        </div>
+
+        <!-- Radar Layers Popover -->
+        <div id="radar-layers-sheet" class="floating-sheet hidden">
+          <div class="sheet-header">
+            <h3>Radar Layers &amp; Style</h3>
+            <button id="btn-close-layers" class="icon-btn-sm">✕</button>
+          </div>
+          <div class="sheet-body">
+            <label class="toggle-row">
+              <span>NWS Warning Polygons</span>
+              <input type="checkbox" id="layer-alerts" checked />
+            </label>
+            <label class="toggle-row">
+              <span>NEXRAD Storm Cells &amp; TOT Cones</span>
+              <input type="checkbox" id="layer-cells" checked />
+            </label>
+            <label class="toggle-row">
+              <span>SPC Day 1 Convective Outlook</span>
+              <input type="checkbox" id="layer-spc" checked />
+            </label>
+            <label class="toggle-row">
+              <span>SPC Mesoscale Discussions (MCD)</span>
+              <input type="checkbox" id="layer-mcd" checked />
+            </label>
+            <label class="toggle-row">
+              <span>Local Storm Reports (6h LSR)</span>
+              <input type="checkbox" id="layer-lsr" checked />
+            </label>
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Radar Opacity</span>
+                <span id="radar-opacity-val">78%</span>
+              </div>
+              <input type="range" id="radar-opacity-slider" min="25" max="100" value="78" />
+            </div>
+            <div class="segmented-row">
+              <button class="seg-btn active" data-basemap="dark">Dark Storm</button>
+              <button class="seg-btn" data-basemap="liberty">Daylight Map</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Radar Inspect Bottom Sheet (Alert or Storm Cell) -->
+        <div id="radar-inspect-sheet" class="floating-sheet hidden">
+          <div class="sheet-header">
+            <h3 id="inspect-title">Details</h3>
+            <button id="btn-close-inspect" class="icon-btn-sm">✕</button>
+          </div>
+          <div id="inspect-body" class="sheet-body"></div>
+        </div>
+      </section>
+
+      <!-- TAB 3: ALERTS & STORM INTEL -->
+      <section id="tab-alerts" class="tab-view" aria-label="Alerts">
+        <div id="alerts-content" class="stack-gap"></div>
+      </section>
+
+      <!-- TAB 4: SETTINGS & OTA UPDATER -->
+      <section id="tab-settings" class="tab-view" aria-label="Settings">
+        <div id="settings-content" class="stack-gap"></div>
+      </section>
+    </main>
+
+    <!-- Bottom iOS Tab Bar -->
+    <nav class="tab-bar" role="tablist" aria-label="Main Navigation">
+      <button class="tab-btn active" data-tab="dashboard" role="tab" aria-selected="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+        <span>Dashboard</span>
+      </button>
+      <button class="tab-btn" data-tab="radar" role="tab" aria-selected="false">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 12 19 7"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1"/></svg>
+        <span>Radar</span>
+      </button>
+      <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false">
+        <div class="tab-icon-wrap">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span id="alerts-badge" class="tab-badge hidden">0</span>
+        </div>
+        <span>Alerts</span>
+      </button>
+      <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>Settings</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Location Picker Modal -->
+  <div id="location-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Saved Locations">
+    <div class="modal-card">
+      <div class="sheet-header">
+        <h3>Locations</h3>
+        <button id="btn-close-location-modal" class="icon-btn-sm">✕</button>
+      </div>
+      <div class="modal-search-row">
+        <input type="text" id="location-search-input" placeholder="Search city, state, or ZIP..." autocomplete="off" />
+        <button id="btn-location-search" class="btn-primary-sm">Search</button>
+      </div>
+      <div id="location-search-results" class="search-results-list"></div>
+      <div class="section-mini-label">Saved Locations</div>
+      <div id="saved-locations-list" class="saved-locations-list"></div>
+    </div>
+  </div>
+
+  <!-- NEXRAD Site Picker Modal -->
+  <div id="site-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Select NEXRAD Radar Site">
+    <div class="modal-card">
+      <div class="sheet-header">
+        <h3>Select NEXRAD Site</h3>
+        <button id="btn-close-site-modal" class="icon-btn-sm">✕</button>
+      </div>
+      <div class="modal-search-row">
+        <input type="text" id="site-search-input" placeholder="Filter by code, city, or state (e.g. KGWX)..." autocomplete="off" />
+      </div>
+      <div id="site-list" class="saved-locations-list"></div>
+    </div>
+  </div>
+
+  <!-- Active Test / Live Alert Overlay Modal -->
+  <div id="alert-popup-modal" class="modal-backdrop hidden" role="alertdialog" aria-modal="true">
+    <div class="modal-card alert-popup-card" id="alert-popup-card">
+      <div class="alert-popup-badge" id="alert-popup-badge">CRITICAL ALERT</div>
+      <h2 id="alert-popup-title">Tornado Warning</h2>
+      <p id="alert-popup-body" class="alert-popup-body"></p>
+      <div class="alert-popup-actions">
+        <button id="btn-alert-popup-radar" class="btn-primary-sm">Open Radar</button>
+        <button id="btn-alert-popup-dismiss" class="btn-danger-sm">Silence &amp; Dismiss</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notification -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
