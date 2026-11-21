@@ -140,14 +140,13 @@ export async function fetchOpenMeteo(lat, lon) {
       'visibility',
       'wind_speed_10m',
       'wind_direction_10m',
-      'wind_speed_80m',
-      'wind_direction_80m',
-      'wind_speed_120m',
-      'wind_direction_120m',
-      'wind_speed_180m',
-      'wind_direction_180m',
+      'wind_speed_850hPa',
+      'wind_direction_850hPa',
+      'wind_speed_500hPa',
+      'wind_direction_500hPa',
       'wind_gusts_10m',
       'cape',
+      'convective_inhibition',
       'freezing_level_height',
       'soil_temperature_0cm',
       'soil_temperature_6cm'
@@ -190,8 +189,9 @@ export async function buildRadarFrames(productCode, siteId) {
     });
   }
 
-  // Single-site NEXRAD RIDGE via IEM (strip leading K for 3-char IEM radar code)
-  const site3 = (siteId || 'KGWX').replace(/^K/i, '').toUpperCase();
+  // Single-site NEXRAD RIDGE via IEM (strip leading K/P/T/R for 3-char IEM radar code)
+  const rawSite = (siteId || 'KGWX').toUpperCase();
+  const site3 = rawSite.length === 4 ? rawSite.slice(1) : rawSite;
   const startIso = new Date(now.getTime() - 75 * 60000).toISOString().slice(0, 16) + 'Z';
   const endIso = now.toISOString().slice(0, 16) + 'Z';
 

@@ -145,3 +145,47 @@ export function geometryCentroid(geometry) {
   }
   return { lon: sumLon / coords.length, lat: sumLat / coords.length };
 }
+
+function pointInRing(lon, lat, ring) {
+  if (!Array.isArray(ring) || ring.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < ((xj - xi) * (lat - yi)) / (yj - yi || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Accurate ray-casting check for whether (lat, lon) lies inside a GeoJSON Polygon or MultiPolygon.
+ */
+export function isPointInGeometry(lat, lon, geometry) {
+  if (!geometry) return false;
+  if (geometry.type === 'Polygon') {
+    const rings = geometry.coordinates || [];
+    if (!rings.length || !pointInRing(lon, lat, rings[0])) return false;
+    for (let h = 1; h < rings.length; h++) {
+      if (pointInRing(lon, lat, rings[h])) return false;
+    }
+    return true;
+  }
+  if (geometry.type === 'MultiPolygon') {
+    for (const poly of geometry.coordinates || []) {
+      if (poly.length && pointInRing(lon, lat, poly[0])) {
+        let inHole = false;
+        for (let h = 1; h < poly.length; h++) {
+          if (pointInRing(lon, lat, poly[h])) {
+            inHole = true;
+            break;
+          }
+        }
+        if (!inHole) return true;
+      }
+    }
+  }
+  return false;
+}
+

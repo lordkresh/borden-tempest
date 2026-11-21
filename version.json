@@ -1,7 +1,7 @@
 {
-  "versionCode": 2,
-  "versionName": "1.1.0",
+  "versionCode": 3,
+  "versionName": "1.2.0",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-21T13:00:00Z",
-  "releaseNotes": "Initial Borden Tempest iOS Companion PWA release: NWS NDFD multi-station accuracy consensus, MapLibre high-res CONUS & single-site NEXRAD RIDGE radar (N0B/N0G/N0C/N0X/EET), live Storm Cell Time-on-Target intercept vectors, SPC Outlooks & MCDs, Convective/HSLC & Full Winter/Ground Temp/Fog Suite, all 8 custom Tornado/Supercell/Severe sirens, and built-in OTA Auto-Updater."
+  "publishedAt": "2026-11-21T22:00:00Z",
+  "releaseNotes": "Severe Weather Engine Hardening (v1.2.0): True 850 hPa (0-1.5km) & 500 hPa (0-6km) upper-air bulk shear + CIN from NOAA HRRR/GFS, ray-casting Point-in-Polygon warning verification, PDS/Observed Tornado & Destructive Severe detection, full 5-tier live siren triggers with escalation re-alerting, Adaptive 45-second Storm Watch mode, iOS Screen Wake Lock, configurable TOT lead time (15-60 min) & convective sensitivity."
 }

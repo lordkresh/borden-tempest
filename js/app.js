@@ -21,21 +21,25 @@ import { RadarMapController } from './radarMap.js';
 import { SIREN_CATALOG, audioEngine } from './audio.js';
 import { APP_LOCAL_VERSION, updater } from './updater.js';
 
-const STORAGE_KEY_SETTINGS = 'borden_tempest_ios_settings_v1';
+const STORAGE_KEY_SETTINGS = 'borden_tempest_ios_settings_v2';
 const STORAGE_KEY_LOCATIONS = 'borden_tempest_ios_locations_v1';
+const STORAGE_KEY_NOTIFIED = 'borden_tempest_ios_notified_v2';
 
 const DEFAULT_SETTINGS = {
   tornadoSoundId: 'tornado_siren_eas',
+  adaptiveStormModeEnabled: true,
+  keepScreenAwakeInStorm: true,
+  severeWarningAlertsEnabled: true,
   convectiveAlertsEnabled: true,
+  convectiveAlertThreshold: 'STANDARD', // SENSITIVE | STANDARD | HIGH_ONLY
   proactiveTotAlertsEnabled: true,
+  proactiveTotLeadMinutes: 35,
   winterAlertsEnabled: true,
   nocturnalReadinessEnabled: true,
   groundFreezeThresholdF: 32,
   radarProduct: 'CONUS_MOSAIC',
   radarOpacity: 0.78,
-  basemap: 'dark',
-  autoRefreshMinutes: 3,
-  dismissedIosBanner: false
+  basemap: 'dark'
 };
 
 const DEFAULT_LOCATION = {
@@ -63,8 +67,10 @@ const state = {
   stormCells: [],
   iemIntel: null,
   activePlayingSoundId: null,
-  lastUpdateCheck: null,
-  notifiedAlertIds: new Set()
+  isStormWatchActive: false,
+  pollTimerId: null,
+  wakeLockSentinel: null,
+  notifiedMap: loadNotifiedMap()
 };
 
 state.activeLocation = state.savedLocations[0] || DEFAULT_LOCATION;
@@ -96,6 +102,34 @@ function loadJson(key, fallback) {
   }
 }
 
+function loadNotifiedMap() {
+  const map = loadJson(STORAGE_KEY_NOTIFIED, {});
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const pruned = {};
+  for (const [k, v] of Object.entries(map)) {
+    if (v && v.ts && v.ts > cutoff) pruned[k] = v;
+  }
+  return pruned;
+}
+
+function saveNotifiedMap() {
+  try {
+    localStorage.setItem(STORAGE_KEY_NOTIFIED, JSON.stringify(state.notifiedMap));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function hasBeenNotified(key, fingerprint = '1') {
+  const rec = state.notifiedMap[key];
+  return Boolean(rec && rec.fp === fingerprint);
+}
+
+function markNotified(key, fingerprint = '1') {
+  state.notifiedMap[key] = { fp: fingerprint, ts: Date.now() };
+  saveNotifiedMap();
+}
+
 function saveSettings() {
   localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(state.settings));
 }
@@ -121,16 +155,79 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+/* ==================== SCREEN WAKE LOCK ==================== */
+async function syncWakeLock() {
+  const wantAwake = state.settings.keepScreenAwakeInStorm && state.isStormWatchActive && !document.hidden;
+  if (!('wakeLock' in navigator)) return;
+
+  if (wantAwake && !state.wakeLockSentinel) {
+    try {
+      state.wakeLockSentinel = await navigator.wakeLock.request('screen');
+      state.wakeLockSentinel.addEventListener('release', () => {
+        state.wakeLockSentinel = null;
+      });
+    } catch {
+      // iOS may deny wake lock until user gesture; silently ignore
+    }
+  } else if (!wantAwake && state.wakeLockSentinel) {
+    try {
+      await state.wakeLockSentinel.release();
+    } catch {
+      // ignore
+    }
+    state.wakeLockSentinel = null;
+  }
+}
+
+/* ==================== ADAPTIVE POLLING ==================== */
+function evaluateStormWatchState() {
+  const hasCriticalOrSevere = state.localAlerts.some((a) => a.tier === 'CRITICAL' || a.tier === 'SEVERE' || a.tier === 'WATCH');
+  const hasApproachingThreat = state.stormCells.some((c) =>
+    (c.threatScore >= 2) &&
+    (c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS') &&
+    (c.intercept.etaMinutes == null || c.intercept.etaMinutes <= 60)
+  );
+  const highEnv = state.environment?.level === 'high';
+  state.isStormWatchActive = Boolean(hasCriticalOrSevere || hasApproachingThreat || highEnv);
+  scheduleNextPoll();
+  syncWakeLock();
+}
+
+function scheduleNextPoll() {
+  if (state.pollTimerId) clearTimeout(state.pollTimerId);
+  const intervalMs = (state.settings.adaptiveStormModeEnabled && state.isStormWatchActive)
+    ? 45000   // 45 seconds in Active Storm Watch
+    : 180000; // 3 minutes in normal weather
+
+  state.pollTimerId = setTimeout(() => {
+    if (!document.hidden) {
+      refreshAllData(true);
+    } else {
+      scheduleNextPoll();
+    }
+  }, intervalMs);
+}
+
 /* ==================== BOOTSTRAP ==================== */
 document.addEventListener('DOMContentLoaded', () => {
-  // Unlock Web Audio on first user touch for iOS Safari
   const unlockOnce = () => {
     audioEngine.unlockForIOS();
+    syncWakeLock();
     window.removeEventListener('touchstart', unlockOnce);
     window.removeEventListener('click', unlockOnce);
   };
   window.addEventListener('touchstart', unlockOnce, { passive: true });
   window.addEventListener('click', unlockOnce, { passive: true });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      syncWakeLock();
+      // Refresh immediately if returning after > 60s
+      if (!state.lastUpdated || Date.now() - state.lastUpdated.getTime() > 60000) {
+        refreshAllData(true);
+      }
+    }
+  });
 
   audioEngine.onStateChange = (playingId) => {
     state.activePlayingSoundId = playingId;
@@ -153,52 +250,43 @@ document.addEventListener('DOMContentLoaded', () => {
     if (state.tab === 'settings') renderSettings();
   });
 
-  // Auto-locate on first launch if no custom saved location yet, otherwise refresh active
   refreshAllData();
-
-  // Foreground active storm polling
-  setInterval(() => {
-    if (!document.hidden) refreshAllData(true);
-  }, (state.settings.autoRefreshMinutes || 3) * 60000);
 });
 
 function checkIosInstallBanner() {
   const el = document.getElementById('ios-install-banner');
   if (!el) return;
-  if (!updater.isStandalone() && !state.settings.dismissedIosBanner) {
+  const hiddenThisSession = sessionStorage.getItem('tempest_hide_ios_tip') === '1';
+  if (!updater.isStandalone() && !hiddenThisSession) {
     el.classList.remove('hidden');
   }
 }
 
 function wireEvents() {
-  // Tabs
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   });
 
-  // Top bar buttons
   document.getElementById('btn-refresh')?.addEventListener('click', () => refreshAllData(false));
   document.getElementById('btn-gps')?.addEventListener('click', requestGpsLocation);
   document.getElementById('btn-siren-stop')?.addEventListener('click', () => audioEngine.stop());
   document.getElementById('location-picker-trigger')?.addEventListener('click', openLocationModal);
 
-  // iOS banner dismiss & OTA update banner
+  // Session-only hide so users never permanently lose the Safari Home Screen tip before installing
   document.getElementById('btn-dismiss-ios-banner')?.addEventListener('click', () => {
-    state.settings.dismissedIosBanner = true;
-    saveSettings();
+    sessionStorage.setItem('tempest_hide_ios_tip', '1');
     document.getElementById('ios-install-banner')?.classList.add('hidden');
   });
+
   document.getElementById('btn-install-update')?.addEventListener('click', () => {
     showToast('Installing latest Borden Tempest update...');
     updater.applyUpdateNow();
   });
 
-  // Radar product chips
   document.querySelectorAll('#radar-product-chips .radar-chip').forEach((chip) => {
     chip.addEventListener('click', () => selectRadarProduct(chip.dataset.product));
   });
 
-  // Radar buttons
   document.getElementById('btn-radar-play')?.addEventListener('click', () => {
     const playing = radarMap.togglePlayback();
     document.getElementById('btn-radar-play').textContent = playing ? '⏸' : '▶';
@@ -227,14 +315,12 @@ function wireEvents() {
     document.getElementById('radar-inspect-sheet')?.classList.add('hidden');
   });
 
-  // Radar layer toggles
   ['alerts', 'cells', 'spc', 'mcd', 'lsr'].forEach((key) => {
     document.getElementById(`layer-${key}`)?.addEventListener('change', (e) => {
       radarMap.setLayerVisibility(key, e.target.checked);
     });
   });
 
-  // Opacity slider & basemap toggle
   const opSlider = document.getElementById('radar-opacity-slider');
   if (opSlider) {
     opSlider.value = Math.round(state.settings.radarOpacity * 100);
@@ -258,7 +344,6 @@ function wireEvents() {
     });
   });
 
-  // Location modal
   document.getElementById('btn-close-location-modal')?.addEventListener('click', closeLocationModal);
   document.getElementById('location-modal')?.addEventListener('click', (e) => {
     if (e.target.id === 'location-modal') closeLocationModal();
@@ -268,7 +353,6 @@ function wireEvents() {
     if (e.key === 'Enter') runLocationSearch();
   });
 
-  // Site modal
   document.getElementById('btn-close-site-modal')?.addEventListener('click', () => {
     document.getElementById('site-modal')?.classList.add('hidden');
   });
@@ -277,7 +361,6 @@ function wireEvents() {
   });
   document.getElementById('site-search-input')?.addEventListener('input', renderSiteList);
 
-  // Alert popup modal
   document.getElementById('btn-alert-popup-dismiss')?.addEventListener('click', () => {
     audioEngine.stop();
     document.getElementById('alert-popup-modal')?.classList.add('hidden');
@@ -325,7 +408,9 @@ async function refreshAllData(silent = false) {
   }
 
   document.getElementById('header-location-name').textContent = state.activeLocation.name;
-  document.getElementById('header-status-sub').textContent = 'Syncing NWS, Open-Meteo & NEXRAD...';
+  if (!silent) {
+    document.getElementById('header-status-sub').textContent = 'Syncing NWS, HRRR/GFS & NEXRAD...';
+  }
 
   try {
     const [nwsRes, omRes, iemRes] = await Promise.allSettled([
@@ -334,9 +419,9 @@ async function refreshAllData(silent = false) {
       fetchIemStormIntel()
     ]);
 
-    state.nwsBundle = nwsRes.status === 'fulfilled' ? nwsRes.value : null;
-    state.openMeteo = omRes.status === 'fulfilled' ? omRes.value : null;
-    state.iemIntel = iemRes.status === 'fulfilled' ? iemRes.value : null;
+    state.nwsBundle = nwsRes.status === 'fulfilled' ? nwsRes.value : state.nwsBundle;
+    state.openMeteo = omRes.status === 'fulfilled' ? omRes.value : state.openMeteo;
+    state.iemIntel = iemRes.status === 'fulfilled' ? iemRes.value : state.iemIntel;
 
     if (state.nwsBundle?.cityLabel && state.activeLocation.id === 'gps_current') {
       state.activeLocation.name = `${state.nwsBundle.cityLabel} (GPS)`;
@@ -347,22 +432,39 @@ async function refreshAllData(silent = false) {
       regionalFeatures: []
     }));
 
-    state.localAlerts = (alertsRes.localFeatures || []).map(classifyNwsAlert).sort((a, b) => b.rank - a.rank);
-    state.regionalAlerts = (alertsRes.regionalFeatures || []).map(classifyNwsAlert).sort((a, b) => b.rank - a.rank);
+    const sortAlerts = (a, b) => {
+      if (b.rank !== a.rank) return b.rank - a.rank;
+      const aIn = a.insidePolygon === true ? 1 : 0;
+      const bIn = b.insidePolygon === true ? 1 : 0;
+      return bIn - aIn;
+    };
+
+    state.localAlerts = (alertsRes.localFeatures || [])
+      .map((f) => classifyNwsAlert(f, lat, lon))
+      .filter((a) => !a.isExpired)
+      .sort(sortAlerts);
+
+    state.regionalAlerts = (alertsRes.regionalFeatures || [])
+      .map((f) => classifyNwsAlert(f, lat, lon))
+      .filter((a) => !a.isExpired)
+      .sort(sortAlerts);
 
     state.current = resolveCurrentConditions(state.nwsBundle, state.openMeteo);
     const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
-    state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount);
+    state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+      convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
+      nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled
+    });
     state.winter = analyzeWinterSuite(state.openMeteo, state.current, state.settings.groundFreezeThresholdF);
     state.stormCells = analyzeStormCells(state.iemIntel?.stormCellsGeoJson, lat, lon, 120);
     state.lastUpdated = new Date();
 
+    evaluateStormWatchState();
     updateHeaderAndBadges();
     renderDashboard();
     renderAlerts();
     if (state.tab === 'settings') renderSettings();
 
-    // Update Radar overlays if initialized
     radarMap.setOverlayData({
       alerts: state.regionalAlerts,
       stormCells: state.stormCells,
@@ -375,11 +477,12 @@ async function refreshAllData(silent = false) {
       loadRadarFramesForCurrentProduct();
     }
 
-    checkForLiveCriticalTriggers();
-    if (!silent) showToast('Weather, radar & storm intel updated');
+    checkAllLiveAlertTriggers();
+    if (!silent) showToast('Weather, radar & severe intel updated');
   } catch (err) {
     document.getElementById('header-status-sub').textContent = 'Offline or partial feed — tap refresh';
     if (!silent) showToast(`Sync error: ${err.message || 'Check connection'}`);
+    scheduleNextPoll();
   } finally {
     state.isLoading = false;
     refBtn?.classList.remove('spinning');
@@ -390,10 +493,16 @@ function updateHeaderAndBadges() {
   document.getElementById('header-location-name').textContent = state.activeLocation.name;
   const clock = state.lastUpdated ? state.lastUpdated.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '--';
   const site = state.selectedRadarSite || findNearestNexradStation(state.activeLocation.lat, state.activeLocation.lon).id;
-  document.getElementById('header-status-sub').textContent = `Updated ${clock} • Radar ${site} • v${APP_LOCAL_VERSION.versionName}`;
+  const watchTag = (state.settings.adaptiveStormModeEnabled && state.isStormWatchActive) ? '⚡ STORM WATCH (45s) • ' : '';
+  document.getElementById('header-status-sub').textContent = `${watchTag}Updated ${clock} • Radar ${site} • v${APP_LOCAL_VERSION.versionName}`;
 
-  const directCells = state.stormCells.filter((c) => c.intercept.verdict === 'DIRECT_INTERCEPT' || c.tvs);
-  const totalCount = state.localAlerts.length + directCells.length +
+  const leadMin = state.settings.proactiveTotLeadMinutes || 35;
+  const threatCells = state.stormCells.filter((c) =>
+    c.tvs ||
+    ((c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS') &&
+      c.intercept.etaMinutes != null && c.intercept.etaMinutes <= leadMin)
+  );
+  const totalCount = state.localAlerts.length + threatCells.length +
     (state.winter?.winterAlerts?.length || 0) +
     (state.environment?.proactiveAlerts?.length || 0);
 
@@ -404,16 +513,116 @@ function updateHeaderAndBadges() {
   }
 }
 
-function checkForLiveCriticalTriggers() {
+/**
+ * Full 5-Tier Severe Weather Trigger Engine — honors every Settings toggle,
+ * deduplicates persistently in localStorage, and re-triggers immediately on escalations.
+ */
+function checkAllLiveAlertTriggers() {
+  const s = state.settings;
+
+  // 1. CRITICAL NWS Alerts (Tornado Warning, Tornado Emergency, Flash Flood Emergency) — ALWAYS active
   const topCritical = state.localAlerts.find((a) => a.tier === 'CRITICAL');
-  if (topCritical && !state.notifiedAlertIds.has(topCritical.id)) {
-    state.notifiedAlertIds.add(topCritical.id);
+  if (topCritical && !hasBeenNotified(`nws_${topCritical.id}`, topCritical.escalationFingerprint)) {
+    markNotified(`nws_${topCritical.id}`, topCritical.escalationFingerprint);
+    const badge = topCritical.isTornadoEmergency
+      ? 'TORNADO EMERGENCY'
+      : topCritical.isPdsOrObserved
+        ? 'OBSERVED / PDS TORNADO'
+        : 'CRITICAL WARNING';
+    const tags = [
+      topCritical.insidePolygon === true ? 'YOU ARE INSIDE THE WARNING POLYGON' : null,
+      topCritical.tornadoDetection ? `Tornado: ${topCritical.tornadoDetection}` : null,
+      topCritical.tornadoDamageThreat ? `Threat: ${topCritical.tornadoDamageThreat}` : null,
+      topCritical.maxWindGust ? `Wind: ${topCritical.maxWindGust}` : null,
+      topCritical.maxHailSize ? `Hail: ${topCritical.maxHailSize}"` : null
+    ].filter(Boolean).join(' • ');
+
     triggerAlertPopup({
-      badge: topCritical.isTornadoEmergency ? 'TORNADO EMERGENCY' : 'CRITICAL WARNING',
+      badge,
       title: topCritical.event,
-      body: `${topCritical.headline}\n\n${topCritical.instruction || topCritical.areaDesc}`,
-      soundId: state.settings.tornadoSoundId
+      body: `${tags ? tags + '\n\n' : ''}${topCritical.headline}\n\n${topCritical.instruction || topCritical.areaDesc}`,
+      soundId: s.tornadoSoundId,
+      loop: topCritical.isTornadoEmergency || topCritical.isPdsOrObserved
     });
+    return;
+  }
+
+  // 2. SEVERE NWS Alerts (Severe Thunderstorm Warning, Flash Flood Warning, Snow Squall Warning)
+  if (s.severeWarningAlertsEnabled) {
+    const topSevere = state.localAlerts.find((a) => a.tier === 'SEVERE');
+    if (topSevere && !hasBeenNotified(`nws_${topSevere.id}`, topSevere.escalationFingerprint)) {
+      markNotified(`nws_${topSevere.id}`, topSevere.escalationFingerprint);
+      const badge = topSevere.isDestructiveSevere ? 'DESTRUCTIVE SEVERE WARNING' : 'SEVERE WARNING';
+      triggerAlertPopup({
+        badge,
+        title: topSevere.event,
+        body: `${topSevere.insidePolygon === true ? 'INSIDE WARNING POLYGON\n' : ''}${topSevere.headline}\n\n${topSevere.instruction || topSevere.areaDesc}`,
+        soundId: 'svr_tstorm_alarm',
+        loop: false
+      });
+      return;
+    }
+  }
+
+  // 3. Proactive NEXRAD Storm Cell Time-on-Target (TOT) Intercept
+  if (s.proactiveTotAlertsEnabled) {
+    const leadMin = s.proactiveTotLeadMinutes || 35;
+    const incoming = state.stormCells.find((c) =>
+      c.threatScore >= 2 &&
+      (c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS') &&
+      c.intercept.etaMinutes != null &&
+      c.intercept.etaMinutes <= leadMin
+    );
+    if (incoming) {
+      const fp = `${incoming.threatLevel}_${incoming.intercept.verdict}`;
+      if (!hasBeenNotified(`cell_${incoming.id}`, fp)) {
+        markNotified(`cell_${incoming.id}`, fp);
+        const isRot = incoming.threatLevel === 'TORNADO_TVS' || incoming.threatLevel === 'SUPERCELL';
+        triggerAlertPopup({
+          badge: incoming.tvs ? 'TVS STORM INTERCEPT' : isRot ? 'ROTATING SUPERCELL TOT' : 'APPROACHING SEVERE CELL',
+          title: `Cell ${incoming.stormId} • ETA ~${incoming.intercept.etaMinutes} min`,
+          body: `${incoming.intercept.distanceMi.toFixed(1)} mi ${incoming.intercept.compassFromUser} moving ${incoming.moveToCompass} @ ${incoming.speedMph} mph\n${incoming.intercept.verdictLabel}${incoming.maxHailIn ? ` • Hail ${incoming.maxHailIn}"` : ''}\n\nProactive Borden Tempest radar-cell tracking — open Radar to verify Velocity (N0G) & CC Debris (N0C).`,
+          soundId: isRot ? 'supercell_alert_alarm' : 'storm_tot_ping',
+          loop: false
+        });
+        return;
+      }
+    }
+  }
+
+  // 4. Convective / HSLC / Nocturnal Environment Alerts
+  if (s.convectiveAlertsEnabled && state.environment?.proactiveAlerts?.length) {
+    const ca = state.environment.proactiveAlerts[0];
+    const hourBucket = new Date().toISOString().slice(0, 13); // dedupe per 1-hour window per regime
+    if (!hasBeenNotified(`env_${ca.id}`, hourBucket)) {
+      markNotified(`env_${ca.id}`, hourBucket);
+      triggerAlertPopup({
+        badge: state.environment.nocturnalEscalated ? 'NOCTURNAL READINESS' : 'CONVECTIVE ENVIRONMENT',
+        title: ca.title,
+        body: `${ca.summary}\n\n${state.environment.nocturnalRisk}`,
+        soundId: 'convective_chime',
+        loop: false
+      });
+      return;
+    }
+  }
+
+  // 5. Winter / Black Ice / Freezing Fog Alerts
+  if (s.winterAlertsEnabled && state.winter?.winterAlerts?.length) {
+    const wa = state.winter.winterAlerts.find((w) => w.severity === 'high') || state.winter.winterAlerts[0];
+    if (wa && wa.severity === 'high') {
+      const hourBucket = new Date().toISOString().slice(0, 13);
+      if (!hasBeenNotified(`win_${wa.id}`, hourBucket)) {
+        markNotified(`win_${wa.id}`, hourBucket);
+        triggerAlertPopup({
+          badge: 'WINTER SURFACE HAZARD',
+          title: wa.title,
+          body: wa.summary,
+          soundId: 'winter_alert_chime',
+          loop: false
+        });
+      }
+    }
   }
 }
 
@@ -495,6 +704,7 @@ function openInspectSheet(type, item) {
         ${item.tvs ? `<span class="badge-red">TVS: ${escapeHtml(item.tvs)}</span>` : ''}
         ${item.meso ? `<span class="badge-magenta">MESO: ${escapeHtml(item.meso)}</span>` : ''}
         ${item.maxHailIn > 0 ? `<span class="badge-amber">Hail ${item.maxHailIn}"</span>` : ''}
+        ${item.maxDbz ? `<span class="badge-muted">${item.maxDbz} dBZ</span>` : ''}
       </div>
       <div class="alert-meta">
         <strong>Position:</strong> ${item.intercept.distanceMi.toFixed(1)} mi ${item.intercept.compassFromUser} moving ${item.moveToCompass} @ ${item.speedMph} mph<br/>
@@ -506,14 +716,16 @@ function openInspectSheet(type, item) {
     titleEl.textContent = item.event;
     bodyEl.innerHTML = `
       <div class="tag-row">
-        <span class="badge-${item.tier === 'CRITICAL' ? 'red' : item.tier === 'WINTER' ? 'blue' : 'amber'}">${item.tier}</span>
+        <span class="badge-${item.tier === 'CRITICAL' ? 'red' : item.tier === 'WINTER' ? 'blue' : 'amber'}">${item.isTornadoEmergency ? 'TORNADO EMERGENCY' : item.tier}</span>
+        ${item.insidePolygon === true ? `<span class="badge-red">INSIDE POLYGON</span>` : ''}
         ${item.tornadoDetection ? `<span class="badge-red">Tornado: ${escapeHtml(item.tornadoDetection)}</span>` : ''}
+        ${item.tornadoDamageThreat ? `<span class="badge-red">Damage: ${escapeHtml(item.tornadoDamageThreat)}</span>` : ''}
         ${item.maxWindGust ? `<span class="badge-amber">Wind: ${escapeHtml(item.maxWindGust)}</span>` : ''}
         ${item.maxHailSize ? `<span class="badge-amber">Hail: ${escapeHtml(item.maxHailSize)}"</span>` : ''}
       </div>
       <div class="alert-meta">
         <strong>${escapeHtml(item.headline)}</strong><br/><br/>
-        ${escapeHtml((item.instruction || item.description || '').slice(0, 500))}
+        ${escapeHtml((item.instruction || item.description || '').slice(0, 520))}
       </div>
     `;
   }
@@ -530,17 +742,21 @@ function renderDashboard() {
   const env = state.environment;
   const win = state.winter;
 
-  // Top Alert Banner Strip
   const topAlert = state.localAlerts[0];
   const topThreatCell = state.stormCells.find((sc) => sc.intercept.verdict === 'DIRECT_INTERCEPT' || sc.tvs);
 
   if (topAlert) {
     strip.className = `alert-strip ${topAlert.tier === 'CRITICAL' ? 'critical' : topAlert.tier === 'WINTER' ? 'winter' : 'severe'}`;
+    const label = topAlert.isTornadoEmergency
+      ? 'TORNADO EMERGENCY'
+      : topAlert.insidePolygon === true
+        ? `INSIDE ${topAlert.tier} POLYGON`
+        : `ACTIVE NWS ${topAlert.tier}`;
     strip.innerHTML = `
       <div>
-        <div style="font-size:11px;font-weight:800;letter-spacing:.06em;opacity:.9;">ACTIVE NWS ${escapeHtml(topAlert.tier)}</div>
+        <div style="font-size:11px;font-weight:800;letter-spacing:.06em;opacity:.92;">${escapeHtml(label)}</div>
         <div style="font-size:15px;font-weight:800;margin-top:2px;">${escapeHtml(topAlert.event)}</div>
-        <div style="font-size:12px;opacity:.88;margin-top:2px;">${state.localAlerts.length} local alert${state.localAlerts.length > 1 ? 's' : ''} — tap to inspect</div>
+        <div style="font-size:12px;opacity:.88;margin-top:2px;">${state.localAlerts.length} active local alert${state.localAlerts.length > 1 ? 's' : ''} — tap to inspect</div>
       </div>
       <span style="font-size:18px;font-weight:800;">›</span>
     `;
@@ -563,10 +779,8 @@ function renderDashboard() {
     strip.className = 'alert-strip hidden';
   }
 
-  // Build Hourly Cards (prefer NWS hourly, fallback to Open-Meteo)
   const hourlyItems = buildHourlyItems();
   const dailyItems = (state.nwsBundle?.forecastPeriods || []).slice(0, 10);
-
   const pTrendSign = c.pressureTrend3h > 0 ? '+' : '';
   const nearestRadar = findNearestNexradStation(state.activeLocation.lat, state.activeLocation.lon);
 
@@ -610,7 +824,7 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT -->
+    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (TRUE 850hPa & 500hPa UPPER-AIR SHEAR) -->
     <div class="card">
       <div class="card-header">
         <div class="card-title">⚡ Convective &amp; Supercell Environment</div>
@@ -619,21 +833,26 @@ function renderDashboard() {
       <div class="regime-banner ${env.level}">
         ${escapeHtml(env.nocturnalRisk)}
       </div>
-      <div class="metrics-grid">
+      <div class="metrics-grid cols-2">
         <div class="metric-box">
           <div class="metric-label">CAPE (12h Peak)</div>
           <div class="metric-value">${env.peakCape12h} J/kg</div>
-          <div class="metric-sub">Now: ${env.capeNow} J/kg</div>
+          <div class="metric-sub">Now: ${env.capeNow} • CIN ${env.cinNow}</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">0–6km Deep Shear</div>
+          <div class="metric-value">${env.bulkShear0to6KmKt} kt</div>
+          <div class="metric-sub">12h Peak: ${env.peakBulkShearKt} kt (500 hPa)</div>
         </div>
         <div class="metric-box">
           <div class="metric-label">0–1.5km Shear</div>
           <div class="metric-value">${env.lowLevelShearKt} kt</div>
-          <div class="metric-sub">${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veering</div>
+          <div class="metric-sub">${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer (850 hPa)</div>
         </div>
         <div class="metric-box">
           <div class="metric-label">Storm Cells (120m)</div>
           <div class="metric-value">${state.stormCells.length}</div>
-          <div class="metric-sub">${state.stormCells.filter((x) => x.tvs || x.meso).length} rotating</div>
+          <div class="metric-sub">${state.stormCells.filter((x) => x.tvs || x.meso).length} rotating • ${state.isStormWatchActive ? '45s Watch' : '3m Poll'}</div>
         </div>
       </div>
     </div>
@@ -665,7 +884,7 @@ function renderDashboard() {
     <div class="card">
       <div class="card-header">
         <div class="card-title">🕒 Next 18 Hours</div>
-        <span class="badge-muted">NWS / Open-Meteo</span>
+        <span class="badge-muted">NWS NDFD / HRRR-GFS</span>
       </div>
       <div class="hourly-strip">
         ${hourlyItems.map((h) => `
@@ -683,7 +902,7 @@ function renderDashboard() {
     ${dailyItems.length ? `
       <div class="card">
         <div class="card-header">
-          <div class="card-title">📅 NWS 7-Day Forecast</div>
+          <div class="card-title">📅 NWS 7-Day Forecast (NBM + WFO)</div>
           <span class="badge-muted">${escapeHtml(state.nwsBundle?.cwa || 'NWS')}</span>
         </div>
         ${dailyItems.map((p) => `
@@ -751,7 +970,6 @@ function renderAlerts() {
 
   const parts = [];
 
-  // 1. Official NWS Local Alerts
   if (localAlerts.length) {
     parts.push(`<div class="section-mini-label">Active Local NWS Alerts (${localAlerts.length})</div>`);
     for (const a of localAlerts) {
@@ -759,17 +977,20 @@ function renderAlerts() {
       parts.push(`
         <div class="card alert-card ${cls}">
           <div class="card-header" style="margin-bottom:4px;">
-            <span class="badge-${a.tier === 'CRITICAL' ? 'red' : a.tier === 'WINTER' ? 'blue' : 'amber'}">${a.isTornadoEmergency ? 'TORNADO EMERGENCY' : a.tier}</span>
+            <span class="badge-${a.tier === 'CRITICAL' ? 'red' : a.tier === 'WINTER' ? 'blue' : 'amber'}">${a.isTornadoEmergency ? 'TORNADO EMERGENCY' : a.isPdsOrObserved ? 'OBSERVED / PDS' : a.tier}</span>
             <span class="metric-sub">${a.expires ? `Exp ${new Date(a.expires).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : ''}</span>
           </div>
           <div class="alert-title">${escapeHtml(a.event)}</div>
           <div class="alert-meta">${escapeHtml(a.headline)}</div>
           <div class="tag-row">
+            ${a.insidePolygon === true ? `<span class="badge-red">INSIDE POLYGON</span>` : a.insidePolygon === false ? `<span class="badge-muted">Zone / Nearby</span>` : ''}
             ${a.tornadoDetection ? `<span class="badge-red">Tornado: ${escapeHtml(a.tornadoDetection)}</span>` : ''}
+            ${a.tornadoDamageThreat ? `<span class="badge-red">Damage: ${escapeHtml(a.tornadoDamageThreat)}</span>` : ''}
+            ${a.thunderstormDamageThreat ? `<span class="badge-red">Svr: ${escapeHtml(a.thunderstormDamageThreat)}</span>` : ''}
             ${a.maxWindGust ? `<span class="badge-amber">Wind: ${escapeHtml(a.maxWindGust)}</span>` : ''}
             ${a.maxHailSize ? `<span class="badge-amber">Hail: ${escapeHtml(a.maxHailSize)}"</span>` : ''}
           </div>
-          ${a.instruction ? `<div class="alert-meta" style="margin-top:8px;color:var(--text-primary);">${escapeHtml(a.instruction.slice(0, 320))}</div>` : ''}
+          ${a.instruction ? `<div class="alert-meta" style="margin-top:8px;color:var(--text-primary);">${escapeHtml(a.instruction.slice(0, 340))}</div>` : ''}
           <div class="card-action-row">
             <button class="btn-primary-sm" data-focus-alert="${escapeHtml(a.id)}">View on Radar</button>
           </div>
@@ -778,7 +999,6 @@ function renderAlerts() {
     }
   }
 
-  // 2. Proactive Convective & Winter Alerts
   if (convAlerts.length || winAlerts.length) {
     parts.push(`<div class="section-mini-label">Borden Tempest Proactive Intelligence</div>`);
     for (const ca of convAlerts) {
@@ -801,7 +1021,6 @@ function renderAlerts() {
     }
   }
 
-  // 3. Tracked NEXRAD Storm Cells (Time-on-Target)
   if (cells.length) {
     parts.push(`<div class="section-mini-label">Tracked NEXRAD Storm Cells Within 120 mi (${cells.length})</div>`);
     for (const sc of cells.slice(0, 12)) {
@@ -822,6 +1041,7 @@ function renderAlerts() {
             ${sc.tvs ? `<span class="badge-red">TVS</span>` : ''}
             ${sc.meso ? `<span class="badge-magenta">MESO ${escapeHtml(sc.meso)}</span>` : ''}
             ${sc.maxHailIn > 0 ? `<span class="badge-amber">Hail ${sc.maxHailIn}"</span>` : ''}
+            ${sc.maxDbz ? `<span class="badge-muted">${sc.maxDbz} dBZ</span>` : ''}
             ${sc.topKft ? `<span class="badge-muted">Top ${sc.topKft} kft</span>` : ''}
           </div>
           <div class="card-action-row">
@@ -832,7 +1052,6 @@ function renderAlerts() {
     }
   }
 
-  // 4. Active SPC Mesoscale Discussions (CONUS)
   if (mcds.length) {
     parts.push(`<div class="section-mini-label">Active SPC Mesoscale Discussions (${mcds.length})</div>`);
     for (const m of mcds.slice(0, 6)) {
@@ -912,6 +1131,98 @@ function renderSettings() {
       </div>
     </div>
 
+    <!-- SEVERE WEATHER ENGINE SETTINGS -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">🌪️ Severe Weather Protection Engine</div>
+        <span class="badge-${state.isStormWatchActive ? 'red' : 'green'}">${state.isStormWatchActive ? 'Active 45s Watch' : 'Standby 3m'}</span>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Adaptive Storm Watch Mode (45s Polling)</div>
+          <div class="setting-desc">Automatically accelerates radar, storm-cell &amp; NWS alert checks from 3 min to 45 sec during severe weather.</div>
+        </div>
+        <input type="checkbox" id="set-adaptive" ${s.adaptiveStormModeEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Keep iPhone Screen Awake During Storms</div>
+          <div class="setting-desc">Prevents iPhone auto-lock during active severe weather so custom Tornado &amp; Supercell sirens fire immediately.</div>
+        </div>
+        <input type="checkbox" id="set-wakelock" ${s.keepScreenAwakeInStorm ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Severe Thunderstorm &amp; Flash Flood Alarms</div>
+          <div class="setting-desc">Sound Severe Alarm on local Severe Thunderstorm, Flash Flood &amp; Snow Squall Warnings (Tornado Warnings always sound).</div>
+        </div>
+        <input type="checkbox" id="set-severe" ${s.severeWarningAlertsEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Proactive Storm Time-on-Target (TOT) Alerts</div>
+          <div class="setting-desc">Pre-warn when a rotating supercell or severe radar cell tracks toward your location ahead of polygons.</div>
+        </div>
+        <input type="checkbox" id="set-tot" ${s.proactiveTotAlertsEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Proactive TOT Lead Window (${s.proactiveTotLeadMinutes} min)</div>
+          <div class="setting-desc">Alert when an intercepting storm cell is within ${s.proactiveTotLeadMinutes} minutes of arrival.</div>
+        </div>
+        <input type="range" id="set-tot-lead" min="15" max="60" step="5" value="${s.proactiveTotLeadMinutes}" style="width:96px;accent-color:var(--cyan);" />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Convective / HSLC Upper-Air Alerts</div>
+          <div class="setting-desc">Monitor true 0–6km (500 hPa) &amp; 0–1.5km (850 hPa) shear, CAPE, pressure falls &amp; SPC MCDs.</div>
+        </div>
+        <input type="checkbox" id="set-convective" ${s.convectiveAlertsEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item" style="flex-direction:column;align-items:stretch;gap:8px;">
+        <div class="setting-info">
+          <div class="setting-title">Convective Alert Sensitivity</div>
+          <div class="setting-desc">Controls when upper-air supercell / HSLC environment chimes trigger.</div>
+        </div>
+        <div class="segmented-row" style="grid-template-columns:repeat(3,1fr);">
+          <button class="seg-btn ${s.convectiveAlertThreshold === 'SENSITIVE' ? 'active' : ''}" data-conv-thresh="SENSITIVE">Sensitive</button>
+          <button class="seg-btn ${s.convectiveAlertThreshold === 'STANDARD' ? 'active' : ''}" data-conv-thresh="STANDARD">Standard</button>
+          <button class="seg-btn ${s.convectiveAlertThreshold === 'HIGH_ONLY' ? 'active' : ''}" data-conv-thresh="HIGH_ONLY">High Only</button>
+        </div>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Dixie Alley Nocturnal Readiness</div>
+          <div class="setting-desc">Escalate evening/overnight shear &amp; HSLC setups before you go to sleep.</div>
+        </div>
+        <input type="checkbox" id="set-nocturnal" ${s.nocturnalReadinessEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Winter, Black Ice &amp; Freezing Fog Alerts</div>
+          <div class="setting-desc">Track 0cm/6cm ground temperatures, bridge icing risk, and freezing fog visibility.</div>
+        </div>
+        <input type="checkbox" id="set-winter" ${s.winterAlertsEnabled ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Ground Freeze Trigger (${s.groundFreezeThresholdF}°F)</div>
+          <div class="setting-desc">Alert when 0cm surface ground temperature drops to or below threshold.</div>
+        </div>
+        <input type="range" id="set-freeze-slider" min="28" max="36" value="${s.groundFreezeThresholdF}" style="width:96px;accent-color:var(--cyan);" />
+      </div>
+    </div>
+
     <!-- CUSTOM SIREN SELECTOR & SOUND TESTER -->
     <div class="card">
       <div class="card-header">
@@ -919,7 +1230,7 @@ function renderSettings() {
         <span class="badge-red">8 Custom WAVs</span>
       </div>
       <div class="alert-meta" style="margin-bottom:10px;">
-        Tap any siren to preview on your iPhone. The selected Tornado siren plays during live critical warnings and tests while Borden Tempest is active.
+        Tap any siren to preview on your iPhone. Tornado Emergencies &amp; Observed Tornadoes loop continuously until you tap Silence.
       </div>
       <div class="siren-list">
         ${SIREN_CATALOG.map((item) => {
@@ -940,41 +1251,6 @@ function renderSettings() {
             </div>
           `;
         }).join('')}
-      </div>
-    </div>
-
-    <!-- ALERT PREFERENCES -->
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">⚙️ Monitoring &amp; Thresholds</div>
-      </div>
-      <div class="setting-item">
-        <div class="setting-info">
-          <div class="setting-title">Convective / HSLC Environment Alerts</div>
-          <div class="setting-desc">Alert when low-level shear, CAPE, pressure falls, or MCDs signal supercell potential.</div>
-        </div>
-        <input type="checkbox" id="set-convective" ${s.convectiveAlertsEnabled ? 'checked' : ''} />
-      </div>
-      <div class="setting-item">
-        <div class="setting-info">
-          <div class="setting-title">Proactive Storm Time-on-Target (TOT)</div>
-          <div class="setting-desc">Highlight radar cells tracking directly toward your location ahead of warnings.</div>
-        </div>
-        <input type="checkbox" id="set-tot" ${s.proactiveTotAlertsEnabled ? 'checked' : ''} />
-      </div>
-      <div class="setting-item">
-        <div class="setting-info">
-          <div class="setting-title">Winter, Black Ice &amp; Freezing Fog Suite</div>
-          <div class="setting-desc">Track 0cm/6cm soil temperatures, bridge icing risk, and freezing fog visibility.</div>
-        </div>
-        <input type="checkbox" id="set-winter" ${s.winterAlertsEnabled ? 'checked' : ''} />
-      </div>
-      <div class="setting-item">
-        <div class="setting-info">
-          <div class="setting-title">Ground Freeze Trigger (${s.groundFreezeThresholdF}°F)</div>
-          <div class="setting-desc">Alert when 0cm surface ground temperature drops to or below threshold.</div>
-        </div>
-        <input type="range" id="set-freeze-slider" min="28" max="36" value="${s.groundFreezeThresholdF}" style="width:96px;accent-color:var(--cyan);" />
       </div>
     </div>
 
@@ -1038,13 +1314,62 @@ function renderSettings() {
     });
   });
 
-  document.getElementById('set-convective')?.addEventListener('change', (e) => {
-    state.settings.convectiveAlertsEnabled = e.target.checked;
+  document.getElementById('set-adaptive')?.addEventListener('change', (e) => {
+    state.settings.adaptiveStormModeEnabled = e.target.checked;
+    saveSettings();
+    scheduleNextPoll();
+    updateHeaderAndBadges();
+  });
+  document.getElementById('set-wakelock')?.addEventListener('change', (e) => {
+    state.settings.keepScreenAwakeInStorm = e.target.checked;
+    saveSettings();
+    syncWakeLock();
+  });
+  document.getElementById('set-severe')?.addEventListener('change', (e) => {
+    state.settings.severeWarningAlertsEnabled = e.target.checked;
     saveSettings();
   });
   document.getElementById('set-tot')?.addEventListener('change', (e) => {
     state.settings.proactiveTotAlertsEnabled = e.target.checked;
     saveSettings();
+  });
+  document.getElementById('set-tot-lead')?.addEventListener('input', (e) => {
+    state.settings.proactiveTotLeadMinutes = Number(e.target.value);
+    saveSettings();
+    renderSettings();
+    updateHeaderAndBadges();
+  });
+  document.getElementById('set-convective')?.addEventListener('change', (e) => {
+    state.settings.convectiveAlertsEnabled = e.target.checked;
+    saveSettings();
+  });
+  el.querySelectorAll('[data-conv-thresh]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.settings.convectiveAlertThreshold = btn.dataset.convThresh;
+      saveSettings();
+      if (state.openMeteo && state.current) {
+        const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
+        state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+          convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
+          nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled
+        });
+        renderDashboard();
+        renderAlerts();
+      }
+      renderSettings();
+    });
+  });
+  document.getElementById('set-nocturnal')?.addEventListener('change', (e) => {
+    state.settings.nocturnalReadinessEnabled = e.target.checked;
+    saveSettings();
+    if (state.openMeteo && state.current) {
+      const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
+      state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+        convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
+        nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled
+      });
+      renderDashboard();
+    }
   });
   document.getElementById('set-winter')?.addEventListener('change', (e) => {
     state.settings.winterAlertsEnabled = e.target.checked;
@@ -1064,8 +1389,9 @@ function renderSettings() {
     triggerAlertPopup({
       badge: 'TEST CRITICAL WARNING',
       title: 'Tornado Warning (Test)',
-      body: 'THIS IS A TEST ALERT from Borden Tempest.\n13.8 mi WSW moving ENE @ 52 mph • 70 mph Wind • 1.75" Hail • Tornado Possible.\nOpen Radar to inspect Velocity (N0G) & CC Debris (N0C).',
-      soundId: state.settings.tornadoSoundId
+      body: 'THIS IS A TEST ALERT from Borden Tempest.\nTime on Target: ~14 min • 12.4 mi WSW moving ENE @ 52 mph (CPA 0.7 mi).\nTornado: OBSERVED • Max Hail: 1.75" • Open Radar to verify Velocity (N0G) & CC Debris (N0C).',
+      soundId: state.settings.tornadoSoundId,
+      loop: false
     });
   });
 
@@ -1074,7 +1400,8 @@ function renderSettings() {
       badge: 'TEST STORM PRE-WARNING',
       title: 'Approaching Supercell (TOT)',
       body: 'THIS IS A TEST PRE-WARNING from Borden Tempest.\nTime on Target: ~26 min • 21.8 mi SW moving NE @ 50 mph • Direct Intercept (CPA 1.2 mi).\nProactive radar-cell tracking alerts you ahead of official polygon arrival.',
-      soundId: 'storm_tot_ping'
+      soundId: 'supercell_alert_alarm',
+      loop: false
     });
   });
 
@@ -1082,8 +1409,9 @@ function renderSettings() {
     triggerAlertPopup({
       badge: 'TEST CONVECTIVE ALERT',
       title: 'HSLC Supercell Environment',
-      body: '0–1.5km Shear 34 kt (+42° veering) • CAPE 520 J/kg • Td 66°F • Pressure -3.6 hPa/3hr.\nDangerous low-CAPE, high-shear rotating storm potential.',
-      soundId: 'convective_chime'
+      body: '0–6km Shear 48 kt (500 hPa) • 0–1.5km Shear 34 kt (+42° veer) • CAPE 520 J/kg • Td 66°F • Pressure -3.6 hPa/3hr.\nDangerous low-CAPE, high-shear rotating storm potential.',
+      soundId: 'convective_chime',
+      loop: false
     });
   });
 
@@ -1092,18 +1420,22 @@ function renderSettings() {
       badge: 'TEST WINTER HAZARD',
       title: 'Black Ice / Freezing Rain',
       body: 'Ground 30°F (6cm: 32°F) • Air 33°F • Vis 0.3 mi • Bridges icing rapidly.',
-      soundId: 'winter_alert_chime'
+      soundId: 'winter_alert_chime',
+      loop: false
     });
   });
 }
 
-function triggerAlertPopup({ badge, title, body, soundId }) {
+function triggerAlertPopup({ badge, title, body, soundId, loop = false }) {
   audioEngine.unlockForIOS();
+  if (navigator.vibrate) {
+    try { navigator.vibrate([300, 120, 300, 120, 500]); } catch {}
+  }
   document.getElementById('alert-popup-badge').textContent = badge;
   document.getElementById('alert-popup-title').textContent = title;
   document.getElementById('alert-popup-body').textContent = body;
   document.getElementById('alert-popup-modal')?.classList.remove('hidden');
-  audioEngine.play(soundId, false);
+  audioEngine.play(soundId, loop);
 }
 
 /* ==================== LOCATION & SITE MODALS ==================== */

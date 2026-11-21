@@ -1,4 +1,11 @@
-import { angularDiffDeg, buildThreatConePolygon, computeStormIntercept, degToCompass, haversineMiles } from './geoMath.js';
+import {
+  angularDiffDeg,
+  buildThreatConePolygon,
+  computeStormIntercept,
+  degToCompass,
+  haversineMiles,
+  isPointInGeometry
+} from './geoMath.js';
 
 const WMO_LABELS = {
   0: ['Clear Sky', '☀️'],
@@ -51,6 +58,18 @@ function paToHpa(pa) {
   return pa == null ? null : pa / 100;
 }
 
+function mphToKt(mph) {
+  return (mph || 0) * 0.868976;
+}
+
+function vectorShearKt(spd1Kt, dir1Deg, spd2Kt, dir2Deg) {
+  const u1 = -spd1Kt * Math.sin((dir1Deg * Math.PI) / 180);
+  const v1 = -spd1Kt * Math.cos((dir1Deg * Math.PI) / 180);
+  const u2 = -spd2Kt * Math.sin((dir2Deg * Math.PI) / 180);
+  const v2 = -spd2Kt * Math.cos((dir2Deg * Math.PI) / 180);
+  return Math.hypot(u2 - u1, v2 - v1);
+}
+
 function findCurrentHourIndex(hourly) {
   const times = hourly?.time || [];
   if (!times.length) return 0;
@@ -68,7 +87,7 @@ function findCurrentHourIndex(hourly) {
 }
 
 /**
- * Multi-station NWS ASOS/AWOS + Open-Meteo Accuracy Consensus Resolver
+ * Multi-station NWS ASOS/AWOS + NDFD/NBM + Open-Meteo (HRRR/GFS) Accuracy Consensus Resolver
  */
 export function resolveCurrentConditions(nwsBundle, openMeteo) {
   const cur = openMeteo?.current || {};
@@ -83,6 +102,11 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
   for (const obs of nwsBundle?.observations || []) {
     const p = obs.props;
     if (!p) continue;
+    // Skip stale observations older than 2.5 hours
+    if (p.timestamp) {
+      const ageMin = (Date.now() - new Date(p.timestamp).getTime()) / 60000;
+      if (ageMin > 150) continue;
+    }
     const tF = cToF(p.temperature?.value);
     const dF = cToF(p.dewpoint?.value);
     if (tF != null && !Number.isNaN(tF)) {
@@ -96,7 +120,6 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
   const omTemp = cur.temperature_2m ?? null;
   const nwsHourlyTemp = nwsBundle?.hourlyPeriods?.[0]?.temperature ?? null;
 
-  // Weighted accuracy consensus: live ASOS observations carry highest weight, blended with NDFD & Open-Meteo
   const samples = [];
   stationTemps.forEach((t, i) => samples.push({ v: t, w: i === 0 ? 0.55 : 0.3 }));
   if (nwsHourlyTemp != null) samples.push({ v: nwsHourlyTemp, w: 0.2 });
@@ -135,8 +158,8 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
   const conditionText = primaryObs?.props?.textDescription || wmoLabel;
 
   const sourceLabel = stationNames.length
-    ? `NWS Consensus (${stationNames.join(', ')}) + Open-Meteo`
-    : 'Open-Meteo Hyperlocal + NDFD';
+    ? `NWS ASOS (${stationNames.join(', ')}) + NDFD/NBM + HRRR/GFS`
+    : 'NWS NDFD/NBM + NOAA HRRR/GFS';
 
   const confidence = spreadF <= 2.5 ? 'High' : spreadF <= 5 ? 'Moderate' : 'Variable';
 
@@ -163,79 +186,120 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
 }
 
 /**
- * Convective, Supercell, HSLC & Dixie Alley Nocturnal Readiness Analyzer
+ * True Upper-Air Convective, Supercell, HSLC & Dixie Alley Nocturnal Readiness Analyzer
+ * Uses real 10m -> 850 hPa (~0-1.5km) and 10m -> 500 hPa (~0-6km) vector wind shear from NOAA HRRR/GFS.
  */
-export function analyzeEnvironment(openMeteo, current, mcdCount = 0) {
+export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {}) {
+  const thresholdMode = options.convectiveAlertThreshold || 'STANDARD'; // SENSITIVE | STANDARD | HIGH_ONLY
+  const nocturnalEnabled = options.nocturnalReadinessEnabled !== false;
+
   const hourly = openMeteo?.hourly || {};
   const idx = findCurrentHourIndex(hourly);
 
-  const capeNow = hourly.cape?.[idx] ?? 0;
-  const next12Cape = (hourly.cape || []).slice(idx, idx + 12);
-  const peakCape12h = next12Cape.length ? Math.max(...next12Cape.map((v) => v || 0)) : capeNow;
+  const calcAt = (i) => {
+    const cape = hourly.cape?.[i] ?? 0;
+    const cin = hourly.convective_inhibition?.[i] ?? 0;
+    const w10 = mphToKt(hourly.wind_speed_10m?.[i] ?? current.windMph ?? 0);
+    const d10 = hourly.wind_direction_10m?.[i] ?? current.windDirDeg ?? 0;
+    const w850 = mphToKt(hourly.wind_speed_850hPa?.[i] ?? hourly.wind_speed_10m?.[i] ?? 0);
+    const d850 = hourly.wind_direction_850hPa?.[i] ?? d10;
+    const w500 = mphToKt(hourly.wind_speed_500hPa?.[i] ?? hourly.wind_speed_850hPa?.[i] ?? 0);
+    const d500 = hourly.wind_direction_500hPa?.[i] ?? d850;
+    const lowShearKt = vectorShearKt(w10, d10, w850, d850);
+    const deepShearKt = vectorShearKt(w10, d10, w500, d500);
+    const veer850 = angularDiffDeg(d10, d850); // positive = clockwise veering (helicity)
+    return { cape, cin, lowShearKt, deepShearKt, veer850 };
+  };
 
-  // Compute low-level bulk shear proxy (10m to 180m / ~0-1.5km extrapolated low-level jet shear)
-  const w10 = (hourly.wind_speed_10m?.[idx] ?? current.windMph ?? 0) * 0.868976; // kt
-  const d10 = hourly.wind_direction_10m?.[idx] ?? current.windDirDeg ?? 0;
-  const w180 = (hourly.wind_speed_180m?.[idx] ?? hourly.wind_speed_120m?.[idx] ?? current.windMph ?? 0) * 0.868976; // kt
-  const d180 = hourly.wind_direction_180m?.[idx] ?? hourly.wind_direction_120m?.[idx] ?? d10;
+  const nowSample = calcAt(idx);
+  const window12 = [];
+  for (let i = idx; i < Math.min(idx + 12, (hourly.time || []).length); i++) {
+    window12.push(calcAt(i));
+  }
 
-  // Vector difference scaled to 0-1.5km layer estimate
-  const u1 = -w10 * Math.sin((d10 * Math.PI) / 180);
-  const v1 = -w10 * Math.cos((d10 * Math.PI) / 180);
-  const u2 = -w180 * Math.sin((d180 * Math.PI) / 180);
-  const v2 = -w180 * Math.cos((d180 * Math.PI) / 180);
-  const rawVecShearKt = Math.hypot(u2 - u1, v2 - v1);
-  const lowLevelShearKt = Math.round(rawVecShearKt * 1.85);
-  const veeringDeg = Math.round(angularDiffDeg(d10, d180)); // positive = clockwise veering (helicity)
+  const peakCape12h = window12.length ? Math.max(...window12.map((s) => s.cape)) : nowSample.cape;
+  const peakLowLevelShearKt = Math.round(window12.length ? Math.max(...window12.map((s) => s.lowShearKt)) : nowSample.lowShearKt);
+  const peakBulkShearKt = Math.round(window12.length ? Math.max(...window12.map((s) => s.deepShearKt)) : nowSample.deepShearKt);
+
+  const lowLevelShearKt = Math.round(nowSample.lowShearKt);
+  const bulkShear0to6KmKt = Math.round(nowSample.deepShearKt);
+  const veeringDeg = Math.round(nowSample.veer850);
+  const cinNow = Math.round(nowSample.cin);
 
   const dewF = current.dewpointF ?? 45;
   const pTrend = current.pressureTrend3h ?? 0;
 
-  let regime = 'Quiet / Stable';
-  let level = 'low';
   let score = 0;
+  // Instability (CAPE)
+  if (peakCape12h >= 1800) score += 3;
+  else if (peakCape12h >= 750) score += 2;
+  else if (peakCape12h >= 200) score += 1;
 
-  if (peakCape12h >= 1500) score += 3;
-  else if (peakCape12h >= 500) score += 2;
-  else if (peakCape12h >= 150) score += 1;
+  // Deep-layer supercell shear (0-6 km: 10m -> 500 hPa)
+  if (peakBulkShearKt >= 45) score += 3;
+  else if (peakBulkShearKt >= 35) score += 2;
+  else if (peakBulkShearKt >= 25) score += 1;
 
-  if (lowLevelShearKt >= 30 && veeringDeg >= 15) score += 3;
-  else if (lowLevelShearKt >= 20) score += 2;
-  else if (lowLevelShearKt >= 12) score += 1;
+  // Low-level tornado shear & veering (0-1.5 km: 10m -> 850 hPa)
+  if (peakLowLevelShearKt >= 30 && veeringDeg >= 20) score += 3;
+  else if (peakLowLevelShearKt >= 22 && veeringDeg >= 10) score += 2;
+  else if (peakLowLevelShearKt >= 16) score += 1;
 
+  // Low-level moisture (Dewpoint)
   if (dewF >= 64) score += 2;
   else if (dewF >= 58) score += 1;
 
+  // Synoptic forcing (3-hr MSLP fall)
   if (pTrend <= -3.0) score += 2;
   else if (pTrend <= -1.5) score += 1;
 
   if (mcdCount > 0) score += 2;
 
-  const isHslc = peakCape12h >= 100 && peakCape12h <= 750 && lowLevelShearKt >= 25 && dewF >= 58;
+  // High-Shear, Low-CAPE (Dixie Alley classic) signature
+  const isHslc = peakCape12h >= 100 && peakCape12h <= 750 &&
+    peakLowLevelShearKt >= 25 && peakBulkShearKt >= 35 && dewF >= 58;
 
-  if (score >= 7) {
+  // Strong moisture + shear + CAPE supercell setup
+  const isSupercellSetup = peakCape12h >= 500 && peakBulkShearKt >= 35 && peakLowLevelShearKt >= 20 && dewF >= 58;
+
+  let regime = 'Quiet / Stable';
+  let level = 'low';
+
+  if (score >= 9 || (isSupercellSetup && score >= 8)) {
     regime = isHslc ? 'HSLC Rotating Threat' : 'Supercell Favorable';
     level = 'high';
-  } else if (score >= 4) {
-    regime = isHslc ? 'HSLC Watchful (Shear-Driven)' : 'Marginal Convective';
+  } else if (score >= 6 || isHslc) {
+    regime = isHslc ? 'HSLC Watchful (Shear-Driven)' : 'Elevated Convective';
+    level = 'mod';
+  } else if (score >= 4 && peakCape12h >= 150) {
+    regime = 'Marginal Convective';
     level = 'mod';
   }
 
-  // Nocturnal Readiness check (sunset to sunrise risk window)
   const hourLocal = new Date().getHours();
   const isEveningOrNight = hourLocal >= 17 || hourLocal <= 6;
-  const nocturnalRisk = (level !== 'low' && isEveningOrNight)
-    ? 'Elevated nocturnal convective setup — keep alerts active overnight.'
+  const nocturnalEscalated = nocturnalEnabled && isEveningOrNight && (level === 'high' || (level === 'mod' && (isHslc || peakLowLevelShearKt >= 25)));
+
+  const nocturnalRisk = nocturnalEscalated
+    ? 'NOCTURNAL READINESS: Elevated overnight shear/convective setup — keep Borden Tempest open & screen awake.'
     : level === 'high'
-      ? 'High convective potential developing — monitor radar closely.'
-      : 'No nocturnal severe-weather readiness escalation needed.';
+      ? 'High convective & rotating storm potential — monitor radar closely.'
+      : level === 'mod'
+        ? 'Marginal/elevated shear or instability developing — stay weather aware.'
+        : 'No nocturnal severe-weather readiness escalation needed.';
+
+  // Respect user's convective alert threshold sensitivity
+  const shouldTriggerProactive =
+    (thresholdMode === 'HIGH_ONLY' && level === 'high') ||
+    (thresholdMode === 'STANDARD' && (level === 'high' || isHslc || nocturnalEscalated)) ||
+    (thresholdMode === 'SENSITIVE' && (level === 'high' || level === 'mod'));
 
   const proactiveAlerts = [];
-  if (level === 'high' || (level === 'mod' && isHslc)) {
+  if (shouldTriggerProactive) {
     proactiveAlerts.push({
-      id: 'convective_env_active',
-      title: `${regime} Environment`,
-      summary: `0–1.5km Shear ~${lowLevelShearKt} kt (${veeringDeg >= 0 ? '+' : ''}${veeringDeg}° veer) • CAPE ${Math.round(peakCape12h)} J/kg • Td ${dewF}°F • Pressure ${pTrend >= 0 ? '+' : ''}${pTrend} hPa/3hr`,
+      id: `convective_${level}_${isHslc ? 'hslc' : 'std'}_${nocturnalEscalated ? 'night' : 'day'}`,
+      title: nocturnalEscalated ? `Nocturnal ${regime}` : `${regime} Environment`,
+      summary: `0–6km Shear ${bulkShear0to6KmKt} kt (peak ${peakBulkShearKt} kt) • 0–1.5km Shear ${lowLevelShearKt} kt (${veeringDeg >= 0 ? '+' : ''}${veeringDeg}° veer) • CAPE ${Math.round(peakCape12h)} J/kg • Td ${dewF}°F • Pressure ${pTrend >= 0 ? '+' : ''}${pTrend} hPa/3hr`,
       level
     });
   }
@@ -244,13 +308,18 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0) {
     regime,
     level,
     score,
-    capeNow: Math.round(capeNow),
+    capeNow: Math.round(nowSample.cape),
     peakCape12h: Math.round(peakCape12h),
+    cinNow,
     lowLevelShearKt,
+    peakLowLevelShearKt,
+    bulkShear0to6KmKt,
+    peakBulkShearKt,
     veeringDeg,
     dewpointF: dewF,
     pressureTrend3h: pTrend,
     isHslc,
+    nocturnalEscalated,
     nocturnalRisk,
     proactiveAlerts
   };
@@ -354,6 +423,7 @@ export function analyzeWinterSuite(openMeteo, current, groundFreezeThresholdF = 
 
 /**
  * NEXRAD Storm Cell Threat & Time-on-Target (TOT) Intercept Engine
+ * Verified: IEM nexrad_attr.geojson `drct` is meteorological FROM direction; moving-TO bearing = (drct + 180) % 360.
  */
 export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadiusMi = 120) {
   const features = stormCellsGeoJson?.features || [];
@@ -367,21 +437,29 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
     if (dist > maxRadiusMi) continue;
 
     const p = f.properties || {};
+    // Skip stale NEXRAD storm cell reports older than 25 minutes
+    if (p.valid) {
+      const ageMin = (Date.now() - new Date(p.valid).getTime()) / 60000;
+      if (ageMin > 25) continue;
+    }
+
     const tvs = String(p.tvs || '').toUpperCase();
     const meso = String(p.meso || '').toUpperCase();
     const maxSizeIn = parseFloat(p.max_size || '0') || 0;
     const poh = parseFloat(p.poh || '0') || 0;
     const posh = parseFloat(p.posh || '0') || 0;
     const topKft = parseFloat(p.top || '0') || 0;
+    const maxDbz = parseFloat(p.max_dbz || '0') || 0;
 
-    // IEM drct is direction storm is moving FROM (or moving toward? In NEXRAD STI drct = azimuth storm moves FROM in meteorological convention; let's normalize carefully: IEM nexrad_attr drct is motion FROM degrees, sknt is knots)
     const speedKt = parseFloat(p.sknt || '0') || 0;
     const speedMph = Math.round(speedKt * 1.15078);
     const drctFrom = p.drct != null && p.drct !== '' ? parseFloat(p.drct) : null;
-    const moveToBearing = drctFrom != null && !Number.isNaN(drctFrom) ? (drctFrom + 180) % 360 : null;
+    const moveToBearing = drctFrom != null && !Number.isNaN(drctFrom) && speedKt > 0
+      ? (drctFrom + 180) % 360
+      : null;
 
     const hasTvs = tvs === 'TVS' || tvs === 'ETVS';
-    const hasMeso = meso && meso !== 'NONE' && meso !== '0' && meso !== 'NULL';
+    const hasMeso = Boolean(meso && meso !== 'NONE' && meso !== '0' && meso !== 'NULL' && meso !== 'UNC');
 
     let threatLevel = 'STRONG';
     let threatScore = 1;
@@ -395,12 +473,11 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
       threatLevel = 'SUPERCELL';
       threatScore = 3;
       color = '#d946ef';
-    } else if (maxSizeIn >= 0.75 || posh >= 40 || topKft >= 40) {
+    } else if (maxSizeIn >= 0.75 || posh >= 40 || topKft >= 40 || maxDbz >= 62) {
       threatLevel = 'SEVERE';
       threatScore = 2;
       color = '#ff6600';
     } else {
-      // Skip weak non-severe garden-variety cells beyond 45 miles to keep UI sharp
       if (dist > 45) continue;
       color = '#facc15';
     }
@@ -409,7 +486,7 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
     const coneCoords = buildThreatConePolygon(lat, lon, moveToBearing, speedMph, 45);
 
     analyzed.push({
-      id: `${p.nexrad || 'RAD'}_${p.storm_id || 'X'}_${lat.toFixed(2)}`,
+      id: `${p.nexrad || 'RAD'}_${p.storm_id || 'X'}`,
       nexrad: p.nexrad || 'NEXRAD',
       stormId: p.storm_id || 'CELL',
       lat,
@@ -417,6 +494,7 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
       tvs: hasTvs ? tvs : null,
       meso: hasMeso ? meso : null,
       maxHailIn: maxSizeIn,
+      maxDbz,
       poh,
       posh,
       topKft,
@@ -432,8 +510,8 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
   }
 
   analyzed.sort((a, b) => {
-    const aDirect = a.intercept.verdict === 'DIRECT_INTERCEPT' ? 10 : a.intercept.verdict === 'NEAR_MISS' ? 5 : 0;
-    const bDirect = b.intercept.verdict === 'DIRECT_INTERCEPT' ? 10 : b.intercept.verdict === 'NEAR_MISS' ? 5 : 0;
+    const aDirect = a.intercept.verdict === 'DIRECT_INTERCEPT' ? 12 : a.intercept.verdict === 'NEAR_MISS' ? 6 : 0;
+    const bDirect = b.intercept.verdict === 'DIRECT_INTERCEPT' ? 12 : b.intercept.verdict === 'NEAR_MISS' ? 6 : 0;
     return (b.threatScore * 4 + bDirect - b.intercept.distanceMi * 0.05) - (a.threatScore * 4 + aDirect - a.intercept.distanceMi * 0.05);
   });
 
@@ -441,43 +519,75 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
 }
 
 /**
- * Classify NWS Alert into Borden Tempest Alert Tiers
+ * Classify NWS Alert into Borden Tempest Severe Tiers with Point-in-Polygon & PDS/Observed Detection
  */
-export function classifyNwsAlert(feature) {
+export function classifyNwsAlert(feature, userLat = null, userLon = null) {
   const p = feature.properties || {};
   const ev = (p.event || '').toLowerCase();
   const params = p.parameters || {};
   const tornadoDetection = params.tornadoDetection?.[0] || null;
   const tornadoDamageThreat = params.tornadoDamageThreat?.[0] || null;
+  const thunderstormDamageThreat = params.thunderstormDamageThreat?.[0] || null;
+  const flashFloodDamageThreat = params.flashFloodDamageThreat?.[0] || null;
   const maxWindGust = params.maxWindGust?.[0] || null;
   const maxHailSize = params.maxHailSize?.[0] || null;
+
   const isTornadoEmergency = (tornadoDamageThreat || '').toUpperCase() === 'CATASTROPHIC' ||
-    (p.headline || '').toLowerCase().includes('tornado emergency');
+    (p.headline || '').toLowerCase().includes('tornado emergency') ||
+    (p.description || '').toLowerCase().includes('tornado emergency');
+
+  const isPdsOrObserved = isTornadoEmergency ||
+    (tornadoDetection || '').toUpperCase() === 'OBSERVED' ||
+    (tornadoDamageThreat || '').toUpperCase() === 'CONSIDERABLE' ||
+    (p.description || '').toLowerCase().includes('particularly dangerous situation');
+
+  const isDestructiveSevere = (thunderstormDamageThreat || '').toUpperCase() === 'DESTRUCTIVE' ||
+    (thunderstormDamageThreat || '').toUpperCase() === 'CONSIDERABLE';
+
+  const isFlashFloodEmergency = (flashFloodDamageThreat || '').toUpperCase() === 'CATASTROPHIC' ||
+    (p.headline || '').toLowerCase().includes('flash flood emergency');
+
+  const expiresIso = p.expires || p.ends || null;
+  const isExpired = expiresIso ? new Date(expiresIso).getTime() < Date.now() : false;
+
+  const insidePolygon = (userLat != null && userLon != null && feature.geometry)
+    ? isPointInGeometry(userLat, userLon, feature.geometry)
+    : null;
 
   let tier = 'ADVISORY';
   let color = '#00d4ff';
   let rank = 1;
 
-  if (ev.includes('tornado warning') || ev.includes('flash flood emergency')) {
+  if (ev.includes('tornado warning') || isFlashFloodEmergency || ev.includes('extreme wind warning')) {
     tier = 'CRITICAL';
     color = '#ff2b4a';
-    rank = 5;
-  } else if (ev.includes('severe thunderstorm warning') || ev.includes('flash flood warning')) {
+    rank = isTornadoEmergency ? 7 : isPdsOrObserved ? 6 : 5;
+  } else if (ev.includes('severe thunderstorm warning') || ev.includes('flash flood warning') || ev.includes('snow squall warning')) {
     tier = 'SEVERE';
-    color = '#ff9800';
-    rank = 4;
+    color = isDestructiveSevere ? '#ff4444' : '#ff9800';
+    rank = isDestructiveSevere ? 4.5 : 4;
   } else if (ev.includes('tornado watch') || ev.includes('severe thunderstorm watch')) {
     tier = 'WATCH';
     color = '#facc15';
-    rank = 3;
+    rank = ev.includes('tornado watch') ? 3.5 : 3;
   } else if (ev.includes('winter') || ev.includes('ice storm') || ev.includes('blizzard') || ev.includes('freeze') || ev.includes('snow') || ev.includes('fog')) {
     tier = 'WINTER';
     color = '#56ccf2';
     rank = 2;
   }
 
+  const escalationFingerprint = [
+    tier,
+    tornadoDetection || '',
+    tornadoDamageThreat || '',
+    thunderstormDamageThreat || '',
+    flashFloodDamageThreat || '',
+    isTornadoEmergency ? 'TE' : ''
+  ].join('|');
+
   return {
     id: feature.id || p.id || `${p.event}_${p.sent}`,
+    escalationFingerprint,
     event: p.event || 'Weather Alert',
     headline: p.headline || p.event || '',
     description: p.description || '',
@@ -485,12 +595,18 @@ export function classifyNwsAlert(feature) {
     areaDesc: p.areaDesc || '',
     senderName: p.senderName || 'NWS',
     sent: p.sent || null,
-    expires: p.expires || p.ends || null,
+    expires: expiresIso,
+    isExpired,
+    insidePolygon,
     severity: p.severity || 'Unknown',
     urgency: p.urgency || 'Unknown',
     tornadoDetection,
     tornadoDamageThreat,
+    thunderstormDamageThreat,
     isTornadoEmergency,
+    isPdsOrObserved,
+    isDestructiveSevere,
+    isFlashFloodEmergency,
     maxWindGust,
     maxHailSize,
     tier,
