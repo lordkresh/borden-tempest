@@ -2,9 +2,11 @@ import {
   RADAR_PRODUCTS,
   buildRadarFrames,
   fetchIemStormIntel,
+  fetchNwsAfd,
   fetchNwsAlerts,
   fetchNwsPointBundle,
   fetchOpenMeteo,
+  fetchSpcOverlayLayer,
   searchLocations
 } from './weatherApi.js';
 import {
@@ -12,11 +14,12 @@ import {
   analyzeStormCells,
   analyzeWinterSuite,
   classifyNwsAlert,
+  evaluateMultiDayOutlooks,
   resolveCurrentConditions,
   wmoInfo
 } from './analyzers.js';
 import { findNearestNexradStation, getStationsSortedByDistance } from './nexradStations.js';
-import { geometryCentroid } from './geoMath.js';
+import { degToCompass, geometryCentroid, haversineMiles, initialBearingDeg } from './geoMath.js';
 import { RadarMapController } from './radarMap.js';
 import { SIREN_CATALOG, audioEngine } from './audio.js';
 import { APP_LOCAL_VERSION, updater } from './updater.js';
@@ -27,6 +30,7 @@ const STORAGE_KEY_NOTIFIED = 'borden_tempest_ios_notified_v2';
 
 const DEFAULT_SETTINGS = {
   tornadoSoundId: 'tornado_siren_eas',
+  voiceAnnouncerEnabled: true,
   adaptiveStormModeEnabled: true,
   keepScreenAwakeInStorm: true,
   severeWarningAlertsEnabled: true,
@@ -38,6 +42,7 @@ const DEFAULT_SETTINGS = {
   nocturnalReadinessEnabled: true,
   groundFreezeThresholdF: 32,
   radarProduct: 'CONUS_MOSAIC',
+  spcOverlayLayerId: 1,
   radarOpacity: 0.78,
   basemap: 'dark'
 };
@@ -66,6 +71,8 @@ const state = {
   regionalAlerts: [],
   stormCells: [],
   iemIntel: null,
+  multiDaySpc: null,
+  afd: null,
   activePlayingSoundId: null,
   isStormWatchActive: false,
   pollTimerId: null,
@@ -88,7 +95,8 @@ const radarMap = new RadarMapController('radar-map-container', {
     if (feedEl) feedEl.textContent = fr ? fr.feedLabel : 'IEM';
   },
   onInspectCell: (cell) => openInspectSheet('cell', cell),
-  onInspectAlert: (alert) => openInspectSheet('alert', alert)
+  onInspectAlert: (alert) => openInspectSheet('alert', alert),
+  onInspectLsr: (lsr) => openInspectSheet('lsr', lsr)
 });
 
 function loadJson(key, fallback) {
@@ -242,7 +250,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const banner = document.getElementById('update-banner');
     if (banner) {
       document.getElementById('update-banner-title').textContent =
-        `Borden Tempest v${manifest?.versionName || 'New'} Ready`;
+        `Tempest v${manifest?.versionName || 'New'} Ready`;
       document.getElementById('update-banner-sub').textContent =
         manifest?.releaseNotes ? manifest.releaseNotes.slice(0, 88) + '…' : 'Tap Update to install instantly.';
       banner.classList.remove('hidden');
@@ -269,7 +277,10 @@ function wireEvents() {
 
   document.getElementById('btn-refresh')?.addEventListener('click', () => refreshAllData(false));
   document.getElementById('btn-gps')?.addEventListener('click', requestGpsLocation);
-  document.getElementById('btn-siren-stop')?.addEventListener('click', () => audioEngine.stop());
+  document.getElementById('btn-siren-stop')?.addEventListener('click', () => {
+    audioEngine.stop();
+    stopVoiceBriefing();
+  });
   document.getElementById('location-picker-trigger')?.addEventListener('click', openLocationModal);
 
   // Session-only hide so users never permanently lose the Safari Home Screen tip before installing
@@ -279,12 +290,28 @@ function wireEvents() {
   });
 
   document.getElementById('btn-install-update')?.addEventListener('click', () => {
-    showToast('Installing latest Borden Tempest update...');
+    showToast('Installing latest Tempest update...');
     updater.applyUpdateNow();
   });
 
   document.querySelectorAll('#radar-product-chips .radar-chip').forEach((chip) => {
     chip.addEventListener('click', () => selectRadarProduct(chip.dataset.product));
+  });
+
+  document.querySelectorAll('#radar-quick-flip .qflip-btn').forEach((btn) => {
+    btn.addEventListener('click', () => selectRadarProduct(btn.dataset.qflip));
+  });
+
+  document.querySelectorAll('#spc-mode-row .spc-mode-btn').forEach((btn) => {
+    btn.classList.toggle('active', Number(btn.dataset.spcLayer) === (state.settings.spcOverlayLayerId || 1));
+    btn.addEventListener('click', () => selectSpcOverlayLayer(Number(btn.dataset.spcLayer)));
+  });
+
+  document.getElementById('btn-close-afd-modal')?.addEventListener('click', () => {
+    document.getElementById('afd-modal')?.classList.add('hidden');
+  });
+  document.getElementById('afd-modal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'afd-modal') document.getElementById('afd-modal').classList.add('hidden');
   });
 
   document.getElementById('btn-radar-play')?.addEventListener('click', () => {
@@ -315,7 +342,7 @@ function wireEvents() {
     document.getElementById('radar-inspect-sheet')?.classList.add('hidden');
   });
 
-  ['alerts', 'cells', 'spc', 'mcd', 'lsr'].forEach((key) => {
+  ['alerts', 'cells', 'watches', 'spc', 'flood', 'mcd', 'lsr'].forEach((key) => {
     document.getElementById(`layer-${key}`)?.addEventListener('change', (e) => {
       radarMap.setLayerVisibility(key, e.target.checked);
     });
@@ -363,10 +390,12 @@ function wireEvents() {
 
   document.getElementById('btn-alert-popup-dismiss')?.addEventListener('click', () => {
     audioEngine.stop();
+    stopVoiceBriefing();
     document.getElementById('alert-popup-modal')?.classList.add('hidden');
   });
   document.getElementById('btn-alert-popup-radar')?.addEventListener('click', () => {
     audioEngine.stop();
+    stopVoiceBriefing();
     document.getElementById('alert-popup-modal')?.classList.add('hidden');
     switchTab('radar');
   });
@@ -416,7 +445,7 @@ async function refreshAllData(silent = false) {
     const [nwsRes, omRes, iemRes] = await Promise.allSettled([
       fetchNwsPointBundle(lat, lon),
       fetchOpenMeteo(lat, lon),
-      fetchIemStormIntel()
+      fetchIemStormIntel(state.settings.spcOverlayLayerId || 1)
     ]);
 
     state.nwsBundle = nwsRes.status === 'fulfilled' ? nwsRes.value : state.nwsBundle;
@@ -427,10 +456,15 @@ async function refreshAllData(silent = false) {
       state.activeLocation.name = `${state.nwsBundle.cityLabel} (GPS)`;
     }
 
-    const alertsRes = await fetchNwsAlerts(lat, lon, state.nwsBundle?.stateCode).catch(() => ({
-      localFeatures: [],
-      regionalFeatures: []
-    }));
+    const [alertsRes, afdRes] = await Promise.all([
+      fetchNwsAlerts(lat, lon, state.nwsBundle?.stateCode).catch(() => ({
+        localFeatures: [],
+        regionalFeatures: []
+      })),
+      fetchNwsAfd(state.nwsBundle?.cwa).catch(() => null)
+    ]);
+    state.afd = afdRes || state.afd;
+    state.multiDaySpc = evaluateMultiDayOutlooks(lat, lon, state.iemIntel);
 
     const sortAlerts = (a, b) => {
       if (b.rank !== a.rank) return b.rank - a.rank;
@@ -470,7 +504,9 @@ async function refreshAllData(silent = false) {
       stormCells: state.stormCells,
       lsrGeoJson: state.iemIntel?.lsrGeoJson,
       mcdGeoJson: state.iemIntel?.mcdGeoJson,
-      spcDay1GeoJson: state.iemIntel?.spcDay1GeoJson
+      spcWatchesGeoJson: state.iemIntel?.spcWatchesGeoJson,
+      wpcFloodGeoJson: state.iemIntel?.wpcFloodGeoJson,
+      spcDay1GeoJson: state.iemIntel?.spcOverlayGeoJson || state.iemIntel?.spcDay1GeoJson
     });
 
     if (state.tab === 'radar') {
@@ -657,6 +693,9 @@ async function ensureRadarReady() {
   document.querySelectorAll('#radar-product-chips .radar-chip').forEach((c) => {
     c.classList.toggle('active', c.dataset.product === state.settings.radarProduct);
   });
+  document.querySelectorAll('#radar-quick-flip .qflip-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.qflip === state.settings.radarProduct);
+  });
 
   radarMap.init(lat, lon, state.settings.basemap, state.settings.radarOpacity);
   radarMap.resize();
@@ -665,7 +704,9 @@ async function ensureRadarReady() {
     stormCells: state.stormCells,
     lsrGeoJson: state.iemIntel?.lsrGeoJson,
     mcdGeoJson: state.iemIntel?.mcdGeoJson,
-    spcDay1GeoJson: state.iemIntel?.spcDay1GeoJson
+    spcWatchesGeoJson: state.iemIntel?.spcWatchesGeoJson,
+    wpcFloodGeoJson: state.iemIntel?.wpcFloodGeoJson,
+    spcDay1GeoJson: state.iemIntel?.spcOverlayGeoJson || state.iemIntel?.spcDay1GeoJson
   });
   await loadRadarFramesForCurrentProduct();
 }
@@ -676,7 +717,26 @@ async function selectRadarProduct(productCode) {
   document.querySelectorAll('#radar-product-chips .radar-chip').forEach((c) => {
     c.classList.toggle('active', c.dataset.product === productCode);
   });
+  document.querySelectorAll('#radar-quick-flip .qflip-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.qflip === productCode);
+  });
   await loadRadarFramesForCurrentProduct();
+}
+
+async function selectSpcOverlayLayer(layerId) {
+  state.settings.spcOverlayLayerId = layerId;
+  saveSettings();
+  document.querySelectorAll('#spc-mode-row .spc-mode-btn').forEach((b) => {
+    b.classList.toggle('active', Number(b.dataset.spcLayer) === layerId);
+  });
+  const chk = document.getElementById('layer-spc');
+  if (chk && !chk.checked) {
+    chk.checked = true;
+    radarMap.setLayerVisibility('spc', true);
+  }
+  const geo = await fetchSpcOverlayLayer(layerId);
+  if (state.iemIntel) state.iemIntel.spcOverlayGeoJson = geo;
+  radarMap.setOverlayData({ spcDay1GeoJson: geo });
 }
 
 async function loadRadarFramesForCurrentProduct() {
@@ -712,11 +772,36 @@ function openInspectSheet(type, item) {
         <strong>Storm Top:</strong> ${item.topKft ? `${item.topKft} kft` : '--'} • <strong>Hail Prob:</strong> ${item.poh}% (Severe ${item.posh}%)
       </div>
     `;
+  } else if (type === 'lsr') {
+    const p = item.properties || {};
+    const [lon, lat] = item.coords || [state.activeLocation.lon, state.activeLocation.lat];
+    const distMi = haversineMiles(state.activeLocation.lat, state.activeLocation.lon, lat, lon);
+    const brg = degToCompass(initialBearingDeg(state.activeLocation.lat, state.activeLocation.lon, lat, lon));
+    const evType = p.typetext || p.type || 'Storm Report';
+    const mag = p.magnitude ? ` • ${p.magnitude}${p.unit ? ' ' + p.unit : ''}` : '';
+    const isTor = String(evType).toUpperCase().includes('TORNADO') || String(evType).toUpperCase().includes('FUNNEL');
+    titleEl.textContent = `${evType}${mag}`;
+    bodyEl.innerHTML = `
+      <div class="tag-row">
+        <span class="badge-${isTor ? 'red' : 'amber'}">CONFIRMED SPOTTER REPORT (LSR)</span>
+        <span class="badge-cyan">${distMi.toFixed(1)} mi ${brg}</span>
+      </div>
+      <div class="alert-meta">
+        <strong>Location:</strong> ${escapeHtml(p.city || 'Nearby')}, ${escapeHtml(p.state || p.st || '')}<br/>
+        <strong>Reported:</strong> ${escapeHtml(p.valid || p.utcvalid || 'Recent')}<br/><br/>
+        ${escapeHtml(p.remark || 'Verified NWS Local Storm Report.')}
+      </div>
+    `;
   } else {
+    const ctr = item.geometry ? geometryCentroid(item.geometry) : null;
+    const rangeTag = ctr
+      ? `${haversineMiles(state.activeLocation.lat, state.activeLocation.lon, ctr.lat, ctr.lon).toFixed(1)} mi ${degToCompass(initialBearingDeg(state.activeLocation.lat, state.activeLocation.lon, ctr.lat, ctr.lon))}`
+      : null;
     titleEl.textContent = item.event;
     bodyEl.innerHTML = `
       <div class="tag-row">
         <span class="badge-${item.tier === 'CRITICAL' ? 'red' : item.tier === 'WINTER' ? 'blue' : 'amber'}">${item.isTornadoEmergency ? 'TORNADO EMERGENCY' : item.tier}</span>
+        ${rangeTag ? `<span class="badge-cyan">${rangeTag}</span>` : ''}
         ${item.insidePolygon === true ? `<span class="badge-red">INSIDE POLYGON</span>` : ''}
         ${item.tornadoDetection ? `<span class="badge-red">Tornado: ${escapeHtml(item.tornadoDetection)}</span>` : ''}
         ${item.tornadoDamageThreat ? `<span class="badge-red">Damage: ${escapeHtml(item.tornadoDamageThreat)}</span>` : ''}
@@ -824,38 +909,80 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (TRUE 850hPa & 500hPa UPPER-AIR SHEAR) -->
+    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (PRO 5-LEVEL SOUNDING + STP/SCP/SRH + LIVE HODOGRAPH) -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">⚡ Convective &amp; Supercell Environment</div>
+        <div class="card-title">⚡ Pro Severe Sounding &amp; HSLC</div>
         <span class="badge-${env.level === 'high' ? 'red' : env.level === 'mod' ? 'amber' : 'green'}">${escapeHtml(env.regime)}</span>
       </div>
       <div class="regime-banner ${env.level}">
         ${escapeHtml(env.nocturnalRisk)}
       </div>
-      <div class="metrics-grid cols-2">
+      <div class="metrics-grid">
         <div class="metric-box">
-          <div class="metric-label">CAPE (12h Peak)</div>
-          <div class="metric-value">${env.peakCape12h} J/kg</div>
-          <div class="metric-sub">Now: ${env.capeNow} • CIN ${env.cinNow}</div>
+          <div class="metric-label">Sig Tor (STP)</div>
+          <div class="metric-value">${(env.stp ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">SPC Fixed-Lyr</div>
         </div>
         <div class="metric-box">
-          <div class="metric-label">0–6km Deep Shear</div>
+          <div class="metric-label">Supercell (SCP)</div>
+          <div class="metric-value">${(env.scp ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">0–3km SRH ${env.srh0to3Km ?? 0}</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">0–1km SRH</div>
+          <div class="metric-value">${env.srh0to1Km ?? 0}</div>
+          <div class="metric-sub">m²/s² Helicity</div>
+        </div>
+      </div>
+      <div class="metrics-grid" style="margin-top:8px;">
+        <div class="metric-box">
+          <div class="metric-label">CAPE / CIN</div>
+          <div class="metric-value">${env.peakCape12h}</div>
+          <div class="metric-sub">Now ${env.capeNow} • CIN ${env.cinNow}</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">0–6km Shear</div>
           <div class="metric-value">${env.bulkShear0to6KmKt} kt</div>
-          <div class="metric-sub">12h Peak: ${env.peakBulkShearKt} kt (500 hPa)</div>
+          <div class="metric-sub">0–1.5km: ${env.lowLevelShearKt} kt</div>
         </div>
         <div class="metric-box">
-          <div class="metric-label">0–1.5km Shear</div>
-          <div class="metric-value">${env.lowLevelShearKt} kt</div>
-          <div class="metric-sub">${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer (850 hPa)</div>
+          <div class="metric-label">LCL / Lapse</div>
+          <div class="metric-value">${env.lclMeters ?? '--'} m</div>
+          <div class="metric-sub">7–5mb: ${env.lapseRate700to500 ?? 5.8}°/km</div>
         </div>
-        <div class="metric-box">
-          <div class="metric-label">Storm Cells (120m)</div>
-          <div class="metric-value">${state.stormCells.length}</div>
-          <div class="metric-sub">${state.stormCells.filter((x) => x.tvs || x.meso).length} rotating • ${state.isStormWatchActive ? '45s Watch' : '3m Poll'}</div>
+      </div>
+      <div class="hodograph-wrap">
+        <div class="hodograph-head">
+          <span style="color:var(--cyan);">LIVE 5-LEVEL HODOGRAPH (KT)</span>
+          <span style="color:var(--watch-yellow);">RM ${escapeHtml(env.bunkersCompass || '--')} @ ${env.bunkersSpeedKt ?? 0} kt</span>
+        </div>
+        <canvas id="hodograph-canvas" class="hodograph-canvas"></canvas>
+        <div class="hodograph-foot">
+          <div class="hodo-legend">
+            <span><i class="hodo-dot" style="background:#ff3d00"></i>0–1km</span>
+            <span><i class="hodo-dot" style="background:#00e676"></i>1–3km</span>
+            <span><i class="hodo-dot" style="background:#00e5ff"></i>3–6km</span>
+          </div>
+          <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer • ${state.stormCells.length} cells</span>
         </div>
       </div>
     </div>
+
+    <!-- 3-DAY SPC SEVERE & WPC FLASH FLOOD STRIP -->
+    ${renderMultiDayOutlookCard(state.multiDaySpc)}
+
+    <!-- LOCAL NWS METEOROLOGIST AREA FORECAST DISCUSSION (AFD) -->
+    ${state.afd ? `
+      <div class="card" id="afd-preview-card" style="cursor:pointer;">
+        <div class="card-header">
+          <div class="card-title">📋 ${escapeHtml(state.afd.office)} Meteorologist Discussion</div>
+          <span class="badge-muted">${escapeHtml(state.afd.issuedLabel)}</span>
+        </div>
+        <div class="afd-excerpt">${escapeHtml(state.afd.synopsisExcerpt)}</div>
+        <div class="afd-cta">Tap to read full NWS Area Forecast Discussion →</div>
+      </div>
+    ` : ''}
 
     <!-- FULL WINTER / GROUND TEMP / FOG SUITE -->
     <div class="card">
@@ -915,6 +1042,180 @@ function renderDashboard() {
       </div>
     ` : ''}
   `;
+
+  // Draw live 5-level Hodograph canvas & wire SPC/Flood/AFD taps
+  drawHodographCanvas(env);
+  document.getElementById('afd-preview-card')?.addEventListener('click', () => {
+    if (!state.afd) return;
+    document.getElementById('afd-modal-title').textContent = `${state.afd.office} Forecast Discussion`;
+    document.getElementById('afd-modal-sub').textContent = `Issued ${state.afd.issuedLabel}`;
+    document.getElementById('afd-modal-text').textContent = state.afd.fullText;
+    document.getElementById('afd-modal')?.classList.remove('hidden');
+  });
+  container.querySelectorAll('[data-jump-spc]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      switchTab('radar');
+      await selectSpcOverlayLayer(Number(el.dataset.jumpSpc));
+    });
+  });
+  container.querySelector('[data-jump-flood]')?.addEventListener('click', () => {
+    switchTab('radar');
+    const chk = document.getElementById('layer-flood');
+    if (chk) chk.checked = true;
+    radarMap.setLayerVisibility('flood', true);
+  });
+}
+
+function outlookColor(cat, isFlood = false) {
+  const u = String(cat || 'NONE').toUpperCase();
+  if (u.includes('HIGH')) return '#d500f9';
+  if (u.includes('MDT')) return '#ef5350';
+  if (u.includes('ENH')) return '#fb8c00';
+  if (u.includes('SLGT')) return '#fdd835';
+  if (u.includes('MRGL')) return isFlood ? '#26a69a' : '#66bb6a';
+  if (u.includes('TSTM')) return '#81c784';
+  return '#94a3b8';
+}
+
+function renderMultiDayOutlookCard(md) {
+  const m = md || {
+    day1Category: 'NONE', day1TornadoProb: 'NONE', day1HailProb: 'NONE',
+    day1WindProb: 'NONE', day2Category: 'NONE', day3Category: 'NONE',
+    wpcDay1FloodRisk: 'NONE', activeWatches: []
+  };
+  const pill = (title, val, attr, color) => `
+    <div class="outlook-pill" ${attr} style="border-color:${val === 'NONE' ? 'rgba(148,163,184,0.16)' : color};">
+      <div class="outlook-pill-title">${title}</div>
+      <div class="outlook-pill-val" style="color:${color};">${escapeHtml(val)}</div>
+    </div>
+  `;
+  return `
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">⛈️ SPC 3-Day Severe &amp; WPC Flood</div>
+        ${m.activeWatches?.length ? `<span class="badge-red">${m.activeWatches.length} ACTIVE WATCH</span>` : '<span class="badge-muted">Tap to View Layer</span>'}
+      </div>
+      <div class="outlook-grid">
+        ${pill('Day 1', m.day1Category, 'data-jump-spc="1"', outlookColor(m.day1Category))}
+        ${pill('Day 2', m.day2Category, 'data-jump-spc="9"', outlookColor(m.day2Category))}
+        ${pill('Day 3', m.day3Category, 'data-jump-spc="17"', outlookColor(m.day3Category))}
+        ${pill('Flood', m.wpcDay1FloodRisk, 'data-jump-flood="1"', outlookColor(m.wpcDay1FloodRisk, true))}
+      </div>
+      <div class="prob-grid">
+        ${pill('Day 1 Tor', m.day1TornadoProb, 'data-jump-spc="3"', m.day1TornadoProb === 'NONE' ? '#94a3b8' : '#ff2b4a')}
+        ${pill('Day 1 Hail', m.day1HailProb, 'data-jump-spc="5"', m.day1HailProb === 'NONE' ? '#94a3b8' : '#10b981')}
+        ${pill('Day 1 Wind', m.day1WindProb, 'data-jump-spc="7"', m.day1WindProb === 'NONE' ? '#94a3b8' : '#facc15')}
+      </div>
+    </div>
+  `;
+}
+
+function drawHodographCanvas(env) {
+  const canvas = document.getElementById('hodograph-canvas');
+  if (!canvas || !env?.hodographPoints?.length) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(240, rect.width || 300);
+  const h = 190;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = env.hodographPoints;
+  const cx = w / 2;
+  const cy = h / 2;
+  const maxR = Math.min(w, h) / 2 - 14;
+  const maxSpd = Math.max(...pts.map((p) => Math.hypot(p.uKt, p.vKt)), 20);
+  const maxRing = maxSpd > 60 ? 80 : maxSpd > 42 ? 60 : maxSpd > 26 ? 40 : 30;
+  const pxPerKt = maxR / maxRing;
+  const toXY = (u, v) => [cx + u * pxPerKt, cy - v * pxPerKt];
+
+  // Speed rings
+  const step = maxRing <= 30 ? 10 : 20;
+  ctx.strokeStyle = '#253549';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#7c8ea6';
+  ctx.font = '10px ui-monospace, monospace';
+  for (let rk = step; rk <= maxRing; rk += step) {
+    const r = rk * pxPerKt;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillText(`${rk}`, cx + r - 14, cy - 3);
+  }
+
+  // Axes
+  ctx.strokeStyle = '#33445c';
+  ctx.beginPath();
+  ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy);
+  ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR);
+  ctx.stroke();
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = 'bold 10px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('N', cx, cy - maxR + 10);
+  ctx.fillText('S', cx, cy + maxR - 2);
+  ctx.fillText('E', cx + maxR - 7, cy + 4);
+  ctx.fillText('W', cx - maxR + 7, cy + 4);
+  ctx.textAlign = 'left';
+
+  // Bunkers Right-Mover vector
+  const rmRad = ((env.bunkersHeadingDeg || 60) * Math.PI) / 180;
+  const rmU = Math.sin(rmRad) * (env.bunkersSpeedKt || 0);
+  const rmV = Math.cos(rmRad) * (env.bunkersSpeedKt || 0);
+  const [rmX, rmY] = toXY(rmU, rmV);
+
+  // Shaded 0-3km SRH polygon
+  const lowPts = pts.filter((p) => p.heightKm <= 3.2);
+  if (lowPts.length >= 2) {
+    ctx.fillStyle = 'rgba(255, 61, 0, 0.16)';
+    ctx.beginPath();
+    ctx.moveTo(rmX, rmY);
+    lowPts.forEach((p) => { const [x, y] = toXY(p.uKt, p.vKt); ctx.lineTo(x, y); });
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Height-colored hodograph segments
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const [x1, y1] = toXY(a.uKt, a.vKt);
+    const [x2, y2] = toXY(b.uKt, b.vKt);
+    ctx.strokeStyle = b.heightKm <= 1.2 ? '#ff3d00' : b.heightKm <= 3.2 ? '#00e676' : '#00e5ff';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  // Points & altitude labels
+  ctx.font = 'bold 9.5px -apple-system, sans-serif';
+  pts.forEach((p, idx) => {
+    const [x, y] = toXY(p.uKt, p.vKt);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = p.heightKm <= 1.2 ? '#ff5252' : p.heightKm <= 3.2 ? '#00e676' : '#00e5ff';
+    ctx.beginPath(); ctx.arc(x, y, 2.7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#f8fafc';
+    const yOff = idx % 2 === 0 ? -6 : 11;
+    ctx.fillText(p.label, x + 5, y + yOff);
+  });
+
+  // RM Crosshair
+  ctx.strokeStyle = '#ffd600';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(rmX, rmY, 5.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(rmX - 8, rmY); ctx.lineTo(rmX + 8, rmY);
+  ctx.moveTo(rmX, rmY - 8); ctx.lineTo(rmX, rmY + 8);
+  ctx.stroke();
+  ctx.fillStyle = '#ffd600';
+  ctx.font = 'bold 10px -apple-system, sans-serif';
+  ctx.fillText('RM', rmX + 7, rmY + 11);
 }
 
 function buildHourlyItems() {
@@ -1000,7 +1301,7 @@ function renderAlerts() {
   }
 
   if (convAlerts.length || winAlerts.length) {
-    parts.push(`<div class="section-mini-label">Borden Tempest Proactive Intelligence</div>`);
+    parts.push(`<div class="section-mini-label">Tempest Proactive Intelligence</div>`);
     for (const ca of convAlerts) {
       parts.push(`
         <div class="card alert-card tier-convective">
@@ -1121,7 +1422,7 @@ function renderSettings() {
         <span class="badge-${hasUpd ? 'cyan' : 'green'}">${hasUpd ? 'Update Ready' : `v${APP_LOCAL_VERSION.versionName} Current`}</span>
       </div>
       <div class="alert-meta" style="margin-bottom:10px;">
-        <strong>Installed:</strong> Borden Tempest v${APP_LOCAL_VERSION.versionName} (Build ${APP_LOCAL_VERSION.versionCode}) • iOS / Web Companion<br/>
+        <strong>Installed:</strong> Tempest v${APP_LOCAL_VERSION.versionName} (Build ${APP_LOCAL_VERSION.versionCode}) • Created by J. Borden<br/>
         <strong>Install Mode:</strong> ${updater.isStandalone() ? 'Installed Home Screen App ✓' : 'Safari Browser (Add to Home Screen for full-screen mode)'}
       </div>
       ${upd?.releaseNotes ? `<div class="alert-meta" style="margin-bottom:10px;padding:9px;border-radius:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border-subtle);"><strong>Latest Release Notes (v${escapeHtml(upd.versionName)}):</strong><br/>${escapeHtml(upd.releaseNotes)}</div>` : ''}
@@ -1152,6 +1453,14 @@ function renderSettings() {
           <div class="setting-desc">Prevents iPhone auto-lock during active severe weather so custom Tornado &amp; Supercell sirens fire immediately.</div>
         </div>
         <input type="checkbox" id="set-wakelock" ${s.keepScreenAwakeInStorm ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <div class="setting-title">Spoken NOAA Voice Announcer</div>
+          <div class="setting-desc">Reads Tornado Warnings, Time-on-Target countdowns &amp; shelter instructions aloud when an emergency triggers.</div>
+        </div>
+        <input type="checkbox" id="set-voice" ${s.voiceAnnouncerEnabled !== false ? 'checked' : ''} />
       </div>
 
       <div class="setting-item">
@@ -1276,7 +1585,7 @@ function renderSettings() {
         1. Open this link in <strong>Safari</strong> on iPhone.<br/>
         2. Tap the <strong>Share</strong> button at the bottom of Safari.<br/>
         3. Scroll down and tap <strong>Add to Home Screen</strong>.<br/>
-        4. Open <strong>Borden Tempest</strong> from your Home Screen — free forever, never expires, and automatically receives OTA updates whenever new releases are published.
+        4. Open <strong>Tempest</strong> from your Home Screen — free forever, never expires, and automatically receives OTA updates whenever new releases are published. Created by J. Borden.
       </div>
     </div>
   `;
@@ -1324,6 +1633,10 @@ function renderSettings() {
     state.settings.keepScreenAwakeInStorm = e.target.checked;
     saveSettings();
     syncWakeLock();
+  });
+  document.getElementById('set-voice')?.addEventListener('change', (e) => {
+    state.settings.voiceAnnouncerEnabled = e.target.checked;
+    saveSettings();
   });
   document.getElementById('set-severe')?.addEventListener('change', (e) => {
     state.settings.severeWarningAlertsEnabled = e.target.checked;
@@ -1426,6 +1739,27 @@ function renderSettings() {
   });
 }
 
+function speakEmergencyBriefing(title, body) {
+  if (state.settings.voiceAnnouncerEnabled === false) return;
+  if (!('speechSynthesis' in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const script = `Emergency weather alert from Tempest. ${title}. ${String(body || '').replace(/\n+/g, '. ').slice(0, 260)}`;
+    const utter = new SpeechSynthesisUtterance(script);
+    utter.lang = 'en-US';
+    utter.rate = 0.96;
+    window.speechSynthesis.speak(utter);
+  } catch {
+    // ignore speech errors on locked Safari contexts
+  }
+}
+
+function stopVoiceBriefing() {
+  if ('speechSynthesis' in window) {
+    try { window.speechSynthesis.cancel(); } catch {}
+  }
+}
+
 function triggerAlertPopup({ badge, title, body, soundId, loop = false }) {
   audioEngine.unlockForIOS();
   if (navigator.vibrate) {
@@ -1436,6 +1770,9 @@ function triggerAlertPopup({ badge, title, body, soundId, loop = false }) {
   document.getElementById('alert-popup-body').textContent = body;
   document.getElementById('alert-popup-modal')?.classList.remove('hidden');
   audioEngine.play(soundId, loop);
+  if (String(badge || '').toUpperCase().includes('TORNADO') || String(badge || '').toUpperCase().includes('CRITICAL')) {
+    setTimeout(() => speakEmergencyBriefing(title, body), 1200);
+  }
 }
 
 /* ==================== LOCATION & SITE MODALS ==================== */

@@ -3,21 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>Borden Tempest</title>
-  <meta name="description" content="Borden Tempest — Severe Weather Intelligence, High-Res NEXRAD Radar, Storm Cell Time-on-Target, Convective & Winter Suite." />
+  <title>Tempest</title>
+  <meta name="description" content="Tempest (by J. Borden) — Pro Severe Weather Intelligence, High-Res NEXRAD Radar, STP/SCP Hodograph, Storm Cell Time-on-Target, Convective & Winter Suite." />
 
   <!-- iOS Standalone PWA Meta Tags -->
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="Borden Tempest" />
-  <meta name="theme-color" content="#090D16" />
+  <meta name="apple-mobile-web-app-title" content="Tempest" />
+  <meta name="theme-color" content="#071222" />
   <meta name="format-detection" content="telephone=no" />
 
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" sizes="180x180" href="./assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/png" sizes="64x64" href="./assets/icons/favicon.png" />
-  <link rel="icon" type="image/svg+xml" href="./assets/icons/icon.svg" />
 
   <!-- MapLibre GL JS -->
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
@@ -30,8 +29,11 @@
     <!-- Top Header Bar -->
     <header class="top-bar" id="top-bar">
       <div class="top-bar-left" id="location-picker-trigger" role="button" tabindex="0" aria-label="Change Location">
-        <img src="./assets/icons/icon.svg" alt="Borden Tempest" class="brand-mini-icon" />
+        <img src="./assets/icons/icon-192.png" alt="Tempest" class="brand-mini-icon" />
         <div class="location-title-wrap">
+          <div class="brand-title-line">
+            <span class="brand-word">TEMPEST</span>
+          </div>
           <div class="location-name-row">
             <span id="header-location-name" class="header-location-name">Locating...</span>
             <span class="chevron-down">▾</span>
@@ -56,7 +58,7 @@
     <div id="update-banner" class="update-banner hidden">
       <div class="update-banner-text">
         <strong id="update-banner-title">Update Available</strong>
-        <span id="update-banner-sub">Tap to install the latest Borden Tempest release.</span>
+        <span id="update-banner-sub">Tap to install the latest Tempest release.</span>
       </div>
       <button id="btn-install-update" class="btn-update-now">Update</button>
     </div>
@@ -71,7 +73,7 @@
             <button id="btn-dismiss-ios-banner" class="text-btn-sm">Hide for Now</button>
           </div>
           <p class="ios-install-copy">
-            Install <strong>Borden Tempest</strong> on your iPhone Home Screen (free, never expires, auto-updates):
+            Install <strong>Tempest</strong> (by J. Borden) on your iPhone Home Screen (free, never expires, auto-updates):
             tap <strong>Share</strong> <span class="share-glyph">⎋</span> in Safari, then tap <strong>Add to Home Screen</strong>.
           </p>
         </div>
@@ -110,6 +112,13 @@
           </div>
         </div>
 
+        <!-- Left 1-Tap Supercell Quick-Flip Trio (Refl | Vel | CC Debris) -->
+        <div class="radar-quick-flip" id="radar-quick-flip">
+          <button class="qflip-btn" data-qflip="N0B">Refl</button>
+          <button class="qflip-btn" data-qflip="N0G">Vel</button>
+          <button class="qflip-btn" data-qflip="N0C">CC</button>
+        </div>
+
         <!-- Radar Bottom Playback Controls -->
         <div class="radar-bottom-overlay">
           <div class="radar-legend-bar" id="radar-legend-bar"></div>
@@ -142,8 +151,24 @@
               <input type="checkbox" id="layer-cells" checked />
             </label>
             <label class="toggle-row">
-              <span>SPC Day 1 Convective Outlook</span>
+              <span>SPC Watch Boxes (PDS / Tornado / Svr)</span>
+              <input type="checkbox" id="layer-watches" checked />
+            </label>
+            <label class="toggle-row">
+              <span>SPC Convective Outlook Overlay</span>
               <input type="checkbox" id="layer-spc" checked />
+            </label>
+            <div class="spc-mode-row" id="spc-mode-row">
+              <button class="spc-mode-btn active" data-spc-layer="1">Day 1</button>
+              <button class="spc-mode-btn" data-spc-layer="3">Tor %</button>
+              <button class="spc-mode-btn" data-spc-layer="5">Hail %</button>
+              <button class="spc-mode-btn" data-spc-layer="7">Wind %</button>
+              <button class="spc-mode-btn" data-spc-layer="9">Day 2</button>
+              <button class="spc-mode-btn" data-spc-layer="17">Day 3</button>
+            </div>
+            <label class="toggle-row">
+              <span>WPC Flash Flood Outlook (ERO)</span>
+              <input type="checkbox" id="layer-flood" />
             </label>
             <label class="toggle-row">
               <span>SPC Mesoscale Discussions (MCD)</span>
@@ -243,9 +268,27 @@
     </div>
   </div>
 
+  <!-- NWS Area Forecast Discussion (AFD) Modal -->
+  <div id="afd-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="NWS Area Forecast Discussion">
+    <div class="modal-card afd-modal-card">
+      <div class="sheet-header">
+        <div>
+          <h3 id="afd-modal-title">NWS Forecast Discussion</h3>
+          <div id="afd-modal-sub" class="header-status-sub"></div>
+        </div>
+        <button id="btn-close-afd-modal" class="icon-btn-sm">✕</button>
+      </div>
+      <pre id="afd-modal-text" class="afd-full-pre"></pre>
+    </div>
+  </div>
+
   <!-- Active Test / Live Alert Overlay Modal -->
   <div id="alert-popup-modal" class="modal-backdrop hidden" role="alertdialog" aria-modal="true">
     <div class="modal-card alert-popup-card" id="alert-popup-card">
+      <div class="alert-popup-brand">
+        <img src="./assets/icons/icon-192.png" alt="Tempest" class="alert-popup-emblem" />
+        <span>TEMPEST EMERGENCY</span>
+      </div>
       <div class="alert-popup-badge" id="alert-popup-badge">CRITICAL ALERT</div>
       <h2 id="alert-popup-title">Tornado Warning</h2>
       <p id="alert-popup-body" class="alert-popup-body"></p>

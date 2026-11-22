@@ -2,7 +2,18 @@ const NWS_BASE = 'https://api.weather.gov';
 const OPEN_METEO_BASE = 'https://api.open-meteo.com/v1/forecast';
 const GEOCODE_BASE = 'https://geocoding-api.open-meteo.com/v1/search';
 const IEM_BASE = 'https://mesonet.agron.iastate.edu';
-const SPC_DAY1_URL = 'https://www.spc.noaa.gov/products/outlook/day1otlk_cat.nolyr.geojson';
+const SPC_MAPSERVER_BASE = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer';
+const WPC_ERO_URL = 'https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/0/query?where=1%3D1&outFields=*&f=geojson';
+const SPC_DAY1_FALLBACK_URL = 'https://www.spc.noaa.gov/products/outlook/day1otlk_cat.nolyr.geojson';
+
+export const SPC_OVERLAY_MODES = [
+  { id: 1, label: 'Day 1 Cat' },
+  { id: 3, label: 'Tor %' },
+  { id: 5, label: 'Hail %' },
+  { id: 7, label: 'Wind %' },
+  { id: 9, label: 'Day 2' },
+  { id: 17, label: 'Day 3' }
+];
 
 export const RADAR_PRODUCTS = [
   { code: 'CONUS_MOSAIC', shortLabel: 'CONUS', name: 'CONUS High-Res Composite Reflectivity', singleSite: false },
@@ -37,9 +48,9 @@ export async function fetchNwsPointBundle(lat, lon) {
     props.observationStations ? fetchJson(props.observationStations, { Accept: 'application/geo+json' }) : Promise.resolve(null)
   ]);
 
-  // Multi-station consensus: query up to 3 closest ASOS/AWOS stations in parallel
+  // Multi-station consensus: query up to 4 closest ASOS/AWOS stations in parallel
   const stationFeatures = (stationsRes.status === 'fulfilled' && stationsRes.value?.features)
-    ? stationsRes.value.features.slice(0, 3)
+    ? stationsRes.value.features.slice(0, 4)
     : [];
 
   const obsResults = await Promise.allSettled(
@@ -109,6 +120,7 @@ export async function fetchOpenMeteo(lat, lon) {
     wind_speed_unit: 'mph',
     precipitation_unit: 'inch',
     timezone: 'auto',
+    past_hours: '6',
     forecast_days: '3',
     current: [
       'temperature_2m',
@@ -140,10 +152,18 @@ export async function fetchOpenMeteo(lat, lon) {
       'visibility',
       'wind_speed_10m',
       'wind_direction_10m',
+      'wind_speed_925hPa',
+      'wind_direction_925hPa',
       'wind_speed_850hPa',
       'wind_direction_850hPa',
+      'wind_speed_700hPa',
+      'wind_direction_700hPa',
       'wind_speed_500hPa',
       'wind_direction_500hPa',
+      'temperature_700hPa',
+      'temperature_500hPa',
+      'geopotential_height_700hPa',
+      'geopotential_height_500hPa',
       'wind_gusts_10m',
       'cape',
       'convective_inhibition',
@@ -156,19 +176,86 @@ export async function fetchOpenMeteo(lat, lon) {
   return fetchJson(`${OPEN_METEO_BASE}?${params.toString()}`);
 }
 
-export async function fetchIemStormIntel() {
-  const [cellsRes, lsrRes, mcdRes, spcRes] = await Promise.allSettled([
+export async function fetchSpcOverlayLayer(layerId = 1) {
+  const url = `${SPC_MAPSERVER_BASE}/${layerId}/query?where=1%3D1&outFields=*&f=geojson`;
+  try {
+    return await fetchJson(url, {}, 10000);
+  } catch {
+    if (layerId === 1) {
+      return fetchJson(SPC_DAY1_FALLBACK_URL, {}, 10000).catch(() => ({ type: 'FeatureCollection', features: [] }));
+    }
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+export async function fetchNwsAfd(cwa) {
+  if (!cwa) return null;
+  try {
+    const list = await fetchJson(`${NWS_BASE}/products/types/AFD/locations/${encodeURIComponent(cwa)}`, { Accept: 'application/ld+json' }, 8000);
+    const first = list?.['@graph']?.[0];
+    if (!first?.id) return null;
+    const detail = await fetchJson(`${NWS_BASE}/products/${encodeURIComponent(first.id)}`, { Accept: 'application/ld+json' }, 9000);
+    const fullText = (detail?.productText || '').trim();
+    if (!fullText) return null;
+
+    // Extract Synopsis / Key Messages / Short Term excerpt
+    const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
+    const keyIdx = lines.findIndex((l) => l.includes('.KEY MESSAGES') || l.includes('.SYNOPSIS') || l.includes('.SHORT TERM'));
+    const excerptLines = keyIdx >= 0 ? lines.slice(keyIdx, keyIdx + 8) : lines.slice(0, 7);
+    const issuedDate = detail?.issuanceTime ? new Date(detail.issuanceTime) : null;
+    const issuedLabel = issuedDate ? formatClock(issuedDate) : 'Latest';
+    const rawOffice = detail?.issuingOffice || `NWS ${cwa}`;
+    const office = rawOffice.toUpperCase().startsWith('NWS') ? rawOffice : `NWS ${rawOffice}`;
+
+    return {
+      office,
+      issuedLabel,
+      synopsisExcerpt: excerptLines.join('\n'),
+      fullText
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchIemStormIntel(spcOverlayLayerId = 1) {
+  const empty = { type: 'FeatureCollection', features: [] };
+  const [
+    cellsRes, lsrRes, mcdRes, watchRes, wpcRes,
+    spcOverlayRes, spcDay1Res, spcTorRes, spcHailRes, spcWindRes, spcDay2Res, spcDay3Res
+  ] = await Promise.allSettled([
     fetchJson(`${IEM_BASE}/geojson/nexrad_attr.geojson`, {}, 10000),
     fetchJson(`${IEM_BASE}/geojson/lsr.geojson?hours=6`, {}, 10000),
     fetchJson(`${IEM_BASE}/geojson/mcd.geojson`, {}, 10000),
-    fetchJson(SPC_DAY1_URL, {}, 10000)
+    fetchJson(`${IEM_BASE}/geojson/spc_watch.geojson`, {}, 10000),
+    fetchJson(WPC_ERO_URL, {}, 10000),
+    fetchSpcOverlayLayer(spcOverlayLayerId),
+    spcOverlayLayerId === 1 ? Promise.resolve(null) : fetchSpcOverlayLayer(1),
+    fetchSpcOverlayLayer(3),
+    fetchSpcOverlayLayer(5),
+    fetchSpcOverlayLayer(7),
+    fetchSpcOverlayLayer(9),
+    fetchSpcOverlayLayer(17)
   ]);
 
+  const overlayGeo = spcOverlayRes.status === 'fulfilled' ? spcOverlayRes.value : empty;
+  const day1CatGeo = spcOverlayLayerId === 1
+    ? overlayGeo
+    : (spcDay1Res.status === 'fulfilled' && spcDay1Res.value ? spcDay1Res.value : empty);
+
   return {
-    stormCellsGeoJson: cellsRes.status === 'fulfilled' ? cellsRes.value : { type: 'FeatureCollection', features: [] },
-    lsrGeoJson: lsrRes.status === 'fulfilled' ? lsrRes.value : { type: 'FeatureCollection', features: [] },
-    mcdGeoJson: mcdRes.status === 'fulfilled' ? mcdRes.value : { type: 'FeatureCollection', features: [] },
-    spcDay1GeoJson: spcRes.status === 'fulfilled' ? spcRes.value : { type: 'FeatureCollection', features: [] }
+    stormCellsGeoJson: cellsRes.status === 'fulfilled' ? cellsRes.value : empty,
+    lsrGeoJson: lsrRes.status === 'fulfilled' ? lsrRes.value : empty,
+    mcdGeoJson: mcdRes.status === 'fulfilled' ? mcdRes.value : empty,
+    spcWatchesGeoJson: watchRes.status === 'fulfilled' ? watchRes.value : empty,
+    wpcFloodGeoJson: wpcRes.status === 'fulfilled' ? wpcRes.value : empty,
+    spcOverlayGeoJson: overlayGeo,
+    spcDay1GeoJson: day1CatGeo,
+    spcDay1TorGeoJson: spcTorRes.status === 'fulfilled' ? spcTorRes.value : empty,
+    spcDay1HailGeoJson: spcHailRes.status === 'fulfilled' ? spcHailRes.value : empty,
+    spcDay1WindGeoJson: spcWindRes.status === 'fulfilled' ? spcWindRes.value : empty,
+    spcDay2GeoJson: spcDay2Res.status === 'fulfilled' ? spcDay2Res.value : empty,
+    spcDay3GeoJson: spcDay3Res.status === 'fulfilled' ? spcDay3Res.value : empty
   };
 }
 

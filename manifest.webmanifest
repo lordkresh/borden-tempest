@@ -1,13 +1,13 @@
 {
-  "name": "Borden Tempest",
+  "name": "Tempest",
   "short_name": "Tempest",
-  "description": "Severe weather intelligence, high-res NEXRAD radar, storm cell Time-on-Target tracking, convective environment, and winter/ground-temp monitoring.",
+  "description": "Tempest (by J. Borden) — Pro Severe Weather Intelligence, High-Res NEXRAD Radar, STP/SCP Hodograph, Storm Cell Time-on-Target, and Winter Suite.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#090D16",
-  "theme_color": "#090D16",
+  "background_color": "#071222",
+  "theme_color": "#071222",
   "categories": ["weather", "utilities"],
   "icons": [
     {

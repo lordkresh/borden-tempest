@@ -32,12 +32,16 @@ export class RadarMapController {
       stormCells: [],
       lsrGeoJson: { type: 'FeatureCollection', features: [] },
       mcdGeoJson: { type: 'FeatureCollection', features: [] },
+      spcWatchesGeoJson: { type: 'FeatureCollection', features: [] },
+      wpcFloodGeoJson: { type: 'FeatureCollection', features: [] },
       spcDay1GeoJson: { type: 'FeatureCollection', features: [] }
     };
     this.layerVisibility = {
       alerts: true,
       cells: true,
       spc: true,
+      watches: true,
+      flood: false,
       mcd: true,
       lsr: true
     };
@@ -77,6 +81,16 @@ export class RadarMapController {
           this.callbacks.onInspectCell(found);
           return;
         }
+      }
+
+      const lsrHits = this.map.queryRenderedFeatures(e.point, { layers: ['tempest_lsr_circle'].filter((id) => this.map.getLayer(id)) });
+      if (lsrHits.length && this.callbacks.onInspectLsr) {
+        const feat = lsrHits[0];
+        this.callbacks.onInspectLsr({
+          properties: feat.properties || {},
+          coords: feat.geometry?.coordinates || [e.lngLat.lng, e.lngLat.lat]
+        });
+        return;
       }
 
       const alertHits = this.map.queryRenderedFeatures(e.point, { layers: ['tempest_alerts_fill'].filter((id) => this.map.getLayer(id)) });
@@ -132,6 +146,8 @@ export class RadarMapController {
       alerts: ['tempest_alerts_fill', 'tempest_alerts_line'],
       cells: ['tempest_cones_fill', 'tempest_cones_line', 'tempest_tot_line', 'tempest_cells_circle', 'tempest_cells_label'],
       spc: ['tempest_spc_fill', 'tempest_spc_line'],
+      watches: ['tempest_watches_fill', 'tempest_watches_line'],
+      flood: ['tempest_flood_fill', 'tempest_flood_line'],
       mcd: ['tempest_mcd_fill', 'tempest_mcd_line'],
       lsr: ['tempest_lsr_circle']
     };
@@ -229,19 +245,66 @@ export class RadarMapController {
     if (!this.map) return;
     this._rebuildRadarLayers();
 
-    // SPC Day 1 Outlook
+    // SPC Convective Outlook (Day 1-3 Cat & Tor/Hail/Wind Prob)
     this.map.addSource('tempest_spc', { type: 'geojson', data: this._emptyFc() });
     this.map.addLayer({
       id: 'tempest_spc_fill',
       type: 'fill',
       source: 'tempest_spc',
-      paint: { 'fill-color': ['coalesce', ['get', 'fill'], '#facc15'], 'fill-opacity': 0.14 }
+      paint: {
+        'fill-color': [
+          'match', ['coalesce', ['get', 'LABEL'], ''],
+          'TSTM', '#4caf50', 'MRGL', '#2e7d32', 'SLGT', '#fdd835', 'ENH', '#fb8c00', 'MDT', '#e53935', 'HIGH', '#d500f9',
+          '0.02', '#2e7d32', '2%', '#2e7d32', '0.05', '#8d6e63', '5%', '#8d6e63', '0.10', '#fdd835', '10%', '#fdd835',
+          '0.15', '#fb8c00', '15%', '#fb8c00', '0.30', '#e53935', '30%', '#e53935', '0.45', '#d500f9', '45%', '#d500f9',
+          '0.60', '#aa00ff', '60%', '#aa00ff', 'SIGN', '#ff1744',
+          ['coalesce', ['get', 'fill'], '#1e88e5']
+        ],
+        'fill-opacity': 0.16
+      }
     });
     this.map.addLayer({
       id: 'tempest_spc_line',
       type: 'line',
       source: 'tempest_spc',
-      paint: { 'line-color': ['coalesce', ['get', 'stroke'], '#facc15'], 'line-width': 1.8 }
+      paint: { 'line-color': ['coalesce', ['get', 'stroke'], '#ffd54f'], 'line-width': 1.6 }
+    });
+
+    // WPC Excessive Rainfall (Flash Flood ERO)
+    this.map.addSource('tempest_flood', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_flood_fill',
+      type: 'fill',
+      source: 'tempest_flood',
+      paint: {
+        'fill-color': [
+          'match', ['coalesce', ['get', 'OUTLOOK'], ''],
+          'MRGL', '#26a69a', 'SLGT', '#fdd835', 'MDT', '#ef5350', 'HIGH', '#d500f9',
+          '#00bfa5'
+        ],
+        'fill-opacity': 0.2
+      }
+    });
+    this.map.addLayer({
+      id: 'tempest_flood_line',
+      type: 'line',
+      source: 'tempest_flood',
+      paint: { 'line-color': '#00e676', 'line-width': 1.8, 'line-dasharray': [2, 2] }
+    });
+
+    // SPC Watch Boxes (PDS Tornado magenta, Tornado red, Severe amber)
+    this.map.addSource('tempest_watches', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_watches_fill',
+      type: 'fill',
+      source: 'tempest_watches',
+      paint: { 'fill-color': ['get', 'watchColor'], 'fill-opacity': 0.11 }
+    });
+    this.map.addLayer({
+      id: 'tempest_watches_line',
+      type: 'line',
+      source: 'tempest_watches',
+      paint: { 'line-color': ['get', 'watchColor'], 'line-width': 2.4, 'line-dasharray': [4, 2] }
     });
 
     // SPC MCD
@@ -447,6 +510,15 @@ export class RadarMapController {
     this.map.getSource('tempest_tot')?.setData({ type: 'FeatureCollection', features: totFeatures });
 
     this.map.getSource('tempest_spc')?.setData(this.overlayData.spcDay1GeoJson || this._emptyFc());
+    this.map.getSource('tempest_flood')?.setData(this.overlayData.wpcFloodGeoJson || this._emptyFc());
+    const watchFeats = (this.overlayData.spcWatchesGeoJson?.features || []).map((f) => {
+      const p = f.properties || {};
+      const isPds = Boolean(p.is_pds || String(p.pds || '').toUpperCase() === 'Y');
+      const isTor = String(p.type || '').toUpperCase() === 'TOR';
+      const watchColor = isPds ? '#ff00ff' : isTor ? '#ff1744' : '#ffb300';
+      return { ...f, properties: { ...p, watchColor } };
+    });
+    this.map.getSource('tempest_watches')?.setData({ type: 'FeatureCollection', features: watchFeats });
     this.map.getSource('tempest_mcd')?.setData(this.overlayData.mcdGeoJson || this._emptyFc());
     this.map.getSource('tempest_lsr')?.setData(this.overlayData.lsrGeoJson || this._emptyFc());
   }

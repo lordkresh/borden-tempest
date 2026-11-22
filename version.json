@@ -1,7 +1,7 @@
 {
-  "versionCode": 3,
-  "versionName": "1.2.0",
+  "versionCode": 4,
+  "versionName": "1.3.0",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-21T22:00:00Z",
-  "releaseNotes": "Severe Weather Engine Hardening (v1.2.0): True 850 hPa (0-1.5km) & 500 hPa (0-6km) upper-air bulk shear + CIN from NOAA HRRR/GFS, ray-casting Point-in-Polygon warning verification, PDS/Observed Tornado & Destructive Severe detection, full 5-tier live siren triggers with escalation re-alerting, Adaptive 45-second Storm Watch mode, iOS Screen Wake Lock, configurable TOT lead time (15-60 min) & convective sensitivity."
+  "publishedAt": "2026-11-22T04:30:00Z",
+  "releaseNotes": "Tempest v1.3.0 (by J. Borden): Official SPC STP/SCP/SRH + live 5-level Hodograph, 3-Day SPC & WPC Flash Flood outlooks, local NWS Meteorologist Discussion (AFD), Spoken NOAA Voice Announcer, 1-tap Refl/Vel/CC radar quick-flip, SPC Watch Boxes, LSR tap-to-inspect, Burnsville-verified ASOS outlier consensus, and new intertwined twin-tornadoes Tempest icon."
 }

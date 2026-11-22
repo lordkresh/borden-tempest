@@ -62,12 +62,31 @@ function mphToKt(mph) {
   return (mph || 0) * 0.868976;
 }
 
+const KT_TO_MS = 0.514444;
+
+function windComponentsKt(spdKt, dirFromDeg) {
+  const rad = (dirFromDeg * Math.PI) / 180;
+  return [-spdKt * Math.sin(rad), -spdKt * Math.cos(rad)];
+}
+
 function vectorShearKt(spd1Kt, dir1Deg, spd2Kt, dir2Deg) {
-  const u1 = -spd1Kt * Math.sin((dir1Deg * Math.PI) / 180);
-  const v1 = -spd1Kt * Math.cos((dir1Deg * Math.PI) / 180);
-  const u2 = -spd2Kt * Math.sin((dir2Deg * Math.PI) / 180);
-  const v2 = -spd2Kt * Math.cos((dir2Deg * Math.PI) / 180);
+  const [u1, v1] = windComponentsKt(spd1Kt, dir1Deg);
+  const [u2, v2] = windComponentsKt(spd2Kt, dir2Deg);
   return Math.hypot(u2 - u1, v2 - v1);
+}
+
+/**
+ * Exact discrete Storm-Relative Helicity integral (Davies-Jones et al. 1990):
+ * Positive for clockwise-curving Northern Hemisphere hodographs with RM storm motion to the right.
+ */
+function integrateSrh(levelsMs, stormU, stormV) {
+  let total = 0;
+  for (let i = 0; i < levelsMs.length - 1; i++) {
+    const [u1, v1] = levelsMs[i];
+    const [u2, v2] = levelsMs[i + 1];
+    total += (u2 - stormU) * (v1 - stormV) - (u1 - stormU) * (v2 - stormV);
+  }
+  return total;
 }
 
 function findCurrentHourIndex(hourly) {
@@ -99,31 +118,41 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
   const stationNames = [];
   let primaryObs = null;
 
+  const omTemp = cur.temperature_2m ?? null;
+  const nwsHourlyTemp = nwsBundle?.hourlyPeriods?.[0]?.temperature ?? null;
+  const anchorTemp = nwsHourlyTemp ?? omTemp;
+
+  // Outlier rejection (screens rural municipal AWOS cold-drainage glitches > 4.5°F from NDFD/HRRR anchor)
+  const validStations = [];
   for (const obs of nwsBundle?.observations || []) {
     const p = obs.props;
     if (!p) continue;
-    // Skip stale observations older than 2.5 hours
     if (p.timestamp) {
       const ageMin = (Date.now() - new Date(p.timestamp).getTime()) / 60000;
-      if (ageMin > 150) continue;
+      if (ageMin > 90) continue;
     }
     const tF = cToF(p.temperature?.value);
     const dF = cToF(p.dewpoint?.value);
+    const rh = p.relativeHumidity?.value ?? null;
+    const desc = String(p.textDescription || '').toLowerCase();
+    const bogusClear100Rh = rh != null && rh >= 99 && (desc.includes('clear') || desc.includes('fair') || desc.includes('sunny'));
     if (tF != null && !Number.isNaN(tF)) {
-      stationTemps.push(tF);
-      stationNames.push(obs.stationId);
-      if (!primaryObs) primaryObs = obs;
+      if (anchorTemp != null && Math.abs(tF - anchorTemp) > 4.5) continue;
+      validStations.push({ obs, tF, dF: bogusClear100Rh ? null : dF, rh: bogusClear100Rh ? null : rh });
     }
-    if (dF != null && !Number.isNaN(dF)) stationDews.push(dF);
   }
 
-  const omTemp = cur.temperature_2m ?? null;
-  const nwsHourlyTemp = nwsBundle?.hourlyPeriods?.[0]?.temperature ?? null;
+  for (const vs of validStations) {
+    stationTemps.push(vs.tF);
+    stationNames.push(vs.obs.stationId);
+    if (!primaryObs) primaryObs = vs.obs;
+    if (vs.dF != null && !Number.isNaN(vs.dF)) stationDews.push(vs.dF);
+  }
 
   const samples = [];
-  stationTemps.forEach((t, i) => samples.push({ v: t, w: i === 0 ? 0.55 : 0.3 }));
-  if (nwsHourlyTemp != null) samples.push({ v: nwsHourlyTemp, w: 0.2 });
-  if (omTemp != null) samples.push({ v: omTemp, w: stationTemps.length ? 0.25 : 1.0 });
+  if (nwsHourlyTemp != null) samples.push({ v: nwsHourlyTemp, w: 0.45 });
+  stationTemps.forEach((t, i) => samples.push({ v: t, w: i === 0 ? 0.35 : 0.2 }));
+  if (omTemp != null) samples.push({ v: omTemp, w: stationTemps.length || nwsHourlyTemp != null ? 0.2 : 1.0 });
 
   const totalW = samples.reduce((a, s) => a + s.w, 0) || 1;
   const tempF = samples.length
@@ -135,10 +164,11 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
     : 0;
 
   const dewpointF = stationDews.length
-    ? (stationDews[0] * 0.65 + (cur.dew_point_2m ?? stationDews[0]) * 0.35)
+    ? (stationDews[0] * 0.55 + (cur.dew_point_2m ?? stationDews[0]) * 0.45)
     : (cur.dew_point_2m ?? null);
 
-  const pressureHpa = paToHpa(primaryObs?.props?.barometricPressure?.value)
+  const pressureHpa = paToHpa(primaryObs?.props?.seaLevelPressure?.value)
+    ?? paToHpa(primaryObs?.props?.barometricPressure?.value)
     ?? cur.pressure_msl
     ?? hourly.pressure_msl?.[idx]
     ?? cur.surface_pressure
@@ -151,7 +181,8 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
   const windMph = kmhToMph(primaryObs?.props?.windSpeed?.value) ?? cur.wind_speed_10m ?? 0;
   const gustMph = kmhToMph(primaryObs?.props?.windGust?.value) ?? cur.wind_gusts_10m ?? null;
   const windDir = primaryObs?.props?.windDirection?.value ?? cur.wind_direction_10m ?? null;
-  const humidity = primaryObs?.props?.relativeHumidity?.value ?? cur.relative_humidity_2m ?? null;
+  const validRh = validStations.find((v) => v.rh != null)?.rh ?? null;
+  const humidity = validRh ?? cur.relative_humidity_2m ?? null;
   const visMi = mToMiles(primaryObs?.props?.visibility?.value) ?? mToMiles(hourly.visibility?.[idx]) ?? 10;
 
   const [wmoLabel, wmoIcon] = wmoInfo(cur.weather_code);
@@ -199,16 +230,97 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
   const calcAt = (i) => {
     const cape = hourly.cape?.[i] ?? 0;
     const cin = hourly.convective_inhibition?.[i] ?? 0;
+    const tempF = hourly.temperature_2m?.[i] ?? current.tempF ?? 65;
+    const dewF = hourly.dew_point_2m?.[i] ?? current.dewpointF ?? 50;
+
     const w10 = mphToKt(hourly.wind_speed_10m?.[i] ?? current.windMph ?? 0);
     const d10 = hourly.wind_direction_10m?.[i] ?? current.windDirDeg ?? 0;
     const w850 = mphToKt(hourly.wind_speed_850hPa?.[i] ?? hourly.wind_speed_10m?.[i] ?? 0);
     const d850 = hourly.wind_direction_850hPa?.[i] ?? d10;
     const w500 = mphToKt(hourly.wind_speed_500hPa?.[i] ?? hourly.wind_speed_850hPa?.[i] ?? 0);
     const d500 = hourly.wind_direction_500hPa?.[i] ?? d850;
+
+    const [u0, v0] = windComponentsKt(w10, d10);
+    const [u850, v850] = windComponentsKt(w850, d850);
+    const [u500, v500] = windComponentsKt(w500, d500);
+
+    const has925 = hourly.wind_speed_925hPa?.[i] != null && hourly.wind_direction_925hPa?.[i] != null;
+    const [u925, v925] = has925
+      ? windComponentsKt(mphToKt(hourly.wind_speed_925hPa[i]), hourly.wind_direction_925hPa[i])
+      : [(u0 + u850) * 0.5, (v0 + v850) * 0.5];
+
+    const has700 = hourly.wind_speed_700hPa?.[i] != null && hourly.wind_direction_700hPa?.[i] != null;
+    const [u700, v700] = has700
+      ? windComponentsKt(mphToKt(hourly.wind_speed_700hPa[i]), hourly.wind_direction_700hPa[i])
+      : [(u850 + u500) * 0.5, (v850 + v500) * 0.5];
+
+    const hodographPoints = [
+      { label: 'Sfc', heightKm: 0.0, uKt: u0, vKt: v0 },
+      { label: '925', heightKm: 0.75, uKt: u925, vKt: v925 },
+      { label: '850', heightKm: 1.5, uKt: u850, vKt: v850 },
+      { label: '700', heightKm: 3.0, uKt: u700, vKt: v700 },
+      { label: '500', heightKm: 5.8, uKt: u500, vKt: v500 }
+    ];
+
     const lowShearKt = vectorShearKt(w10, d10, w850, d850);
     const deepShearKt = vectorShearKt(w10, d10, w500, d500);
-    const veer850 = angularDiffDeg(d10, d850); // positive = clockwise veering (helicity)
-    return { cape, cin, lowShearKt, deepShearKt, veer850 };
+    const veer850 = angularDiffDeg(d10, d850);
+
+    // Bunkers Right-Mover Storm Motion (m/s)
+    const meanU = ((u0 + u925 + u850 + u700 + u500) / 5) * KT_TO_MS;
+    const meanV = ((v0 + v925 + v850 + v700 + v500) / 5) * KT_TO_MS;
+    const shearU = (u500 - u0) * KT_TO_MS;
+    const shearV = (v500 - v0) * KT_TO_MS;
+    const shearMag = Math.max(0.01, Math.hypot(shearU, shearV));
+    const cx = meanU + 7.5 * (shearV / shearMag);
+    const cy = meanV + 7.5 * (-shearU / shearMag);
+    const bunkersSpeedKt = Math.hypot(cx, cy) / KT_TO_MS;
+    const bunkersHeadingDeg = ((Math.atan2(cx, cy) * 180) / Math.PI + 360) % 360;
+
+    // 1.0 km interpolated wind vector & exact Davies-Jones SRH
+    const u1km = (u925 + (u850 - u925) * (0.25 / 0.75)) * KT_TO_MS;
+    const v1km = (v925 + (v850 - v925) * (0.25 / 0.75)) * KT_TO_MS;
+    const srh0to1 = Math.max(0, integrateSrh([
+      [u0 * KT_TO_MS, v0 * KT_TO_MS],
+      [u925 * KT_TO_MS, v925 * KT_TO_MS],
+      [u1km, v1km]
+    ], cx, cy));
+    const srh0to3 = Math.max(0, integrateSrh([
+      [u0 * KT_TO_MS, v0 * KT_TO_MS],
+      [u925 * KT_TO_MS, v925 * KT_TO_MS],
+      [u850 * KT_TO_MS, v850 * KT_TO_MS],
+      [u700 * KT_TO_MS, v700 * KT_TO_MS]
+    ], cx, cy));
+
+    // Espy LCL height (m) & 700-500 hPa lapse rate (C/km)
+    const tempC = ((tempF - 32) * 5) / 9;
+    const dewC = ((dewF - 32) * 5) / 9;
+    const lclMeters = Math.max(50, Math.min(5000, Math.round(125 * Math.max(0, tempC - dewC))));
+
+    const t700 = hourly.temperature_700hPa?.[i];
+    const t500 = hourly.temperature_500hPa?.[i];
+    const h700 = hourly.geopotential_height_700hPa?.[i];
+    const h500 = hourly.geopotential_height_500hPa?.[i];
+    let lapseRate700to500 = 5.8;
+    if (t700 != null && t500 != null && h700 != null && h500 != null && (h500 - h700) > 500) {
+      const dTC = ((t700 - t500) * 5) / 9;
+      lapseRate700to500 = Math.round((dTC / ((h500 - h700) / 1000)) * 10) / 10;
+    }
+
+    // Official SPC Fixed-Layer Significant Tornado Parameter (STP) & Supercell Composite (SCP)
+    const bulkShearMs = deepShearKt * KT_TO_MS;
+    const lclTerm = lclMeters > 2000 ? 0 : lclMeters < 1000 ? 1 : (2000 - lclMeters) / 1000;
+    const shearTerm = bulkShearMs < 12.5 ? 0 : bulkShearMs > 30 ? 1.5 : bulkShearMs / 20;
+    const cinAbs = Math.abs(cin);
+    const cinTerm = cinAbs >= 200 ? 0 : cinAbs <= 50 ? 1 : (200 - cinAbs) / 150;
+    const stp = Math.round(Math.min(12, Math.max(0, (cape / 1500) * lclTerm * (srh0to1 / 150) * shearTerm * cinTerm)) * 10) / 10;
+    const scp = Math.round(Math.min(25, Math.max(0, (cape / 1000) * (srh0to3 / 50) * Math.min(1.5, bulkShearMs / 20))) * 10) / 10;
+
+    return {
+      cape, cin, lowShearKt, deepShearKt, veer850,
+      srh0to1, srh0to3, lclMeters, lapseRate700to500, stp, scp,
+      bunkersHeadingDeg, bunkersSpeedKt, hodographPoints
+    };
   };
 
   const nowSample = calcAt(idx);
@@ -316,12 +428,84 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
     bulkShear0to6KmKt,
     peakBulkShearKt,
     veeringDeg,
+    srh0to1Km: Math.round(nowSample.srh0to1),
+    srh0to3Km: Math.round(nowSample.srh0to3),
+    stp: nowSample.stp,
+    scp: nowSample.scp,
+    lclMeters: nowSample.lclMeters,
+    lapseRate700to500: nowSample.lapseRate700to500,
+    bunkersHeadingDeg: nowSample.bunkersHeadingDeg,
+    bunkersSpeedKt: Math.round(nowSample.bunkersSpeedKt),
+    bunkersCompass: degToCompass(nowSample.bunkersHeadingDeg),
+    hodographPoints: nowSample.hodographPoints,
     dewpointF: dewF,
     pressureTrend3h: pTrend,
     isHslc,
     nocturnalEscalated,
     nocturnalRisk,
     proactiveAlerts
+  };
+}
+
+/**
+ * Evaluates Day 1-3 SPC Categorical, Day 1 Tornado/Hail/Wind %, WPC Flash Flood ERO,
+ * and active SPC Watch Boxes at the user's exact coordinates.
+ */
+export function evaluateMultiDayOutlooks(userLat, userLon, intel) {
+  const catRank = { NONE: 0, TSTM: 1, MRGL: 2, SLGT: 3, ENH: 4, MDT: 5, HIGH: 6 };
+  const findHighestCat = (fc, propKey = 'LABEL') => {
+    let best = 'NONE';
+    for (const f of fc?.features || []) {
+      if (!f.geometry || !isPointInGeometry(userLat, userLon, f.geometry)) continue;
+      const raw = String(f.properties?.[propKey] || f.properties?.OUTLOOK || f.properties?.LABEL2 || '').trim().toUpperCase();
+      const norm = raw.includes('HIGH') ? 'HIGH'
+        : raw.includes('MDT') || raw.includes('MODERATE') ? 'MDT'
+        : raw.includes('ENH') ? 'ENH'
+        : raw.includes('SLGT') || raw.includes('SLIGHT') ? 'SLGT'
+        : raw.includes('MRGL') || raw.includes('MARGINAL') ? 'MRGL'
+        : raw.includes('TSTM') ? 'TSTM' : 'NONE';
+      if ((catRank[norm] || 0) > (catRank[best] || 0)) best = norm;
+    }
+    return best;
+  };
+
+  const findHighestProb = (fc) => {
+    let bestPct = 0;
+    let isSign = false;
+    for (const f of fc?.features || []) {
+      if (!f.geometry || !isPointInGeometry(userLat, userLon, f.geometry)) continue;
+      const lbl = String(f.properties?.LABEL || '').trim().toUpperCase();
+      if (lbl === 'SIGN') { isSign = true; continue; }
+      const n = parseFloat(lbl.replace('%', ''));
+      if (!Number.isNaN(n)) {
+        const pct = n <= 1 ? Math.round(n * 100) : Math.round(n);
+        if (pct > bestPct) bestPct = pct;
+      }
+    }
+    if (bestPct === 0) return 'NONE';
+    return isSign ? `${bestPct}% SIG` : `${bestPct}%`;
+  };
+
+  const activeWatches = (intel?.spcWatchesGeoJson?.features || []).filter((f) =>
+    f.geometry && isPointInGeometry(userLat, userLon, f.geometry)
+  ).map((f) => {
+    const p = f.properties || {};
+    return {
+      number: p.num || p.SEL || '',
+      type: String(p.type || '').toUpperCase(),
+      isPds: Boolean(p.is_pds || String(p.pds || '').toUpperCase() === 'Y')
+    };
+  });
+
+  return {
+    day1Category: findHighestCat(intel?.spcDay1GeoJson, 'LABEL'),
+    day1TornadoProb: findHighestProb(intel?.spcDay1TorGeoJson),
+    day1HailProb: findHighestProb(intel?.spcDay1HailGeoJson),
+    day1WindProb: findHighestProb(intel?.spcDay1WindGeoJson),
+    day2Category: findHighestCat(intel?.spcDay2GeoJson, 'LABEL'),
+    day3Category: findHighestCat(intel?.spcDay3GeoJson, 'LABEL'),
+    wpcDay1FloodRisk: findHighestCat(intel?.wpcFloodGeoJson, 'OUTLOOK'),
+    activeWatches
   };
 }
 
