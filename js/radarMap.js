@@ -1,3 +1,5 @@
+import { buildCirclePolygon, destinationPoint } from './geoMath.js';
+
 const BASEMAP_STYLES = {
   dark: 'https://tiles.openfreemap.org/styles/dark',
   liberty: 'https://tiles.openfreemap.org/styles/liberty'
@@ -73,7 +75,8 @@ export class RadarMapController {
 
     this.map.on('click', (e) => {
       if (!this.ready) return;
-      const cellHits = this.map.queryRenderedFeatures(e.point, { layers: ['tempest_cells_circle'].filter((id) => this.map.getLayer(id)) });
+      const cellLayers = ['tempest_cells_circle', 'tempest_cells_ring', 'tempest_cells_label'].filter((id) => this.map.getLayer(id));
+      const cellHits = cellLayers.length ? this.map.queryRenderedFeatures(e.point, { layers: cellLayers }) : [];
       if (cellHits.length && this.callbacks.onInspectCell) {
         const cid = cellHits[0].properties?.id;
         const found = this.overlayData.stormCells.find((c) => c.id === cid);
@@ -110,9 +113,16 @@ export class RadarMapController {
     }
   }
 
-  flyTo(lat, lon, zoom = 8.2) {
+  setUserLocation(lat, lon) {
     this.userLoc = { lat, lon };
     this._updateUserSource();
+    if (this.ready) this._updateGeoJsonSources();
+  }
+
+  flyTo(lat, lon, zoom = 8.2, isUserOrigin = false) {
+    if (isUserOrigin) {
+      this.setUserLocation(lat, lon);
+    }
     if (this.map) {
       this.map.flyTo({ center: [lon, lat], zoom, duration: 750 });
     }
@@ -144,7 +154,18 @@ export class RadarMapController {
     const vis = visible ? 'visible' : 'none';
     const mapIds = {
       alerts: ['tempest_alerts_fill', 'tempest_alerts_line'],
-      cells: ['tempest_cones_fill', 'tempest_cones_line', 'tempest_tot_line', 'tempest_cells_circle', 'tempest_cells_label'],
+      cells: [
+        'tempest_range_rings_line',
+        'tempest_range_rings_label',
+        'tempest_cones_fill',
+        'tempest_cones_line',
+        'tempest_vectors_casing',
+        'tempest_vectors_line',
+        'tempest_tot_line',
+        'tempest_cells_ring',
+        'tempest_cells_circle',
+        'tempest_cells_label'
+      ],
       spc: ['tempest_spc_fill', 'tempest_spc_line'],
       watches: ['tempest_watches_fill', 'tempest_watches_line'],
       flood: ['tempest_flood_fill', 'tempest_flood_line'],
@@ -337,19 +358,65 @@ export class RadarMapController {
       paint: { 'line-color': ['get', 'color'], 'line-width': 2.5 }
     });
 
-    // Storm Cell Threat Cones & TOT Lines
+    // Concentric Tactical Range Rings (15 / 30 / 60 mi)
+    this.map.addSource('tempest_range_rings', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_range_rings_line',
+      type: 'line',
+      source: 'tempest_range_rings',
+      paint: {
+        'line-color': '#38bdf8',
+        'line-opacity': 0.24,
+        'line-width': 1.1,
+        'line-dasharray': [4, 4]
+      }
+    });
+    this.map.addSource('tempest_range_rings_labels', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_range_rings_label',
+      type: 'symbol',
+      source: 'tempest_range_rings_labels',
+      layout: {
+        'text-field': ['get', 'label'],
+        'text-size': 10,
+        'text-anchor': 'bottom'
+      },
+      paint: {
+        'text-color': 'rgba(125, 211, 252, 0.72)',
+        'text-halo-color': '#070c16',
+        'text-halo-width': 1.5
+      }
+    });
+
+    // Storm Cell Threat Cones, Centerline Motion Vectors & TOT Lines
     this.map.addSource('tempest_cones', { type: 'geojson', data: this._emptyFc() });
     this.map.addLayer({
       id: 'tempest_cones_fill',
       type: 'fill',
       source: 'tempest_cones',
-      paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.18 }
+      paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.16 }
     });
     this.map.addLayer({
       id: 'tempest_cones_line',
       type: 'line',
       source: 'tempest_cones',
-      paint: { 'line-color': ['get', 'color'], 'line-width': 1.5, 'line-dasharray': [2, 2] }
+      paint: { 'line-color': ['get', 'color'], 'line-width': 1.8, 'line-opacity': 0.85, 'line-dasharray': [3, 2] }
+    });
+
+    this.map.addSource('tempest_vectors', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_vectors_casing',
+      type: 'line',
+      source: 'tempest_vectors',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': '#060b14', 'line-width': 4.4, 'line-opacity': 0.8 }
+    });
+    this.map.addLayer({
+      id: 'tempest_vectors_line',
+      type: 'line',
+      source: 'tempest_vectors',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': ['get', 'color'], 'line-width': 2.4 }
     });
 
     this.map.addSource('tempest_tot', { type: 'geojson', data: this._emptyFc() });
@@ -367,21 +434,35 @@ export class RadarMapController {
       type: 'circle',
       source: 'tempest_lsr',
       paint: {
-        'circle-radius': 5,
+        'circle-radius': 5.5,
         'circle-color': '#facc15',
         'circle-stroke-color': '#090d16',
-        'circle-stroke-width': 1.5
+        'circle-stroke-width': 1.8
       }
     });
 
-    // Storm Cell Markers
+    // Storm Cell Markers (Outer Rotation Halo + Core Dot + Velocity Vector Tag)
     this.map.addSource('tempest_cells', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_cells_ring',
+      type: 'circle',
+      source: 'tempest_cells',
+      filter: ['>=', ['get', 'threatScore'], 3],
+      paint: {
+        'circle-radius': 14,
+        'circle-color': ['get', 'color'],
+        'circle-opacity': 0.16,
+        'circle-stroke-color': ['get', 'color'],
+        'circle-stroke-width': 1.5,
+        'circle-stroke-opacity': 0.72
+      }
+    });
     this.map.addLayer({
       id: 'tempest_cells_circle',
       type: 'circle',
       source: 'tempest_cells',
       paint: {
-        'circle-radius': 7,
+        'circle-radius': ['case', ['>=', ['get', 'threatScore'], 3], 8.5, 6.5],
         'circle-color': ['get', 'color'],
         'circle-stroke-color': '#ffffff',
         'circle-stroke-width': 2
@@ -394,29 +475,42 @@ export class RadarMapController {
       layout: {
         'text-field': ['get', 'label'],
         'text-size': 11,
-        'text-offset': [0, 1.35],
-        'text-anchor': 'top'
+        'text-offset': [0, 1.45],
+        'text-anchor': 'top',
+        'text-allow-overlap': false
       },
       paint: {
-        'text-color': '#ffffff',
-        'text-halo-color': '#090d16',
-        'text-halo-width': 1.5
+        'text-color': '#f8fafc',
+        'text-halo-color': '#060a12',
+        'text-halo-width': 1.8
       }
     });
 
-    // User Location Marker
+    // User Location Beacon
     this.map.addSource('tempest_user', { type: 'geojson', data: this._emptyFc() });
+    this.map.addLayer({
+      id: 'tempest_user_ring',
+      type: 'circle',
+      source: 'tempest_user',
+      paint: {
+        'circle-radius': 18,
+        'circle-color': 'transparent',
+        'circle-stroke-color': '#00d4ff',
+        'circle-stroke-width': 1.2,
+        'circle-stroke-opacity': 0.45
+      }
+    });
     this.map.addLayer({
       id: 'tempest_user_halo',
       type: 'circle',
       source: 'tempest_user',
-      paint: { 'circle-radius': 13, 'circle-color': '#00d4ff', 'circle-opacity': 0.25 }
+      paint: { 'circle-radius': 11, 'circle-color': '#00d4ff', 'circle-opacity': 0.28 }
     });
     this.map.addLayer({
       id: 'tempest_user_dot',
       type: 'circle',
       source: 'tempest_user',
-      paint: { 'circle-radius': 6, 'circle-color': '#00d4ff', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 2.5 }
+      paint: { 'circle-radius': 5.5, 'circle-color': '#00d4ff', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 2.4 }
     });
 
     this._updateUserSource();
@@ -465,6 +559,27 @@ export class RadarMapController {
         properties: {}
       }]
     });
+
+    const ringRadii = [15, 30, 60];
+    this.map.getSource('tempest_range_rings')?.setData({
+      type: 'FeatureCollection',
+      features: ringRadii.map((mi) => ({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: buildCirclePolygon(this.userLoc.lat, this.userLoc.lon, mi, 64) },
+        properties: { radiusMi: mi }
+      }))
+    });
+    this.map.getSource('tempest_range_rings_labels')?.setData({
+      type: 'FeatureCollection',
+      features: ringRadii.map((mi) => {
+        const pt = destinationPoint(this.userLoc.lat, this.userLoc.lon, 0, mi);
+        return {
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: [pt.lon, pt.lat] },
+          properties: { label: `${mi} mi` }
+        };
+      })
+    });
   }
 
   _updateGeoJsonSources() {
@@ -480,15 +595,23 @@ export class RadarMapController {
     this.map.getSource('tempest_alerts')?.setData({ type: 'FeatureCollection', features: alertFeatures });
 
     const cells = this.overlayData.stormCells || [];
-    const cellFeatures = cells.map((c) => ({
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: [c.lon, c.lat] },
-      properties: {
-        id: c.id,
-        color: c.color,
-        label: c.tvs ? `TVS ${c.stormId}` : c.meso ? `MESO ${c.stormId}` : `${c.stormId}`
-      }
-    }));
+    const cellFeatures = cells.map((c) => {
+      const prefix = c.tvs ? 'TVS' : c.meso ? 'SUP' : c.threatScore >= 2 ? 'SVR' : '';
+      const dirTag = c.speedMph >= 3 && c.moveToCompass && c.moveToCompass !== '--'
+        ? ` →${c.moveToCompass} ${c.speedMph}`
+        : '';
+      const label = prefix ? `${prefix} ${c.stormId}${dirTag}` : `${c.stormId}${dirTag}`;
+      return {
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [c.lon, c.lat] },
+        properties: {
+          id: c.id,
+          color: c.color,
+          threatScore: c.threatScore || 1,
+          label
+        }
+      };
+    });
     this.map.getSource('tempest_cells')?.setData({ type: 'FeatureCollection', features: cellFeatures });
 
     const coneFeatures = cells
@@ -499,6 +622,22 @@ export class RadarMapController {
         properties: { id: c.id, color: c.color }
       }));
     this.map.getSource('tempest_cones')?.setData({ type: 'FeatureCollection', features: coneFeatures });
+
+    const vectorFeatures = [];
+    for (const c of cells) {
+      if (!c.vectorLine) continue;
+      vectorFeatures.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: c.vectorLine.coords },
+        properties: { id: c.id, color: c.color }
+      });
+      vectorFeatures.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: c.vectorLine.arrowCoords },
+        properties: { id: c.id, color: c.color }
+      });
+    }
+    this.map.getSource('tempest_vectors')?.setData({ type: 'FeatureCollection', features: vectorFeatures });
 
     const totFeatures = cells
       .filter((c) => c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS')

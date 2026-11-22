@@ -1,5 +1,6 @@
 import {
   angularDiffDeg,
+  buildMotionVectorLine,
   buildThreatConePolygon,
   computeStormIntercept,
   degToCompass,
@@ -605,101 +606,257 @@ export function analyzeWinterSuite(openMeteo, current, groundFreezeThresholdF = 
   };
 }
 
+const TDWR_SITES = new Set([
+  'MEM', 'BNA', 'ATL', 'DFW', 'DAL', 'HOU', 'IAH', 'MCI', 'MSP', 'ORD', 'MDW',
+  'STL', 'CLT', 'RDU', 'MIA', 'FLL', 'MCO', 'TPA', 'DEN', 'SLC', 'PHX', 'LAS',
+  'EWR', 'JFK', 'PHL', 'BWI', 'DCA', 'IAD', 'BOS', 'DTW', 'CVG', 'CMH', 'CLE',
+  'IND', 'MKE', 'PIT', 'MSY', 'OKC', 'TUL', 'ICT', 'SDF', 'DAY', 'PBI', 'SJU'
+]);
+
+function parseMesoRank(rawMeso) {
+  const s = String(rawMeso || '').trim().toUpperCase();
+  if (!s || s === 'NONE' || s === '0' || s === 'NULL' || s === 'UNC' || s === 'NA') return 0;
+  const num = parseInt(s, 10);
+  if (!Number.isNaN(num)) return Math.max(0, Math.min(20, num));
+  if (s.includes('SIG') || s.includes('STRONG') || s.includes('3D') || s.includes('MESO')) return 4;
+  return 0;
+}
+
 /**
  * NEXRAD Storm Cell Threat & Time-on-Target (TOT) Intercept Engine
- * Verified: IEM nexrad_attr.geojson `drct` is meteorological FROM direction; moving-TO bearing = (drct + 180) % 360.
+ * Verified against IEM nexrad_attr.geojson:
+ * - `drct` is meteorological FROM direction; moving-TO bearing = (drct + 180) % 360.
+ * - Rejects shallow non-convective showers/clutter (e.g. MDA shear on 4.6 kft / VIL 2 rain).
+ * - Spatially deduplicates overlapping radar detections within 8 miles into one confirmed cell.
  */
-export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadiusMi = 120) {
+export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadiusMi = 120, nowMs = Date.now()) {
   const features = stormCellsGeoJson?.features || [];
-  const analyzed = [];
+  const candidates = [];
 
   for (const f of features) {
     const coords = f.geometry?.coordinates;
     if (!coords || coords.length < 2) continue;
     const [lon, lat] = coords;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
     const dist = haversineMiles(userLat, userLon, lat, lon);
     if (dist > maxRadiusMi) continue;
 
     const p = f.properties || {};
-    // Skip stale NEXRAD storm cell reports older than 25 minutes
     if (p.valid) {
-      const ageMin = (Date.now() - new Date(p.valid).getTime()) / 60000;
-      if (ageMin > 25) continue;
+      const validMs = new Date(p.valid).getTime();
+      if (Number.isFinite(validMs)) {
+        const ageMin = (nowMs - validMs) / 60000;
+        if (ageMin > 25) continue;
+      }
     }
 
-    const tvs = String(p.tvs || '').toUpperCase();
-    const meso = String(p.meso || '').toUpperCase();
+    const nexrad = String(p.nexrad || 'NEXRAD').trim().toUpperCase();
+    const isTdwr = TDWR_SITES.has(nexrad);
+    const radarRangeKm = parseFloat(p.range || '0') || 0;
+    const radarRangeMi = radarRangeKm > 0 ? Number((radarRangeKm * 0.621371).toFixed(0)) : null;
+
+    const rawTvs = String(p.tvs || '').trim().toUpperCase();
+    const rawMeso = String(p.meso || '').trim().toUpperCase();
+    const mesoRank = parseMesoRank(rawMeso);
     const maxSizeIn = parseFloat(p.max_size || '0') || 0;
     const poh = parseFloat(p.poh || '0') || 0;
     const posh = parseFloat(p.posh || '0') || 0;
+    const vil = parseFloat(p.vil || '0') || 0;
     const topKft = parseFloat(p.top || '0') || 0;
     const maxDbz = parseFloat(p.max_dbz || '0') || 0;
+    const maxDbzHeightKft = parseFloat(p.max_dbz_height || '0') || 0;
 
-    const speedKt = parseFloat(p.sknt || '0') || 0;
-    const speedMph = Math.round(speedKt * 1.15078);
-    const drctFrom = p.drct != null && p.drct !== '' ? parseFloat(p.drct) : null;
-    const moveToBearing = drctFrom != null && !Number.isNaN(drctFrom) && speedKt > 0
-      ? (drctFrom + 180) % 360
-      : null;
+    // 1. Reject shallow rain showers, ground clutter & bird/chaff artifacts outright
+    if (topKft < 14 && vil < 8 && maxDbz < 52 && maxSizeIn < 0.5) continue;
 
-    const hasTvs = tvs === 'TVS' || tvs === 'ETVS';
-    const hasMeso = Boolean(meso && meso !== 'NONE' && meso !== '0' && meso !== 'NULL' && meso !== 'UNC');
+    const hasRawTvs = rawTvs === 'TVS' || rawTvs === 'ETVS';
+    const hasRawMeso = mesoRank > 0;
+    const hasDeepConvection = topKft >= 20 && (vil >= 15 || maxDbz >= 55 || maxSizeIn >= 0.75);
+    const tdwrConvectiveOk = !isTdwr || (maxDbz >= 58 && vil >= 15);
 
     let threatLevel = 'STRONG';
     let threatScore = 1;
-    let color = '#ff9800';
+    let color = '#facc15';
+    let verifiedTvs = null;
+    let verifiedMeso = null;
+    let mesoFiltered = false;
 
-    if (hasTvs) {
+    if (hasRawTvs && (topKft >= 18 || vil >= 12 || maxDbz >= 52) && tdwrConvectiveOk) {
       threatLevel = 'TORNADO_TVS';
       threatScore = 4;
       color = '#ff2b4a';
-    } else if (hasMeso || maxSizeIn >= 1.5) {
+      verifiedTvs = rawTvs;
+      if (hasRawMeso && hasDeepConvection) verifiedMeso = rawMeso;
+    } else if (
+      tdwrConvectiveOk &&
+      (
+        (hasRawMeso && mesoRank >= 3 && hasDeepConvection) ||
+        (hasRawMeso && mesoRank >= 2 && topKft >= 22 && vil >= 20 && maxDbz >= 58) ||
+        (maxSizeIn >= 1.5 && topKft >= 22 && vil >= 25)
+      )
+    ) {
       threatLevel = 'SUPERCELL';
       threatScore = 3;
       color = '#d946ef';
-    } else if (maxSizeIn >= 0.75 || posh >= 40 || topKft >= 40 || maxDbz >= 62) {
+      verifiedMeso = hasRawMeso ? rawMeso : null;
+    } else if (
+      (maxSizeIn >= 0.75 && topKft >= 18) ||
+      (posh >= 50 && vil >= 20) ||
+      (vil >= 35 && maxDbz >= 58) ||
+      (topKft >= 38 && maxDbz >= 55)
+    ) {
       threatLevel = 'SEVERE';
       threatScore = 2;
-      color = '#ff6600';
+      color = '#ff7a18';
+      if (hasRawMeso) mesoFiltered = true;
     } else {
-      if (dist > 45) continue;
+      // Only retain genuinely convective non-severe storms within 55 mi
+      if (dist > 55 || topKft < 18 || maxDbz < 50 || vil < 10) continue;
+      threatLevel = 'STRONG';
+      threatScore = 1;
       color = '#facc15';
+      if (hasRawMeso) mesoFiltered = true;
     }
+
+    // 2. Verified Storm Motion (IEM drct = meteorological FROM -> moveTo = (drct + 180) % 360)
+    const speedKtRaw = parseFloat(p.sknt || '0') || 0;
+    const speedMphRaw = Math.round(speedKtRaw * 1.15078);
+    const drctFromRaw = p.drct != null && p.drct !== '' ? parseFloat(p.drct) : null;
+    const motionUnreliable =
+      speedKtRaw <= 0 ||
+      drctFromRaw == null ||
+      Number.isNaN(drctFromRaw) ||
+      speedMphRaw > 95 ||
+      (speedMphRaw > 80 && (topKft < 20 || vil < 10));
+
+    const speedMph = motionUnreliable ? 0 : speedMphRaw;
+    const moveFromBearing = motionUnreliable ? null : Math.round(((drctFromRaw % 360) + 360) % 360);
+    const moveToBearing = motionUnreliable ? null : Math.round((moveFromBearing + 180) % 360);
+    const moveToCompass = moveToBearing != null ? degToCompass(moveToBearing) : '--';
+    const moveFromCompass = moveFromBearing != null ? degToCompass(moveFromBearing) : '--';
+    const motionSummary = speedMph >= 3 && moveToBearing != null
+      ? `Moving ${moveToCompass} (${String(moveToBearing).padStart(3, '0')}°) @ ${speedMph} mph · from ${moveFromCompass}`
+      : 'Stationary / Slow-Moving';
 
     const intercept = computeStormIntercept(userLat, userLon, lat, lon, moveToBearing, speedMph);
     const coneCoords = buildThreatConePolygon(lat, lon, moveToBearing, speedMph, 45);
+    const vectorLine = buildMotionVectorLine(lat, lon, moveToBearing, speedMph, 45);
 
-    analyzed.push({
-      id: `${p.nexrad || 'RAD'}_${p.storm_id || 'X'}`,
-      nexrad: p.nexrad || 'NEXRAD',
+    const obsQualityScore =
+      (!isTdwr ? 500 : 0) +
+      threatScore * 120 -
+      Math.min(radarRangeKm || 120, 320) * 0.8 +
+      vil * 1.5 +
+      maxDbz;
+
+    candidates.push({
+      id: `${nexrad}_${p.storm_id || 'X'}`,
+      nexrad,
+      isTdwr,
       stormId: p.storm_id || 'CELL',
+      valid: p.valid || null,
       lat,
       lon,
-      tvs: hasTvs ? tvs : null,
-      meso: hasMeso ? meso : null,
+      radarRangeKm,
+      radarRangeMi,
+      tvs: verifiedTvs,
+      meso: verifiedMeso,
+      mesoRank,
+      mesoFiltered,
       maxHailIn: maxSizeIn,
       maxDbz,
+      maxDbzHeightKft,
+      vil,
       poh,
       posh,
       topKft,
       speedMph,
+      moveFromBearing,
+      moveFromCompass,
       moveToBearing,
-      moveToCompass: moveToBearing != null ? degToCompass(moveToBearing) : '--',
+      moveToCompass,
+      motionUnreliable,
+      motionSummary,
       threatLevel,
       threatScore,
       color,
       intercept,
-      coneCoords
+      coneCoords,
+      vectorLine,
+      confirmingRadars: [nexrad],
+      obsQualityScore
     });
   }
 
-  analyzed.sort((a, b) => {
-    const aDirect = a.intercept.verdict === 'DIRECT_INTERCEPT' ? 12 : a.intercept.verdict === 'NEAR_MISS' ? 6 : 0;
-    const bDirect = b.intercept.verdict === 'DIRECT_INTERCEPT' ? 12 : b.intercept.verdict === 'NEAR_MISS' ? 6 : 0;
-    return (b.threatScore * 4 + bDirect - b.intercept.distanceMi * 0.05) - (a.threatScore * 4 + aDirect - a.intercept.distanceMi * 0.05);
+  // 3. Spatial Multi-Radar Deduplication (merge overlapping radar observations within 8 miles)
+  candidates.sort((a, b) => b.obsQualityScore - a.obsQualityScore);
+  const clustered = [];
+
+  for (const cand of candidates) {
+    const host = clustered.find((existing) => haversineMiles(existing.lat, existing.lon, cand.lat, cand.lon) <= 8);
+    if (!host) {
+      clustered.push({ ...cand, confirmingRadars: [...cand.confirmingRadars] });
+      continue;
+    }
+
+    if (!host.confirmingRadars.includes(cand.nexrad)) {
+      host.confirmingRadars.push(cand.nexrad);
+      host.confirmingRadars.sort();
+    }
+
+    // Merge verified maxima from non-TDWR WSR-88D confirmations (never degrade host primary coords/motion)
+    if (!cand.isTdwr) {
+      host.maxHailIn = Math.max(host.maxHailIn, cand.maxHailIn);
+      host.vil = Math.max(host.vil, cand.vil);
+      host.maxDbz = Math.max(host.maxDbz, cand.maxDbz);
+      host.topKft = Math.max(host.topKft, cand.topKft);
+      host.posh = Math.max(host.posh, cand.posh);
+      host.poh = Math.max(host.poh, cand.poh);
+      if (cand.threatScore > host.threatScore) {
+        host.threatScore = cand.threatScore;
+        host.threatLevel = cand.threatLevel;
+        host.color = cand.color;
+        if (cand.tvs) host.tvs = cand.tvs;
+        if (cand.meso) host.meso = cand.meso;
+      }
+    }
+  }
+
+  clustered.sort((a, b) => {
+    const aDirect = a.intercept.verdict === 'DIRECT_INTERCEPT' ? 14 : a.intercept.verdict === 'NEAR_MISS' ? 7 : 0;
+    const bDirect = b.intercept.verdict === 'DIRECT_INTERCEPT' ? 14 : b.intercept.verdict === 'NEAR_MISS' ? 7 : 0;
+    return (b.threatScore * 5 + bDirect - b.intercept.distanceMi * 0.05) - (a.threatScore * 5 + aDirect - a.intercept.distanceMi * 0.05);
   });
 
-  return analyzed.slice(0, 40);
+  return clustered.slice(0, 35);
+}
+
+/**
+ * Parse NWS CAP eventMotionDescription (e.g. "2026-11-22T20:55:00-00:00...storm...250DEG...35KT")
+ * where direction is meteorological FROM, converting to TOWARD motion.
+ */
+function parseNwsEventMotion(rawMotion) {
+  const str = Array.isArray(rawMotion) ? rawMotion[0] : rawMotion;
+  if (!str) return null;
+  const m = String(str).match(/(\d{1,3})\s*DEG\.{2,3}(\d{1,3})\s*KT/i);
+  if (!m) return null;
+  const fromDeg = ((parseInt(m[1], 10) % 360) + 360) % 360;
+  const speedKt = parseInt(m[2], 10);
+  if (Number.isNaN(fromDeg) || Number.isNaN(speedKt)) return null;
+  const moveToBearing = (fromDeg + 180) % 360;
+  const speedMph = Math.round(speedKt * 1.15078);
+  const moveToCompass = degToCompass(moveToBearing);
+  const moveFromCompass = degToCompass(fromDeg);
+  return {
+    moveToBearing,
+    moveToCompass,
+    moveFromBearing: fromDeg,
+    moveFromCompass,
+    speedMph,
+    summary: speedMph > 0
+      ? `Moving ${moveToCompass} (${String(moveToBearing).padStart(3, '0')}°) @ ${speedMph} mph · from ${moveFromCompass}`
+      : 'Nearly stationary'
+  };
 }
 
 /**
@@ -715,6 +872,7 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
   const flashFloodDamageThreat = params.flashFloodDamageThreat?.[0] || null;
   const maxWindGust = params.maxWindGust?.[0] || null;
   const maxHailSize = params.maxHailSize?.[0] || null;
+  const stormMotion = parseNwsEventMotion(params.eventMotionDescription);
 
   const isTornadoEmergency = (tornadoDamageThreat || '').toUpperCase() === 'CATASTROPHIC' ||
     (p.headline || '').toLowerCase().includes('tornado emergency') ||
@@ -793,6 +951,7 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
     isFlashFloodEmergency,
     maxWindGust,
     maxHailSize,
+    stormMotion,
     tier,
     color,
     rank,

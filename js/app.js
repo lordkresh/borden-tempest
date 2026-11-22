@@ -328,7 +328,17 @@ function wireEvents() {
     radarMap.scrubTo(Number(e.target.value));
   });
   document.getElementById('btn-radar-recenter')?.addEventListener('click', () => {
-    radarMap.flyTo(state.activeLocation.lat, state.activeLocation.lon, 8.2);
+    radarMap.flyTo(state.activeLocation.lat, state.activeLocation.lon, 8.2, true);
+  });
+  document.getElementById('radar-storm-hud')?.addEventListener('click', () => {
+    if (state.stormCells?.length) {
+      const top = state.stormCells[0];
+      radarMap.flyTo(top.lat, top.lon, 8.8, false);
+      openInspectSheet('cell', top);
+    } else {
+      radarMap.flyTo(state.activeLocation.lat, state.activeLocation.lon, 8.0, true);
+      showToast('No severe storm cells detected within 120 miles.');
+    }
   });
   document.getElementById('btn-radar-site')?.addEventListener('click', openSiteModal);
   document.getElementById('btn-radar-layers')?.addEventListener('click', () => {
@@ -495,10 +505,12 @@ async function refreshAllData(silent = false) {
 
     evaluateStormWatchState();
     updateHeaderAndBadges();
+    updateRadarStormHud();
     renderDashboard();
     renderAlerts();
     if (state.tab === 'settings') renderSettings();
 
+    radarMap.setUserLocation(lat, lon);
     radarMap.setOverlayData({
       alerts: state.regionalAlerts,
       stormCells: state.stormCells,
@@ -534,9 +546,13 @@ function updateHeaderAndBadges() {
 
   const leadMin = state.settings.proactiveTotLeadMinutes || 35;
   const threatCells = state.stormCells.filter((c) =>
-    c.tvs ||
-    ((c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS') &&
-      c.intercept.etaMinutes != null && c.intercept.etaMinutes <= leadMin)
+    c.threatScore >= 2 &&
+    (
+      c.tvs ||
+      c.threatLevel === 'SUPERCELL' ||
+      ((c.intercept.verdict === 'DIRECT_INTERCEPT' || c.intercept.verdict === 'NEAR_MISS') &&
+        c.intercept.etaMinutes != null && c.intercept.etaMinutes <= leadMin)
+    )
   );
   const totalCount = state.localAlerts.length + threatCells.length +
     (state.winter?.winterAlerts?.length || 0) +
@@ -546,6 +562,33 @@ function updateHeaderAndBadges() {
   if (badge) {
     badge.textContent = String(totalCount);
     badge.classList.toggle('hidden', totalCount === 0);
+  }
+}
+
+function updateRadarStormHud() {
+  const pill = document.getElementById('radar-storm-hud');
+  const txt = document.getElementById('radar-hud-text');
+  if (!pill || !txt) return;
+
+  const cells = state.stormCells || [];
+  const tvsCells = cells.filter((c) => c.threatLevel === 'TORNADO_TVS');
+  const supCells = cells.filter((c) => c.threatLevel === 'SUPERCELL');
+  const svrCells = cells.filter((c) => c.threatLevel === 'SEVERE');
+
+  pill.classList.remove('hud-critical', 'hud-supercell', 'hud-severe');
+  if (tvsCells.length) {
+    pill.classList.add('hud-critical');
+    txt.textContent = `TVS ${tvsCells.length} · ${tvsCells[0].intercept.distanceMi.toFixed(0)} mi`;
+  } else if (supCells.length) {
+    pill.classList.add('hud-supercell');
+    txt.textContent = `${supCells.length} Sup · ${supCells[0].intercept.distanceMi.toFixed(0)} mi ${supCells[0].moveToCompass}`;
+  } else if (svrCells.length) {
+    pill.classList.add('hud-severe');
+    txt.textContent = `${svrCells.length} Svr · ${svrCells[0].intercept.distanceMi.toFixed(0)} mi`;
+  } else if (cells.length) {
+    txt.textContent = `${cells.length} Cell${cells.length > 1 ? 's' : ''} · ${cells[0].intercept.distanceMi.toFixed(0)} mi`;
+  } else {
+    txt.textContent = '✓ Area Clear';
   }
 }
 
@@ -675,7 +718,7 @@ function requestGpsLocation() {
       const nearest = findNearestNexradStation(lat, lon);
       state.activeLocation = { id: 'gps_current', name: 'Current Location (GPS)', lat, lon };
       state.selectedRadarSite = nearest.id;
-      radarMap.flyTo(lat, lon, 8.2);
+      radarMap.flyTo(lat, lon, 8.2, true);
       refreshAllData();
     },
     () => showToast('Location permission denied — tap the city name to search manually.'),
@@ -698,7 +741,9 @@ async function ensureRadarReady() {
   });
 
   radarMap.init(lat, lon, state.settings.basemap, state.settings.radarOpacity);
+  radarMap.setUserLocation(lat, lon);
   radarMap.resize();
+  updateRadarStormHud();
   radarMap.setOverlayData({
     alerts: state.regionalAlerts,
     stormCells: state.stormCells,
@@ -758,18 +803,41 @@ function openInspectSheet(type, item) {
 
   if (type === 'cell') {
     titleEl.textContent = `Storm Cell ${item.stormId} (${item.nexrad})`;
+    const radarConfirmText = item.confirmingRadars?.length > 1
+      ? `Confirmed by ${item.confirmingRadars.length} radars: ${item.confirmingRadars.join(' · ')}`
+      : `Single-site radar: ${item.nexrad}`;
     bodyEl.innerHTML = `
       <div class="tag-row">
-        <span class="badge-${item.tvs ? 'red' : item.meso ? 'magenta' : 'amber'}">${item.threatLevel.replace('_', ' ')}</span>
+        <span class="badge-${item.tvs ? 'red' : item.meso ? 'magenta' : item.threatScore >= 2 ? 'amber' : 'muted'}">${item.threatLevel.replace('_', ' ')}</span>
         ${item.tvs ? `<span class="badge-red">TVS: ${escapeHtml(item.tvs)}</span>` : ''}
-        ${item.meso ? `<span class="badge-magenta">MESO: ${escapeHtml(item.meso)}</span>` : ''}
+        ${item.meso ? `<span class="badge-magenta">MESO RANK ${escapeHtml(item.meso)}</span>` : ''}
         ${item.maxHailIn > 0 ? `<span class="badge-amber">Hail ${item.maxHailIn}"</span>` : ''}
-        ${item.maxDbz ? `<span class="badge-muted">${item.maxDbz} dBZ</span>` : ''}
       </div>
-      <div class="alert-meta">
-        <strong>Position:</strong> ${item.intercept.distanceMi.toFixed(1)} mi ${item.intercept.compassFromUser} moving ${item.moveToCompass} @ ${item.speedMph} mph<br/>
+      <div class="cell-motion-banner">
+        <span>${escapeHtml(item.motionSummary || `Moving ${item.moveToCompass} @ ${item.speedMph} mph`)}</span>
+        <span>${item.intercept.distanceMi.toFixed(1)} mi ${item.intercept.compassFromUser}</span>
+      </div>
+      <div class="cell-proof-grid">
+        <div class="cell-proof-item">
+          <div class="cell-proof-k">VIL</div>
+          <div class="cell-proof-v">${item.vil ?? 0}</div>
+        </div>
+        <div class="cell-proof-item">
+          <div class="cell-proof-k">Echo Top</div>
+          <div class="cell-proof-v">${item.topKft ? `${item.topKft}k` : '--'}</div>
+        </div>
+        <div class="cell-proof-item">
+          <div class="cell-proof-k">Max dBZ</div>
+          <div class="cell-proof-v">${item.maxDbz || '--'}</div>
+        </div>
+        <div class="cell-proof-item">
+          <div class="cell-proof-k">Hail Prob</div>
+          <div class="cell-proof-v">${item.posh ?? 0}%</div>
+        </div>
+      </div>
+      <div class="alert-meta" style="margin-top:8px;">
         <strong>Intercept:</strong> ${escapeHtml(item.intercept.verdictLabel)}${item.intercept.etaMinutes ? ` • <strong>TOT ~${item.intercept.etaMinutes} min</strong>` : ''}<br/>
-        <strong>Storm Top:</strong> ${item.topKft ? `${item.topKft} kft` : '--'} • <strong>Hail Prob:</strong> ${item.poh}% (Severe ${item.posh}%)
+        <strong>Radar Verification:</strong> ${escapeHtml(radarConfirmText)}${item.radarRangeMi ? ` • ${item.radarRangeMi} mi from ${escapeHtml(item.nexrad)}` : ''}
       </div>
     `;
   } else if (type === 'lsr') {
@@ -808,13 +876,167 @@ function openInspectSheet(type, item) {
         ${item.maxWindGust ? `<span class="badge-amber">Wind: ${escapeHtml(item.maxWindGust)}</span>` : ''}
         ${item.maxHailSize ? `<span class="badge-amber">Hail: ${escapeHtml(item.maxHailSize)}"</span>` : ''}
       </div>
-      <div class="alert-meta">
+      ${item.stormMotion ? `<div class="cell-motion-banner"><span>${escapeHtml(item.stormMotion.summary)}</span><span>NWS Vector</span></div>` : ''}
+      <div class="alert-meta" style="margin-top:8px;">
         <strong>${escapeHtml(item.headline)}</strong><br/><br/>
         ${escapeHtml((item.instruction || item.description || '').slice(0, 520))}
       </div>
     `;
   }
   sheet.classList.remove('hidden');
+}
+
+/* ==================== GRAPHICS & TELEMETRY HELPERS ==================== */
+let _svgUid = 0;
+
+function skyAtmosphereClass(condText, isNight) {
+  const s = String(condText || '').toLowerCase();
+  if (s.includes('thunder') || s.includes('storm') || s.includes('tornado')) return 'cond-storm';
+  if (s.includes('snow') || s.includes('sleet') || s.includes('ice') || s.includes('blizzard') || s.includes('freezing')) return 'cond-winter';
+  if (s.includes('rain') || s.includes('shower') || s.includes('drizzle')) return 'cond-rain';
+  if (s.includes('overcast') || s.includes('mostly cloudy') || s.includes('fog') || s.includes('haze') || s.includes('mist')) return 'cond-cloud';
+  return isNight ? 'cond-night' : 'cond-clear';
+}
+
+function renderWeatherGraphicSvg(conditionText, isNight = false, size = 76) {
+  const s = String(conditionText || '').toLowerCase();
+  const uid = `wg${++_svgUid}`;
+  const isStorm = s.includes('thunder') || s.includes('t-storm') || s.includes('storm');
+  const isSnow = s.includes('snow') || s.includes('sleet') || s.includes('ice') || s.includes('flur');
+  const isRain = !isStorm && (s.includes('rain') || s.includes('shower') || s.includes('drizzle'));
+  const isFog = s.includes('fog') || s.includes('mist') || s.includes('haze');
+  const isPartly = s.includes('partly') || s.includes('mostly clear') || s.includes('few') || s.includes('scattered') || s.includes('mostly sunny');
+  const isOvercast = s.includes('overcast') || s.includes('cloudy');
+
+  const sunOrb = `
+    <defs>
+      <radialGradient id="${uid}_sun" cx="42%" cy="38%" r="58%">
+        <stop offset="0%" stop-color="#fef08a"/>
+        <stop offset="55%" stop-color="#facc15"/>
+        <stop offset="100%" stop-color="#f97316"/>
+      </radialGradient>
+    </defs>
+    <circle cx="32" cy="32" r="22" fill="#facc15" opacity="0.18"/>
+    <circle cx="32" cy="32" r="14.5" fill="url(#${uid}_sun)"/>
+  `;
+
+  const moonOrb = `
+    <circle cx="33" cy="30" r="19" fill="#818cf8" opacity="0.16"/>
+    <path d="M36 16a14 14 0 1 0 13 18.5A11.5 11.5 0 0 1 36 16Z" fill="#e2e8f0" stroke="#93c5fd" stroke-width="1"/>
+    <circle cx="46" cy="20" r="1.4" fill="#fde68a"/>
+    <circle cx="20" cy="22" r="1.1" fill="#bae6fd"/>
+  `;
+
+  const cloudShape = (fill = '#cbd5e1', yOff = 0) => `
+    <path d="M22 ${44 + yOff}h23a9 9 0 0 0 1.4-17.9A12.5 12.5 0 0 0 22.8 29a8.2 8.2 0 0 0-.8 15Z" fill="${fill}" opacity="0.96"/>
+  `;
+
+  let body = '';
+  if (isStorm) {
+    body = `
+      ${cloudShape('#64748b', -4)}
+      ${cloudShape('#94a3b8', 0)}
+      <polygon points="34,40 27,51 33,51 29,60 40,48 34,48" fill="#facc15" stroke="#fef08a" stroke-width="0.6" stroke-linejoin="round"/>
+      <line x1="21" y1="47" x2="18" y2="55" stroke="#38bdf8" stroke-width="2.4" stroke-linecap="round"/>
+      <line x1="45" y1="47" x2="42" y2="55" stroke="#38bdf8" stroke-width="2.4" stroke-linecap="round"/>
+    `;
+  } else if (isSnow) {
+    body = `
+      ${cloudShape('#cbd5e1', -4)}
+      <circle cx="24" cy="50" r="2.2" fill="#e0f2fe"/>
+      <circle cx="33" cy="53" r="2.4" fill="#bae6fd"/>
+      <circle cx="42" cy="50" r="2.2" fill="#e0f2fe"/>
+      <circle cx="29" cy="46" r="1.8" fill="#ffffff"/>
+      <circle cx="38" cy="46" r="1.8" fill="#ffffff"/>
+    `;
+  } else if (isRain) {
+    body = `
+      ${cloudShape('#94a3b8', -4)}
+      <line x1="23" y1="44" x2="19.5" y2="54" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="33" y1="45" x2="29.5" y2="56" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="43" y1="44" x2="39.5" y2="54" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+    `;
+  } else if (isFog) {
+    body = `
+      ${cloudShape('#94a3b8', -6)}
+      <line x1="16" y1="44" x2="48" y2="44" stroke="#94a3b8" stroke-width="2.6" stroke-linecap="round"/>
+      <line x1="20" y1="50" x2="44" y2="50" stroke="#64748b" stroke-width="2.6" stroke-linecap="round"/>
+    `;
+  } else if (isPartly) {
+    body = isNight
+      ? `<g transform="translate(8,-4) scale(0.78)">${moonOrb}</g>${cloudShape('#e2e8f0', 2)}`
+      : `<g transform="translate(9,-4) scale(0.76)">${sunOrb}</g>${cloudShape('#e2e8f0', 2)}`;
+  } else if (isOvercast) {
+    body = `${cloudShape('#94a3b8', -5)}${cloudShape('#cbd5e1', 2)}`;
+  } else {
+    body = isNight
+      ? moonOrb
+      : `${sunOrb}
+         <g stroke="#fde047" stroke-width="2.4" stroke-linecap="round" opacity="0.85">
+           <line x1="32" y1="9" x2="32" y2="13"/>
+           <line x1="32" y1="51" x2="32" y2="55"/>
+           <line x1="9" y1="32" x2="13" y2="32"/>
+           <line x1="51" y1="32" x2="55" y2="32"/>
+           <line x1="16" y1="16" x2="19" y2="19"/>
+           <line x1="45" y1="45" x2="48" y2="48"/>
+           <line x1="48" y1="16" x2="45" y2="19"/>
+           <line x1="19" y1="45" x2="16" y2="48"/>
+         </g>`;
+  }
+
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" aria-hidden="true">${body}</svg>`;
+}
+
+function renderWindCompassSvg(windDirDeg, size = 24) {
+  const deg = windDirDeg != null && !Number.isNaN(Number(windDirDeg)) ? Number(windDirDeg) : 0;
+  return `
+    <svg viewBox="0 0 44 44" width="${size}" height="${size}" aria-hidden="true" style="flex-shrink:0;">
+      <circle cx="22" cy="22" r="19" fill="rgba(7,13,24,0.65)" stroke="rgba(148,163,184,0.32)" stroke-width="1.4"/>
+      <text x="22" y="9" text-anchor="middle" fill="#94a3b8" font-size="7" font-weight="800">N</text>
+      <g transform="rotate(${deg} 22 22)">
+        <polygon points="22,9 26.5,22 22,19 17.5,22" fill="#00d4ff"/>
+        <polygon points="22,35 24.5,22 22,24 19.5,22" fill="#475569"/>
+      </g>
+      <circle cx="22" cy="22" r="2.3" fill="#f8fafc"/>
+    </svg>
+  `;
+}
+
+function renderPressureArcSvg(pressureHpa, trend3h, width = 30, height = 20) {
+  const hpa = pressureHpa != null ? Number(pressureHpa) : 1013;
+  const pct = Math.max(0, Math.min(1, (hpa - 980) / 60));
+  const angleRad = Math.PI - pct * Math.PI;
+  const dx = 24 + 17 * Math.cos(angleRad);
+  const dy = 26 - 17 * Math.sin(angleRad);
+  const arrow = trend3h > 0.4 ? '▲' : trend3h < -0.4 ? '▼' : '●';
+  const arrowCol = trend3h > 0.4 ? '#34d399' : trend3h < -0.4 ? '#ff6b81' : '#94a3b8';
+  return `
+    <svg viewBox="0 0 48 32" width="${width}" height="${height}" aria-hidden="true" style="flex-shrink:0;">
+      <path d="M 7 26 A 17 17 0 0 1 41 26" fill="none" stroke="rgba(148,163,184,0.28)" stroke-width="4" stroke-linecap="round"/>
+      <path d="M 7 26 A 17 17 0 0 1 ${dx.toFixed(1)} ${dy.toFixed(1)}" fill="none" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="${dx.toFixed(1)}" cy="${dy.toFixed(1)}" r="3.4" fill="#f8fafc" stroke="#00d4ff" stroke-width="1.5"/>
+      <text x="24" y="27" text-anchor="middle" fill="${arrowCol}" font-size="10" font-weight="800">${arrow}</text>
+    </svg>
+  `;
+}
+
+function sectionIcon(name, tone = '') {
+  const icons = {
+    sounding: `<path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/>`,
+    spc: `<path d="M12 2 4 5v6c0 5.2 3.4 10 8 11 4.6-1 8-5.8 8-11V5l-8-3z"/>`,
+    afd: `<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/>`,
+    winter: `<line x1="12" y1="2" x2="12" y2="22"/><line x1="4.9" y1="6.5" x2="19.1" y2="17.5"/><line x1="19.1" y1="6.5" x2="4.9" y2="17.5"/>`,
+    hourly: `<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>`,
+    daily: `<rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>`,
+    ota: `<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/>`,
+    shield: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/>`
+  };
+  return `<span class="section-icon ${tone}"><svg viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ''}</svg></span>`;
+}
+
+function severityMeter(pct, color) {
+  const clamped = Math.max(4, Math.min(100, Math.round(pct)));
+  return `<div class="metric-meter"><div class="metric-meter-fill" style="width:${clamped}%;background:${color};"></div></div>`;
 }
 
 /* ==================== RENDER: DASHBOARD ==================== */
@@ -828,7 +1050,7 @@ function renderDashboard() {
   const win = state.winter;
 
   const topAlert = state.localAlerts[0];
-  const topThreatCell = state.stormCells.find((sc) => sc.intercept.verdict === 'DIRECT_INTERCEPT' || sc.tvs);
+  const topThreatCell = state.stormCells.find((sc) => sc.threatScore >= 2 && (sc.intercept.verdict === 'DIRECT_INTERCEPT' || sc.tvs));
 
   if (topAlert) {
     strip.className = `alert-strip ${topAlert.tier === 'CRITICAL' ? 'critical' : topAlert.tier === 'WINTER' ? 'winter' : 'severe'}`;
@@ -850,15 +1072,15 @@ function renderDashboard() {
     strip.className = 'alert-strip critical';
     strip.innerHTML = `
       <div>
-        <div style="font-size:11px;font-weight:800;letter-spacing:.06em;">STORM CELL INTERCEPT</div>
+        <div style="font-size:11px;font-weight:800;letter-spacing:.06em;">STORM CELL INTERCEPT • ${escapeHtml(topThreatCell.threatLevel.replace('_', ' '))}</div>
         <div style="font-size:15px;font-weight:800;margin-top:2px;">Cell ${escapeHtml(topThreatCell.stormId)} • ${topThreatCell.intercept.etaMinutes ? `TOT ~${topThreatCell.intercept.etaMinutes} min` : topThreatCell.intercept.verdictLabel}</div>
-        <div style="font-size:12px;opacity:.9;margin-top:2px;">${topThreatCell.intercept.distanceMi.toFixed(1)} mi ${topThreatCell.intercept.compassFromUser} moving ${topThreatCell.moveToCompass} @ ${topThreatCell.speedMph} mph</div>
+        <div style="font-size:12px;opacity:.9;margin-top:2px;">${topThreatCell.intercept.distanceMi.toFixed(1)} mi ${topThreatCell.intercept.compassFromUser} • ${escapeHtml(topThreatCell.motionSummary)}</div>
       </div>
       <span style="font-size:18px;font-weight:800;">›</span>
     `;
     strip.onclick = () => {
       switchTab('radar');
-      radarMap.flyTo(topThreatCell.lat, topThreatCell.lon, 9.2);
+      radarMap.flyTo(topThreatCell.lat, topThreatCell.lon, 9.2, false);
     };
   } else {
     strip.className = 'alert-strip hidden';
@@ -866,53 +1088,77 @@ function renderDashboard() {
 
   const hourlyItems = buildHourlyItems();
   const dailyItems = (state.nwsBundle?.forecastPeriods || []).slice(0, 10);
+  const dailyTemps = dailyItems.map((p) => Number(p.temperature)).filter((t) => Number.isFinite(t));
+  const dailyMinT = dailyTemps.length ? Math.min(...dailyTemps) : 30;
+  const dailySpan = Math.max(12, (dailyTemps.length ? Math.max(...dailyTemps) : 80) - dailyMinT);
+
   const pTrendSign = c.pressureTrend3h > 0 ? '+' : '';
   const nearestRadar = findNearestNexradStation(state.activeLocation.lat, state.activeLocation.lon);
+  const firstHourDay = state.nwsBundle?.hourlyPeriods?.[0]?.isDaytime;
+  const hrNow = new Date().getHours();
+  const isNightNow = firstHourDay != null ? !firstHourDay : (hrNow < 6 || hrNow >= 18);
+  const atmClass = skyAtmosphereClass(c.conditionText, isNightNow);
 
   container.innerHTML = `
     <!-- HERO CURRENT CONDITIONS -->
-    <div class="card hero-card">
+    <div class="card hero-card ${atmClass}">
       <div class="hero-top">
-        <div>
-          <div class="hero-temp">${c.tempF != null ? `${c.tempF}°` : '--'}</div>
-          <div class="hero-cond">${c.icon} ${escapeHtml(c.conditionText)}</div>
+        <div class="hero-temp-wrap">
+          <div class="hero-temp">${c.tempF != null ? `${c.tempF}<span class="hero-deg">°</span>` : '--'}</div>
+          <div class="hero-cond">${escapeHtml(c.conditionText)}</div>
           <div class="hero-feels">Feels like ${c.feelsLikeF ?? '--'}° • Dewpoint ${c.dewpointF ?? '--'}°F</div>
         </div>
         <div class="hero-right">
-          <span class="badge-cyan">${c.confidence} Consensus</span>
-          <span class="badge-muted">±${c.spreadF}°F spread</span>
-          <span class="badge-muted">${nearestRadar.id} (${nearestRadar.distanceMi.toFixed(0)} mi)</span>
+          <div class="hero-graphic-stage">
+            ${renderWeatherGraphicSvg(c.conditionText, isNightNow, 76)}
+          </div>
         </div>
+      </div>
+
+      <div class="hero-status-strip">
+        <span class="badge-cyan">${c.confidence} Consensus</span>
+        <span class="badge-muted">±${c.spreadF}°F spread</span>
+        <span class="badge-muted">${nearestRadar.id} · ${nearestRadar.distanceMi.toFixed(0)} mi</span>
       </div>
 
       <div class="metrics-grid">
         <div class="metric-box">
-          <div class="metric-label">Wind</div>
+          <div class="metric-head-row">
+            <span class="metric-label">Wind</span>
+            ${renderWindCompassSvg(c.windDirDeg, 24)}
+          </div>
           <div class="metric-value">${c.windCompass} ${c.windMph} mph</div>
-          <div class="metric-sub">${c.gustMph ? `Gusts ${c.gustMph} mph` : 'Steady'}</div>
+          <div class="metric-sub">${c.gustMph ? `Gusts ${c.gustMph} mph` : 'Steady flow'}</div>
         </div>
         <div class="metric-box">
-          <div class="metric-label">Humidity</div>
+          <div class="metric-head-row">
+            <span class="metric-label">Humidity</span>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="rgba(56,189,248,0.28)" stroke="#38bdf8" stroke-width="2" aria-hidden="true"><path d="M12 2.7C12 2.7 6 9.8 6 14.3a6 6 0 0 0 12 0C18 9.8 12 2.7 12 2.7z"/></svg>
+          </div>
           <div class="metric-value">${c.humidity ?? '--'}%</div>
-          <div class="metric-sub">Td ${c.dewpointF ?? '--'}°F</div>
+          <div class="metric-sub">Td ${c.dewpointF ?? '--'}° • ${c.visibilityMi} mi</div>
+          ${severityMeter(c.humidity ?? 0, '#38bdf8')}
         </div>
         <div class="metric-box">
-          <div class="metric-label">Pressure</div>
+          <div class="metric-head-row">
+            <span class="metric-label">Pressure</span>
+            ${renderPressureArcSvg(c.pressureHpa, c.pressureTrend3h, 30, 20)}
+          </div>
           <div class="metric-value">${c.pressureInHg}"</div>
-          <div class="metric-sub">${pTrendSign}${c.pressureTrend3h} hPa / 3h</div>
+          <div class="metric-sub">${pTrendSign}${c.pressureTrend3h} hPa/3h</div>
         </div>
       </div>
 
       <div class="consensus-meta">
         <span>${escapeHtml(c.sourceLabel)}</span>
-        <span>Vis ${c.visibilityMi} mi</span>
+        <span>${c.pressureHpa ? `${c.pressureHpa} hPa` : ''}</span>
       </div>
     </div>
 
     <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (PRO 5-LEVEL SOUNDING + STP/SCP/SRH + LIVE HODOGRAPH) -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">⚡ Pro Severe Sounding &amp; HSLC</div>
+        <div class="card-title">${sectionIcon('sounding', env.level === 'high' ? 'amber' : '')}Pro Severe Sounding &amp; HSLC</div>
         <span class="badge-${env.level === 'high' ? 'red' : env.level === 'mod' ? 'amber' : 'green'}">${escapeHtml(env.regime)}</span>
       </div>
       <div class="regime-banner ${env.level}">
@@ -923,16 +1169,19 @@ function renderDashboard() {
           <div class="metric-label">Sig Tor (STP)</div>
           <div class="metric-value">${(env.stp ?? 0).toFixed(1)}</div>
           <div class="metric-sub">SPC Fixed-Lyr</div>
+          ${severityMeter(((env.stp ?? 0) / 3) * 100, (env.stp ?? 0) >= 1 ? '#ff2b4a' : '#10b981')}
         </div>
         <div class="metric-box">
           <div class="metric-label">Supercell (SCP)</div>
           <div class="metric-value">${(env.scp ?? 0).toFixed(1)}</div>
           <div class="metric-sub">0–3km SRH ${env.srh0to3Km ?? 0}</div>
+          ${severityMeter(((env.scp ?? 0) / 5) * 100, (env.scp ?? 0) >= 1 ? '#d946ef' : '#38bdf8')}
         </div>
         <div class="metric-box">
           <div class="metric-label">0–1km SRH</div>
           <div class="metric-value">${env.srh0to1Km ?? 0}</div>
           <div class="metric-sub">m²/s² Helicity</div>
+          ${severityMeter(((env.srh0to1Km ?? 0) / 300) * 100, (env.srh0to1Km ?? 0) >= 150 ? '#ff9800' : '#00d4ff')}
         </div>
       </div>
       <div class="metrics-grid" style="margin-top:8px;">
@@ -960,11 +1209,11 @@ function renderDashboard() {
         <canvas id="hodograph-canvas" class="hodograph-canvas"></canvas>
         <div class="hodograph-foot">
           <div class="hodo-legend">
-            <span><i class="hodo-dot" style="background:#ff3d00"></i>0–1km</span>
-            <span><i class="hodo-dot" style="background:#00e676"></i>1–3km</span>
-            <span><i class="hodo-dot" style="background:#00e5ff"></i>3–6km</span>
+            <span><i class="hodo-dot" style="background:#ff3d5a"></i>0–1km</span>
+            <span><i class="hodo-dot" style="background:#facc15"></i>1–3km</span>
+            <span><i class="hodo-dot" style="background:#00d4ff"></i>3–6km</span>
           </div>
-          <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer • ${state.stormCells.length} cells</span>
+          <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer • ${state.stormCells.length} verified cell${state.stormCells.length === 1 ? '' : 's'}</span>
         </div>
       </div>
     </div>
@@ -976,7 +1225,7 @@ function renderDashboard() {
     ${state.afd ? `
       <div class="card" id="afd-preview-card" style="cursor:pointer;">
         <div class="card-header">
-          <div class="card-title">📋 ${escapeHtml(state.afd.office)} Meteorologist Discussion</div>
+          <div class="card-title">${sectionIcon('afd')}${escapeHtml(state.afd.office)} Meteorologist Discussion</div>
           <span class="badge-muted">${escapeHtml(state.afd.issuedLabel)}</span>
         </div>
         <div class="afd-excerpt">${escapeHtml(state.afd.synopsisExcerpt)}</div>
@@ -987,7 +1236,7 @@ function renderDashboard() {
     <!-- FULL WINTER / GROUND TEMP / FOG SUITE -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">❄️ Winter, Ground Temp &amp; Fog Suite</div>
+        <div class="card-title">${sectionIcon('winter', 'blue')}Winter, Ground Temp &amp; Fog Suite</div>
         <span class="badge-${win.hazardLevel === 'CRITICAL' ? 'red' : win.hazardLevel === 'CLEAR' ? 'green' : 'blue'}">${escapeHtml(win.statusLabel)}</span>
       </div>
       <div class="regime-banner ${win.hazardLevel === 'CRITICAL' ? 'high' : win.hazardLevel === 'CLEAR' ? 'low' : 'winter'}">
@@ -1010,16 +1259,17 @@ function renderDashboard() {
     <!-- HOURLY FORECAST -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">🕒 Next 18 Hours</div>
+        <div class="card-title">${sectionIcon('hourly')}Next 18 Hours</div>
         <span class="badge-muted">NWS NDFD / HRRR-GFS</span>
       </div>
       <div class="hourly-strip">
-        ${hourlyItems.map((h) => `
-          <div class="hour-pill">
+        ${hourlyItems.map((h, i) => `
+          <div class="hour-pill ${i === 0 ? 'now' : ''}">
             <div class="hour-time">${escapeHtml(h.time)}</div>
-            <div class="hour-icon">${h.icon}</div>
+            <div class="hour-icon">${renderWeatherGraphicSvg(h.condText, h.isNight, 22)}</div>
             <div class="hour-temp">${h.temp}°</div>
             <div class="hour-pop">${h.pop > 0 ? `${h.pop}%` : '&nbsp;'}</div>
+            <div class="hour-pop-bar"><div class="hour-pop-fill" style="width:${Math.min(100, h.pop || 0)}%"></div></div>
           </div>
         `).join('')}
       </div>
@@ -1029,16 +1279,25 @@ function renderDashboard() {
     ${dailyItems.length ? `
       <div class="card">
         <div class="card-header">
-          <div class="card-title">📅 NWS 7-Day Forecast (NBM + WFO)</div>
+          <div class="card-title">${sectionIcon('daily')}NWS 7-Day Forecast (NBM + WFO)</div>
           <span class="badge-muted">${escapeHtml(state.nwsBundle?.cwa || 'NWS')}</span>
         </div>
-        ${dailyItems.map((p) => `
-          <div class="daily-row">
-            <div class="daily-name">${escapeHtml(p.name)}</div>
-            <div class="daily-desc">${escapeHtml(p.shortForecast)}</div>
-            <div class="daily-temp">${p.temperature}°${p.temperatureUnit || 'F'}</div>
-          </div>
-        `).join('')}
+        ${dailyItems.map((p) => {
+          const tVal = Number(p.temperature);
+          const posPct = Number.isFinite(tVal) ? Math.max(8, Math.min(92, ((tVal - dailyMinT) / dailySpan) * 100)) : 50;
+          const isDay = p.isDaytime !== false;
+          return `
+            <div class="daily-row">
+              <div class="daily-name">${escapeHtml(p.name)}</div>
+              <div class="daily-icon">${renderWeatherGraphicSvg(p.shortForecast, !isDay, 20)}</div>
+              <div class="daily-desc">${escapeHtml(p.shortForecast)}</div>
+              <div class="daily-bar-track">
+                <div class="daily-bar-fill" style="left:${Math.max(0, posPct - 18)}%;width:32%;"></div>
+              </div>
+              <div class="daily-temp">${p.temperature}°${p.temperatureUnit || 'F'}</div>
+            </div>
+          `;
+        }).join('')}
       </div>
     ` : ''}
   `;
@@ -1092,7 +1351,7 @@ function renderMultiDayOutlookCard(md) {
   return `
     <div class="card">
       <div class="card-header">
-        <div class="card-title">⛈️ SPC 3-Day Severe &amp; WPC Flood</div>
+        <div class="card-title">${sectionIcon('spc', 'amber')}SPC 3-Day Severe &amp; WPC Flood</div>
         ${m.activeWatches?.length ? `<span class="badge-red">${m.activeWatches.length} ACTIVE WATCH</span>` : '<span class="badge-muted">Tap to View Layer</span>'}
       </div>
       <div class="outlook-grid">
@@ -1113,52 +1372,62 @@ function renderMultiDayOutlookCard(md) {
 function drawHodographCanvas(env) {
   const canvas = document.getElementById('hodograph-canvas');
   if (!canvas || !env?.hodographPoints?.length) return;
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  const w = Math.max(240, rect.width || 300);
-  const h = 190;
-  canvas.width = w * dpr;
-  canvas.height = h * dpr;
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const size = 224;
+  canvas.width = size * dpr;
+  canvas.height = size * dpr;
   const ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, size, size);
 
   const pts = env.hodographPoints;
-  const cx = w / 2;
-  const cy = h / 2;
-  const maxR = Math.min(w, h) / 2 - 14;
+  const cx = size / 2;
+  const cy = size / 2;
+  const maxR = size / 2 - 16;
   const maxSpd = Math.max(...pts.map((p) => Math.hypot(p.uKt, p.vKt)), 20);
   const maxRing = maxSpd > 60 ? 80 : maxSpd > 42 ? 60 : maxSpd > 26 ? 40 : 30;
   const pxPerKt = maxR / maxRing;
   const toXY = (u, v) => [cx + u * pxPerKt, cy - v * pxPerKt];
 
-  // Speed rings
+  // Radar-scope radial gradient backdrop
+  const scopeGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, maxR);
+  scopeGrad.addColorStop(0, 'rgba(0, 212, 255, 0.09)');
+  scopeGrad.addColorStop(0.65, 'rgba(13, 24, 44, 0.45)');
+  scopeGrad.addColorStop(1, 'rgba(6, 11, 20, 0.88)');
+  ctx.fillStyle = scopeGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, maxR, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dashed speed rings
   const step = maxRing <= 30 ? 10 : 20;
-  ctx.strokeStyle = '#253549';
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.24)';
   ctx.lineWidth = 1;
   ctx.fillStyle = '#7c8ea6';
-  ctx.font = '10px ui-monospace, monospace';
+  ctx.font = '9.5px "JetBrains Mono", ui-monospace, monospace';
   for (let rk = step; rk <= maxRing; rk += step) {
     const r = rk * pxPerKt;
+    ctx.setLineDash(rk === maxRing ? [] : [3, 3]);
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.fillText(`${rk}`, cx + r - 14, cy - 3);
+    ctx.fillText(`${rk}`, cx + 3, cy - r + 10);
   }
+  ctx.setLineDash([]);
 
-  // Axes
-  ctx.strokeStyle = '#33445c';
+  // Cardinal axes
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.26)';
   ctx.beginPath();
   ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy);
   ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR);
   ctx.stroke();
   ctx.fillStyle = '#94a3b8';
-  ctx.font = 'bold 10px -apple-system, sans-serif';
+  ctx.font = '700 10px "Inter", -apple-system, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('N', cx, cy - maxR + 10);
-  ctx.fillText('S', cx, cy + maxR - 2);
-  ctx.fillText('E', cx + maxR - 7, cy + 4);
-  ctx.fillText('W', cx - maxR + 7, cy + 4);
+  ctx.fillText('N', cx, cy - maxR - 4);
+  ctx.fillText('S', cx, cy + maxR + 11);
+  ctx.fillText('E', cx + maxR + 8, cy + 3);
+  ctx.fillText('W', cx - maxR - 8, cy + 3);
   ctx.textAlign = 'left';
 
   // Bunkers Right-Mover vector
@@ -1167,10 +1436,10 @@ function drawHodographCanvas(env) {
   const rmV = Math.cos(rmRad) * (env.bunkersSpeedKt || 0);
   const [rmX, rmY] = toXY(rmU, rmV);
 
-  // Shaded 0-3km SRH polygon
+  // Shaded 0-3km SRH inflow wedge
   const lowPts = pts.filter((p) => p.heightKm <= 3.2);
   if (lowPts.length >= 2) {
-    ctx.fillStyle = 'rgba(255, 61, 0, 0.16)';
+    ctx.fillStyle = 'rgba(255, 61, 90, 0.20)';
     ctx.beginPath();
     ctx.moveTo(rmX, rmY);
     lowPts.forEach((p) => { const [x, y] = toXY(p.uKt, p.vKt); ctx.lineTo(x, y); });
@@ -1178,43 +1447,66 @@ function drawHodographCanvas(env) {
     ctx.fill();
   }
 
+  // Origin -> RM dashed motion vector
+  ctx.strokeStyle = 'rgba(250, 204, 21, 0.58)';
+  ctx.lineWidth = 1.4;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(rmX, rmY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
   // Height-colored hodograph segments
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 3.2;
   ctx.lineCap = 'round';
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i], b = pts[i + 1];
     const [x1, y1] = toXY(a.uKt, a.vKt);
     const [x2, y2] = toXY(b.uKt, b.vKt);
-    ctx.strokeStyle = b.heightKm <= 1.2 ? '#ff3d00' : b.heightKm <= 3.2 ? '#00e676' : '#00e5ff';
+    ctx.strokeStyle = b.heightKm <= 1.2 ? '#ff3d5a' : b.heightKm <= 3.2 ? '#facc15' : '#00d4ff';
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
     ctx.stroke();
   }
 
-  // Points & altitude labels
-  ctx.font = 'bold 9.5px -apple-system, sans-serif';
+  // Points & de-crowded altitude labels
+  const placedLabels = [];
+  ctx.font = '700 9.5px "Inter", -apple-system, sans-serif';
   pts.forEach((p, idx) => {
     const [x, y] = toXY(p.uKt, p.vKt);
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = p.heightKm <= 1.2 ? '#ff5252' : p.heightKm <= 3.2 ? '#00e676' : '#00e5ff';
-    ctx.beginPath(); ctx.arc(x, y, 2.7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#090d16';
+    ctx.beginPath(); ctx.arc(x, y, 4.6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = p.heightKm <= 1.2 ? '#ff3d5a' : p.heightKm <= 3.2 ? '#facc15' : '#00d4ff';
+    ctx.beginPath(); ctx.arc(x, y, 3.0, 0, Math.PI * 2); ctx.fill();
+
+    // Always prioritize Sfc, 850, 700, 500 labels; skip 925 if crowded
+    if (p.label === '925') return;
+    const dx = x - cx;
+    const dy = y - cy;
+    const norm = Math.max(1, Math.hypot(dx, dy));
+    let lx = x + (dx / norm) * 11;
+    let ly = y + (dy / norm) * 11 + (dy >= 0 ? 4 : 0);
+    if (placedLabels.some((o) => Math.hypot(o[0] - lx, o[1] - ly) < 16)) {
+      lx = x + (idx % 2 === 0 ? -18 : 10);
+      ly = y + (idx % 2 === 0 ? -9 : 13);
+    }
+    placedLabels.push([lx, ly]);
     ctx.fillStyle = '#f8fafc';
-    const yOff = idx % 2 === 0 ? -6 : 11;
-    ctx.fillText(p.label, x + 5, y + yOff);
+    ctx.fillText(p.label, Math.max(6, Math.min(size - 26, lx - 6)), Math.max(12, Math.min(size - 6, ly)));
   });
 
-  // RM Crosshair
-  ctx.strokeStyle = '#ffd600';
+  // RM Crosshair reticle
+  ctx.strokeStyle = '#facc15';
   ctx.lineWidth = 1.6;
   ctx.beginPath(); ctx.arc(rmX, rmY, 5.5, 0, Math.PI * 2); ctx.stroke();
   ctx.beginPath();
   ctx.moveTo(rmX - 8, rmY); ctx.lineTo(rmX + 8, rmY);
   ctx.moveTo(rmX, rmY - 8); ctx.lineTo(rmX, rmY + 8);
   ctx.stroke();
-  ctx.fillStyle = '#ffd600';
-  ctx.font = 'bold 10px -apple-system, sans-serif';
+  ctx.fillStyle = '#facc15';
+  ctx.font = '800 10px "Inter", -apple-system, sans-serif';
   ctx.fillText('RM', rmX + 7, rmY + 11);
 }
 
@@ -1224,17 +1516,11 @@ function buildHourlyItems() {
     return nwsHourly.slice(0, 18).map((p, i) => {
       const d = new Date(p.startTime);
       const label = i === 0 ? 'Now' : d.toLocaleTimeString([], { hour: 'numeric' });
-      const txt = (p.shortForecast || '').toLowerCase();
-      let icon = p.isDaytime ? '🌤️' : '🌙';
-      if (txt.includes('thunder')) icon = '⛈️';
-      else if (txt.includes('snow') || txt.includes('sleet')) icon = '❄️';
-      else if (txt.includes('rain') || txt.includes('shower')) icon = '🌧️';
-      else if (txt.includes('fog')) icon = '🌫️';
-      else if (txt.includes('cloud')) icon = '☁️';
-      else if (txt.includes('sun') || txt.includes('clear')) icon = p.isDaytime ? '☀️' : '🌙';
+      const condText = p.shortForecast || '';
       return {
         time: label,
-        icon,
+        condText,
+        isNight: p.isDaytime === false,
         temp: p.temperature,
         pop: p.probabilityOfPrecipitation?.value || 0
       };
@@ -1248,10 +1534,12 @@ function buildHourlyItems() {
   if (start < 0) start = 0;
   return om.time.slice(start, start + 18).map((t, i) => {
     const d = new Date(t);
-    const [, icon] = wmoInfo(om.weather_code?.[start + i]);
+    const [condText] = wmoInfo(om.weather_code?.[start + i]);
+    const hr = d.getHours();
     return {
       time: i === 0 ? 'Now' : d.toLocaleTimeString([], { hour: 'numeric' }),
-      icon,
+      condText,
+      isNight: hr < 6 || hr >= 18,
       temp: Math.round(om.temperature_2m?.[start + i] ?? 0),
       pop: Math.round(om.precipitation_probability?.[start + i] ?? 0)
     };
@@ -1291,6 +1579,7 @@ function renderAlerts() {
             ${a.maxWindGust ? `<span class="badge-amber">Wind: ${escapeHtml(a.maxWindGust)}</span>` : ''}
             ${a.maxHailSize ? `<span class="badge-amber">Hail: ${escapeHtml(a.maxHailSize)}"</span>` : ''}
           </div>
+          ${a.stormMotion ? `<div class="cell-motion-banner"><span>${escapeHtml(a.stormMotion.summary)}</span><span>NWS CAP Vector</span></div>` : ''}
           ${a.instruction ? `<div class="alert-meta" style="margin-top:8px;color:var(--text-primary);">${escapeHtml(a.instruction.slice(0, 340))}</div>` : ''}
           <div class="card-action-row">
             <button class="btn-primary-sm" data-focus-alert="${escapeHtml(a.id)}">View on Radar</button>
@@ -1323,27 +1612,50 @@ function renderAlerts() {
   }
 
   if (cells.length) {
-    parts.push(`<div class="section-mini-label">Tracked NEXRAD Storm Cells Within 120 mi (${cells.length})</div>`);
+    parts.push(`<div class="section-mini-label">Verified NEXRAD Storm Cells Within 120 mi (${cells.length})</div>`);
     for (const sc of cells.slice(0, 12)) {
       const cls = sc.tvs ? 'tier-critical' : sc.meso ? 'tier-supercell' : '';
+      const confirmStr = sc.confirmingRadars?.length > 1
+        ? `Confirmed by ${sc.confirmingRadars.length} radars: ${sc.confirmingRadars.join(' · ')}`
+        : `Single-site radar: ${sc.nexrad}`;
       parts.push(`
         <div class="card alert-card ${cls}">
           <div class="card-header" style="margin-bottom:4px;">
-            <span class="badge-${sc.tvs ? 'red' : sc.meso ? 'magenta' : 'amber'}">${sc.threatLevel.replace('_', ' ')} • ${escapeHtml(sc.stormId)}</span>
+            <span class="badge-${sc.tvs ? 'red' : sc.meso ? 'magenta' : sc.threatScore >= 2 ? 'amber' : 'muted'}">${sc.threatLevel.replace('_', ' ')} • ${escapeHtml(sc.stormId)}</span>
             <span class="metric-sub">${sc.intercept.distanceMi.toFixed(1)} mi ${sc.intercept.compassFromUser}</span>
           </div>
           <div class="alert-title">
             ${sc.intercept.etaMinutes ? `Time on Target: ~${sc.intercept.etaMinutes} min` : escapeHtml(sc.intercept.verdictLabel)}
           </div>
-          <div class="alert-meta">
-            Moving ${sc.moveToCompass} @ ${sc.speedMph} mph • ${escapeHtml(sc.intercept.verdictLabel)} • Radar ${escapeHtml(sc.nexrad)}
+          <div class="cell-motion-banner">
+            <span>${escapeHtml(sc.motionSummary)}</span>
+          </div>
+          <div class="cell-proof-grid">
+            <div class="cell-proof-item">
+              <div class="cell-proof-k">VIL</div>
+              <div class="cell-proof-v">${sc.vil ?? 0}</div>
+            </div>
+            <div class="cell-proof-item">
+              <div class="cell-proof-k">Top</div>
+              <div class="cell-proof-v">${sc.topKft ? `${sc.topKft}k` : '--'}</div>
+            </div>
+            <div class="cell-proof-item">
+              <div class="cell-proof-k">dBZ</div>
+              <div class="cell-proof-v">${sc.maxDbz || '--'}</div>
+            </div>
+            <div class="cell-proof-item">
+              <div class="cell-proof-k">Hail</div>
+              <div class="cell-proof-v">${sc.maxHailIn > 0 ? `${sc.maxHailIn}"` : `${sc.posh ?? 0}%`}</div>
+            </div>
           </div>
           <div class="tag-row">
             ${sc.tvs ? `<span class="badge-red">TVS</span>` : ''}
-            ${sc.meso ? `<span class="badge-magenta">MESO ${escapeHtml(sc.meso)}</span>` : ''}
-            ${sc.maxHailIn > 0 ? `<span class="badge-amber">Hail ${sc.maxHailIn}"</span>` : ''}
-            ${sc.maxDbz ? `<span class="badge-muted">${sc.maxDbz} dBZ</span>` : ''}
-            ${sc.topKft ? `<span class="badge-muted">Top ${sc.topKft} kft</span>` : ''}
+            ${sc.meso ? `<span class="badge-magenta">MESO RANK ${escapeHtml(sc.meso)}</span>` : ''}
+            ${sc.maxHailIn > 0 ? `<span class="badge-amber">Hail ${sc.maxHailIn}" (POSH ${sc.posh}%)</span>` : ''}
+          </div>
+          <div class="radar-confirm-pill">
+            <span>${escapeHtml(confirmStr)}</span>
+            <span>${escapeHtml(sc.intercept.verdictLabel)}</span>
           </div>
           <div class="card-action-row">
             <button class="btn-primary-sm" data-focus-cell="${escapeHtml(sc.id)}">Track on Radar</button>
@@ -1369,11 +1681,13 @@ function renderAlerts() {
 
   if (!parts.length) {
     parts.push(`
-      <div class="card" style="text-align:center;padding:28px 18px;">
-        <div style="font-size:34px;margin-bottom:8px;">🛡️</div>
+      <div class="card" style="text-align:center;padding:30px 18px;">
+        <div style="display:inline-flex;align-items:center;justify-content:center;width:54px;height:54px;border-radius:16px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.34);color:#34d399;margin-bottom:10px;">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+        </div>
         <div class="alert-title">All Quiet Across Your Area</div>
         <div class="alert-meta" style="margin-top:6px;">
-          Active TVS/Mesocyclone detections, approaching storm Time-on-Target vectors, black ice / freezing fog alerts, NWS warnings, and SPC Mesoscale Discussions will appear here automatically.
+          No verified supercells, TVS signatures, or NWS warnings detected within 120 miles. Non-convective rain clutter is automatically filtered.
         </div>
       </div>
     `);
@@ -1418,7 +1732,7 @@ function renderSettings() {
     <!-- OTA AUTO-UPDATER -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">🔄 App Updates (OTA)</div>
+        <div class="card-title">${sectionIcon('ota')}App Updates (OTA)</div>
         <span class="badge-${hasUpd ? 'cyan' : 'green'}">${hasUpd ? 'Update Ready' : `v${APP_LOCAL_VERSION.versionName} Current`}</span>
       </div>
       <div class="alert-meta" style="margin-bottom:10px;">
@@ -1435,7 +1749,7 @@ function renderSettings() {
     <!-- SEVERE WEATHER ENGINE SETTINGS -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">🌪️ Severe Weather Protection Engine</div>
+        <div class="card-title">${sectionIcon('shield')}Severe Weather Protection Engine</div>
         <span class="badge-${state.isStormWatchActive ? 'red' : 'green'}">${state.isStormWatchActive ? 'Active 45s Watch' : 'Standby 3m'}</span>
       </div>
 
@@ -1535,7 +1849,7 @@ function renderSettings() {
     <!-- CUSTOM SIREN SELECTOR & SOUND TESTER -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">🚨 Tornado &amp; Severe Alert Sirens</div>
+        <div class="card-title">${sectionIcon('sounding', 'amber')}Tornado &amp; Severe Alert Sirens</div>
         <span class="badge-red">8 Custom WAVs</span>
       </div>
       <div class="alert-meta" style="margin-bottom:10px;">
@@ -1811,7 +2125,7 @@ function renderSavedLocations() {
         state.activeLocation = found;
         state.selectedRadarSite = findNearestNexradStation(found.lat, found.lon).id;
         closeLocationModal();
-        radarMap.flyTo(found.lat, found.lon, 8.2);
+        radarMap.flyTo(found.lat, found.lon, 8.2, true);
         refreshAllData();
       }
     });
@@ -1866,7 +2180,7 @@ async function runLocationSearch() {
         state.activeLocation = newLoc;
         state.selectedRadarSite = findNearestNexradStation(hit.lat, hit.lon).id;
         closeLocationModal();
-        radarMap.flyTo(hit.lat, hit.lon, 8.2);
+        radarMap.flyTo(hit.lat, hit.lon, 8.2, true);
         refreshAllData();
       });
     });

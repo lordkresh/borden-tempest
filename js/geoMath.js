@@ -116,19 +116,44 @@ export function computeStormIntercept(userLat, userLon, cellLat, cellLon, moveTo
 }
 
 export function buildThreatConePolygon(cellLat, cellLon, moveToBearingDeg, speedMph, minutes = 45) {
-  if (!speedMph || speedMph < 5 || moveToBearingDeg == null) return null;
+  if (!speedMph || speedMph < 5 || moveToBearingDeg == null || Number.isNaN(moveToBearingDeg)) return null;
   const travelMi = Math.min(75, Math.max(8, (speedMph * minutes) / 60));
   const spreadDeg = 16;
-  const pLeft = destinationPoint(cellLat, cellLon, (moveToBearingDeg - spreadDeg + 360) % 360, travelMi);
-  const pMid = destinationPoint(cellLat, cellLon, moveToBearingDeg, travelMi * 1.04);
-  const pRight = destinationPoint(cellLat, cellLon, (moveToBearingDeg + spreadDeg) % 360, travelMi);
-  return [
-    [cellLon, cellLat],
-    [pLeft.lon, pLeft.lat],
-    [pMid.lon, pMid.lat],
-    [pRight.lon, pRight.lat],
-    [cellLon, cellLat]
-  ];
+  const steps = 6;
+  const ring = [[cellLon, cellLat]];
+  for (let i = 0; i <= steps; i++) {
+    const frac = i / steps;
+    const angle = (moveToBearingDeg - spreadDeg + frac * spreadDeg * 2 + 360) % 360;
+    const cosCurve = 1 + 0.05 * Math.sin(frac * Math.PI);
+    const pt = destinationPoint(cellLat, cellLon, angle, travelMi * cosCurve);
+    ring.push([pt.lon, pt.lat]);
+  }
+  ring.push([cellLon, cellLat]);
+  return ring;
+}
+
+export function buildMotionVectorLine(cellLat, cellLon, moveToBearingDeg, speedMph, minutes = 45) {
+  if (!speedMph || speedMph < 5 || moveToBearingDeg == null || Number.isNaN(moveToBearingDeg)) return null;
+  const travelMi = Math.min(75, Math.max(8, (speedMph * minutes) / 60));
+  const tip = destinationPoint(cellLat, cellLon, moveToBearingDeg, travelMi);
+  const headLenMi = Math.max(2.2, Math.min(5.5, travelMi * 0.16));
+  const leftWing = destinationPoint(tip.lat, tip.lon, (moveToBearingDeg + 150) % 360, headLenMi);
+  const rightWing = destinationPoint(tip.lat, tip.lon, (moveToBearingDeg + 210) % 360, headLenMi);
+  return {
+    tip,
+    coords: [[cellLon, cellLat], [tip.lon, tip.lat]],
+    arrowCoords: [[leftWing.lon, leftWing.lat], [tip.lon, tip.lat], [rightWing.lon, rightWing.lat]]
+  };
+}
+
+export function buildCirclePolygon(centerLat, centerLon, radiusMiles, steps = 64) {
+  const ring = [];
+  for (let i = 0; i <= steps; i++) {
+    const brg = (i / steps) * 360;
+    const pt = destinationPoint(centerLat, centerLon, brg, radiusMiles);
+    ring.push([pt.lon, pt.lat]);
+  }
+  return ring;
 }
 
 export function geometryCentroid(geometry) {

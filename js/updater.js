@@ -1,6 +1,6 @@
 export const APP_LOCAL_VERSION = {
-  versionCode: 4,
-  versionName: '1.3.0',
+  versionCode: 5,
+  versionName: '1.4.0',
   platform: 'iOS / Web PWA'
 };
 

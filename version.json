@@ -1,7 +1,7 @@
 {
-  "versionCode": 4,
-  "versionName": "1.3.0",
+  "versionCode": 5,
+  "versionName": "1.4.0",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-22T04:30:00Z",
-  "releaseNotes": "Tempest v1.3.0 (by J. Borden): Official SPC STP/SCP/SRH + live 5-level Hodograph, 3-Day SPC & WPC Flash Flood outlooks, local NWS Meteorologist Discussion (AFD), Spoken NOAA Voice Announcer, 1-tap Refl/Vel/CC radar quick-flip, SPC Watch Boxes, LSR tap-to-inspect, Burnsville-verified ASOS outlier consensus, and new intertwined twin-tornadoes Tempest icon."
+  "publishedAt": "2026-11-22T21:30:00Z",
+  "releaseNotes": "Tempest v1.4.0 (by J. Borden): Meteorological storm-tracking overhaul (deep-convective VIL/Echo Top/dBZ gating eliminates shallow-shower false supercells, strict FROM->TOWARD motion vectors + NWS CAP vector parsing, erratic SCIT spike guard, and 8-mile multi-radar deduplication), tactical radar centerline vectors & 15/30/60 mi range rings, plus flagship obsidian UI with custom SVG weather graphics, live wind compass & barometer arc, and severity meters."
 }

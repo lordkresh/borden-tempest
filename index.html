@@ -18,7 +18,10 @@
   <link rel="apple-touch-icon" sizes="180x180" href="./assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/png" sizes="64x64" href="./assets/icons/favicon.png" />
 
-  <!-- MapLibre GL JS -->
+  <!-- Typography & MapLibre GL JS -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" defer></script>
 
@@ -106,6 +109,10 @@
             <button id="btn-radar-site" class="radar-pill-btn">
               <span class="dot-live"></span>
               <span id="radar-site-label">Site: Auto</span>
+            </button>
+            <button id="radar-storm-hud" class="radar-pill-btn radar-hud-pill" title="Focus Highest Threat Cell">
+              <span class="hud-dot"></span>
+              <span id="radar-hud-text">Scanning...</span>
             </button>
             <button id="btn-radar-layers" class="radar-pill-btn">Layers</button>
             <button id="btn-radar-recenter" class="radar-pill-btn" title="Recenter on Location">◎</button>
