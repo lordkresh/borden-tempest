@@ -1,7 +1,7 @@
 {
-  "versionCode": 5,
-  "versionName": "1.4.0",
+  "versionCode": 7,
+  "versionName": "1.6.0",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-22T21:30:00Z",
-  "releaseNotes": "Tempest v1.4.0 (by J. Borden): Meteorological storm-tracking overhaul (deep-convective VIL/Echo Top/dBZ gating eliminates shallow-shower false supercells, strict FROM->TOWARD motion vectors + NWS CAP vector parsing, erratic SCIT spike guard, and 8-mile multi-radar deduplication), tactical radar centerline vectors & 15/30/60 mi range rings, plus flagship obsidian UI with custom SVG weather graphics, live wind compass & barometer arc, and severity meters."
+  "publishedAt": "2026-11-23T01:05:00Z",
+  "releaseNotes": "Tempest v1.6.0 (by J. Borden): Fixes atmospheric convection mislabeling on stable zero-CAPE high-shear days (CAPE & CIN cap gating), plus specular obsidian glass polish and tinted-glass action buttons harmonized with Android v1.5.0."
 }

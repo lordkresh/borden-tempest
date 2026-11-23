@@ -11,7 +11,7 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Tempest" />
-  <meta name="theme-color" content="#071222" />
+  <meta name="theme-color" content="#040811" />
   <meta name="format-detection" content="telephone=no" />
 
   <link rel="manifest" href="./manifest.webmanifest" />
@@ -56,6 +56,21 @@
         </button>
       </div>
     </header>
+
+    <!-- Live Broadcast Telemetry Ribbon -->
+    <div id="telemetry-ribbon" class="telemetry-ribbon tone-clear" role="status" aria-live="polite" title="Tap to open Radar or Active Alerts">
+      <div class="telem-chip telem-status">
+        <span class="telem-dot"></span>
+        <span id="telem-threat">SCANNING</span>
+      </div>
+      <div class="telem-metrics">
+        <span class="telem-item"><b id="telem-radar">KGWX</b></span>
+        <span class="telem-sep">•</span>
+        <span class="telem-item" id="telem-cells">0 CELLS</span>
+        <span class="telem-sep">•</span>
+        <span class="telem-item" id="telem-stp">STP 0.0</span>
+      </div>
+    </div>
 
     <!-- OTA Update Banner (Hidden unless an update is available) -->
     <div id="update-banner" class="update-banner hidden">
