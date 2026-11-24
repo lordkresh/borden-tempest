@@ -176,19 +176,23 @@ export function cleanReflectivityTileRgba(rgba, width, height) {
 async function decodePngBuffer(rawBuf) {
   const blob = new Blob([rawBuf], { type: 'image/png' });
   if (typeof createImageBitmap === 'function') {
-    const bitmap = await createImageBitmap(blob);
-    return {
-      source: bitmap,
-      width: bitmap.width,
-      height: bitmap.height,
-      close: () => {
-        try {
-          bitmap.close?.();
-        } catch {
-          // ignore
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return {
+        source: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        close: () => {
+          try {
+            bitmap.close?.();
+          } catch {
+            // ignore
+          }
         }
-      }
-    };
+      };
+    } catch {
+      // Fall through to HTMLImageElement decoder (handles iOS Safari WebKit PNG edge cases)
+    }
   }
   if (typeof Image === 'function' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
     const objUrl = URL.createObjectURL(blob);
@@ -527,6 +531,17 @@ export class RadarMapController {
     }
   }
 
+  _clearMapFallback() {
+    if (this._fallbackClickEl && typeof this._fallbackClickEl.removeEventListener === 'function') {
+      this._fallbackClickEl.removeEventListener('click', this._onFallbackContainerClick);
+    }
+    this._fallbackClickEl = null;
+    if (typeof document !== 'undefined') {
+      const container = document.getElementById(this.containerId);
+      container?.querySelectorAll?.('.radar-map-fallback')?.forEach?.((el) => el.remove());
+    }
+  }
+
   _renderMapFallback(message) {
     if (typeof document === 'undefined') return;
     const container = document.getElementById(this.containerId);
@@ -583,6 +598,7 @@ export class RadarMapController {
         attributionControl: false
       });
       this._webglUnavailable = false;
+      this._clearMapFallback();
     } catch (err) {
       this.map = null;
       this.ready = false;

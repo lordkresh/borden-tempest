@@ -469,9 +469,14 @@ function stripTransientUpdateParam() {
 }
 
 /* ==================== BOOTSTRAP ==================== */
-document.addEventListener('DOMContentLoaded', () => {
-  stripTransientUpdateParam();
-  armGestureUnlock();
+let _tempestBooted = false;
+
+function bootTempest() {
+  if (_tempestBooted) return;
+  _tempestBooted = true;
+
+  try { stripTransientUpdateParam(); } catch { /* non-fatal */ }
+  try { armGestureUnlock(); } catch { /* non-fatal */ }
 
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
@@ -502,10 +507,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (state.tab === 'settings') renderSettings();
   };
 
-  wireEvents();
-  checkIosInstallBanner();
-  const hydrated = hydrateFromSnapshot();
-  startExpirySweep();
+  try { wireEvents(); } catch { /* non-fatal */ }
+  try { checkIosInstallBanner(); } catch { /* non-fatal */ }
+  let hydrated = false;
+  try { hydrated = hydrateFromSnapshot(); } catch { hydrated = false; }
+  try { startExpirySweep(); } catch { /* non-fatal */ }
 
   void updater.init((manifest) => {
     const banner = document.getElementById('update-banner');
@@ -528,7 +534,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }).catch(() => {});
 
   void refreshAllData(hydrated);
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootTempest, { once: true });
+} else {
+  bootTempest();
+}
 
 function checkIosInstallBanner() {
   const el = document.getElementById('ios-install-banner');
