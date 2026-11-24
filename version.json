@@ -1,7 +1,7 @@
 {
-  "versionCode": 8,
-  "versionName": "1.6.1",
+  "versionCode": 9,
+  "versionName": "1.6.2",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-24T04:45:00Z",
-  "releaseNotes": "Tempest v1.6.1 (by J. Borden): Full production hardening release building on v1.6.0 (CAPE/CIN cap gating & obsidian glass polish) — adds strict network-only live weather/radar SW isolation, bounded retry/backoff + binary NEXRAD validation, America/Chicago UTC conversion + hard >15m staleness alert banner, edge/hole/antimeridian polygon geometry & SPC SCP math fixes, immediate expired/superseded NWS alert purging, zero-leak radar loop background lifecycle, graceful GPS fallback, and 63/63 automated Chromium verification tests."
+  "publishedAt": "2026-11-24T06:15:00Z",
+  "releaseNotes": "Tempest v1.6.2 (by J. Borden): Adds NEXRAD reflectivity ground-clutter & noise-speckle suppression with smooth linear raster resampling (CONUS Mosaic, N0B, N0Q via safe MapLibre v4 custom protocol while keeping Velocity/CC/ZDR raw), eliminates false iOS Safari / GitHub Pages OTA update loops via cache-revalidating app-shell fetches and strict versionCode gating, and expands automated Chromium verification."
 }

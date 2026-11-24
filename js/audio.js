@@ -61,40 +61,61 @@ class TempestAudioEngine {
   constructor() {
     this.currentAudio = null;
     this.currentId = null;
+    this.audioCtx = null;
     this.unlocked = false;
     this.onStateChange = null;
   }
 
   unlockForIOS() {
-    if (this.unlocked) return;
+    if (typeof window === 'undefined') return;
+    // On iOS Safari standalone PWAs, backgrounding can transition an already-unlocked AudioContext
+    // to 'interrupted' or 'suspended'. Only early-return when the context is actively running.
+    if (this.unlocked && (!this.audioCtx || this.audioCtx.state === 'running')) return;
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (AudioCtx) {
-        const ctx = new AudioCtx();
+        if (!this.audioCtx || this.audioCtx.state === 'closed') {
+          this.audioCtx = new AudioCtx();
+        }
+        const ctx = this.audioCtx;
+        if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+          this.unlocked = false;
+          ctx.resume()
+            .then(() => {
+              if (this.audioCtx && this.audioCtx.state === 'running') {
+                this.unlocked = true;
+              }
+            })
+            .catch(() => {});
+        }
         const buf = ctx.createBuffer(1, 1, 22050);
         const src = ctx.createBufferSource();
         src.buffer = buf;
         src.connect(ctx.destination);
         src.start(0);
-        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+        if (ctx.state === 'running') {
+          this.unlocked = true;
+        }
+      } else {
+        this.unlocked = true;
       }
-      this.unlocked = true;
     } catch {
-      // ignore
+      // ignore restricted audio contexts
     }
   }
 
   stop() {
-    if (this.currentAudio) {
+    const active = this.currentAudio;
+    this.currentAudio = null;
+    this.currentId = null;
+    if (active) {
       try {
-        this.currentAudio.pause();
-        this.currentAudio.currentTime = 0;
+        active.pause();
+        active.currentTime = 0;
       } catch {
         // ignore
       }
-      this.currentAudio = null;
     }
-    this.currentId = null;
     if (this.onStateChange) this.onStateChange(null);
   }
 
@@ -102,30 +123,47 @@ class TempestAudioEngine {
     const item = SIREN_CATALOG.find((s) => s.id === soundId) || SIREN_CATALOG[0];
     this.stop();
 
-    const audio = new Audio(item.file);
-    audio.loop = loop;
+    if (typeof Audio === 'undefined') {
+      return false;
+    }
+
+    let audio;
+    try {
+      audio = new Audio(item.file);
+    } catch {
+      return false;
+    }
+
+    audio.loop = Boolean(loop);
     audio.preload = 'auto';
     audio.playsInline = true;
     this.currentAudio = audio;
     this.currentId = item.id;
 
-    audio.addEventListener('ended', () => {
-      if (!loop && this.currentAudio === audio) {
+    const cleanupIfCurrent = () => {
+      if (this.currentAudio === audio) {
         this.currentAudio = null;
         this.currentId = null;
         if (this.onStateChange) this.onStateChange(null);
       }
+    };
+
+    audio.addEventListener('ended', () => {
+      if (!loop) cleanupIfCurrent();
     });
+    audio.addEventListener('error', cleanupIfCurrent);
 
     if (this.onStateChange) this.onStateChange(item.id);
 
     try {
-      await audio.play();
-      return true;
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        await playPromise;
+      }
+      return this.currentAudio === audio;
     } catch {
-      this.currentAudio = null;
-      this.currentId = null;
-      if (this.onStateChange) this.onStateChange(null);
+      // Only clear state if this exact audio instance is still active (avoids clobbering a newer play())
+      cleanupIfCurrent();
       return false;
     }
   }
@@ -135,7 +173,7 @@ class TempestAudioEngine {
       this.stop();
       return false;
     }
-    this.play(soundId, false);
+    void this.play(soundId, false).catch(() => false);
     return true;
   }
 }

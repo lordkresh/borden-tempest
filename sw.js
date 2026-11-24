@@ -1,4 +1,4 @@
-const CACHE_NAME = 'borden-tempest-v1.6.1-b8';
+const CACHE_NAME = 'borden-tempest-v1.6.2-b9';
 
 const SHELL_ASSETS = [
   './',
@@ -91,6 +91,14 @@ function isStaticAppShellAsset(url) {
 
 function fetchNetworkOnly(request) {
   const init = { cache: 'no-store' };
+  if (request.mode === 'navigate') {
+    return fetch(request.url, init);
+  }
+  return fetch(request, init);
+}
+
+function fetchAppShellNoCache(request) {
+  const init = { cache: 'no-cache' };
   if (request.mode === 'navigate') {
     return fetch(request.url, init);
   }
@@ -237,7 +245,8 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // 3. Static app-shell HTML, JS, CSS, and Web Manifest: Network-first with clean offline cache fallback
+  // 3. Static app-shell HTML, JS, CSS, and Web Manifest: Network-first (cache: 'no-cache') with clean offline cache fallback
+  // Using { cache: 'no-cache' } bypasses GitHub Pages' 10-minute max-age=600 CDN HTTP cache so js/updater.js is never stale after OTA.
   if (
     request.mode === 'navigate' ||
     url.pathname === '/' ||
@@ -248,11 +257,14 @@ self.addEventListener('fetch', (event) => {
     url.pathname.endsWith('.webmanifest')
   ) {
     event.respondWith(
-      fetch(request)
+      fetchAppShellNoCache(request)
         .then((resp) => {
           if (resp && resp.ok && resp.status === 200) {
             const clone = resp.clone();
-            event.waitUntil(safeCachePut(request, clone));
+            const cacheKey = url.searchParams.has('_upd')
+              ? new Request(`${url.origin}${url.pathname}`)
+              : request;
+            event.waitUntil(safeCachePut(cacheKey, clone));
           }
           return resp;
         })

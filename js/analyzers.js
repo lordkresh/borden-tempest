@@ -5,8 +5,14 @@ import {
   computeStormIntercept,
   degToCompass,
   haversineMiles,
-  isPointInGeometry
+  isPointInGeometry,
+  isValidLatLon
 } from './geoMath.js';
+import {
+  DEFAULT_TIME_ZONE,
+  getCentralHour24,
+  parseUtcTimestampMs
+} from './weatherApi.js';
 
 const WMO_LABELS = {
   0: ['Clear Sky', '☀️'],
@@ -43,31 +49,147 @@ export function wmoInfo(code) {
   return WMO_LABELS[code] || ['Fair', '🌤️'];
 }
 
-function cToF(c) {
-  return c == null ? null : (c * 9) / 5 + 32;
+function toFiniteNumber(v) {
+  if (v === null || v === undefined || v === '' || typeof v === 'boolean') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function kmhToMph(kmh) {
-  return kmh == null ? null : kmh * 0.621371;
+export const KT_TO_MS = 1852 / 3600;
+export const MS_TO_KT = 3600 / 1852;
+export const KT_TO_MPH = 1852 / 1609.344;
+export const MPH_TO_KT = 1609.344 / 1852;
+
+export function cToF(c) {
+  const n = toFiniteNumber(c);
+  return n === null ? null : (n * 9) / 5 + 32;
 }
 
-function mToMiles(m) {
-  return m == null ? null : m / 1609.344;
+export function fToC(f) {
+  const n = toFiniteNumber(f);
+  return n === null ? null : ((n - 32) * 5) / 9;
 }
 
-function paToHpa(pa) {
-  return pa == null ? null : pa / 100;
+export function kmhToMph(kmh) {
+  const n = toFiniteNumber(kmh);
+  return n === null ? null : n / 1.609344;
 }
 
-function mphToKt(mph) {
-  return (mph || 0) * 0.868976;
+export function mphToKmh(mph) {
+  const n = toFiniteNumber(mph);
+  return n === null ? null : n * 1.609344;
 }
 
-const KT_TO_MS = 0.514444;
+export function ktToMph(kt) {
+  const n = toFiniteNumber(kt);
+  return n === null ? null : n * KT_TO_MPH;
+}
+
+export function mphToKt(mph) {
+  const n = toFiniteNumber(mph);
+  return n === null ? null : n * MPH_TO_KT;
+}
+
+export function msToMph(ms) {
+  const n = toFiniteNumber(ms);
+  return n === null ? null : (n * 3600) / 1609.344;
+}
+
+export function msToKt(ms) {
+  const n = toFiniteNumber(ms);
+  return n === null ? null : n * MS_TO_KT;
+}
+
+export function ktToMs(kt) {
+  const n = toFiniteNumber(kt);
+  return n === null ? null : n * KT_TO_MS;
+}
+
+export function mToFeet(m) {
+  const n = toFiniteNumber(m);
+  return n === null ? null : n / 0.3048;
+}
+
+export function mToMiles(m) {
+  const n = toFiniteNumber(m);
+  return n === null ? null : n / 1609.344;
+}
+
+export function paToHpa(pa) {
+  const n = toFiniteNumber(pa);
+  return n === null ? null : n / 100;
+}
+
+export function hpaToInHg(hpa) {
+  const n = toFiniteNumber(hpa);
+  return n === null ? null : n * 0.029529983071445;
+}
+
+function normalizeUnitCode(unit) {
+  return String(unit || '').trim().toLowerCase();
+}
+
+function convertTempToF(val, unitLabel = '°f') {
+  const n = toFiniteNumber(val);
+  if (n === null) return null;
+  const u = normalizeUnitCode(unitLabel);
+  if (u.includes('degc') || u === 'c' || u === '°c') return cToF(n);
+  return n;
+}
+
+function convertWindToMph(val, unitLabel = 'mp/h') {
+  const n = toFiniteNumber(val);
+  if (n === null) return null;
+  const u = normalizeUnitCode(unitLabel);
+  if (u.includes('km_h') || u.includes('km/h') || u === 'kmh') return kmhToMph(n);
+  if (u.includes('m_s') || u.includes('m/s') || u === 'ms') return msToMph(n);
+  if (u === 'kn' || u === 'kt' || u === 'kts' || u.includes(':kt') || u.includes('knot')) return ktToMph(n);
+  return n;
+}
+
+function convertWindToKt(val, unitLabel = 'mp/h') {
+  const n = toFiniteNumber(val);
+  if (n === null) return null;
+  const u = normalizeUnitCode(unitLabel);
+  if (u === 'kn' || u === 'kt' || u === 'kts' || u.includes(':kt') || u.includes('knot')) return n;
+  if (u.includes('km_h') || u.includes('km/h') || u === 'kmh') return mphToKt(kmhToMph(n));
+  if (u.includes('m_s') || u.includes('m/s') || u === 'ms') return msToKt(n);
+  return mphToKt(n);
+}
+
+function convertPressureToHpa(val, unitLabel = 'pa') {
+  const n = toFiniteNumber(val);
+  if (n === null) return null;
+  const u = normalizeUnitCode(unitLabel);
+  if (u.includes('hpa') || u === 'mb') return n;
+  if (u.includes('inhg')) return n / 0.029529983071445;
+  return paToHpa(n);
+}
+
+function convertVisibilityToMiles(val, unitLabel = 'm') {
+  const n = toFiniteNumber(val);
+  if (n === null) return null;
+  const u = normalizeUnitCode(unitLabel);
+  if (u === 'mi' || u === 'mile' || u === 'miles') return n;
+  if (u === 'km' || u.includes(':km')) return kmhToMph(n);
+  if (u === 'ft' || u === 'feet') return n / 5280;
+  return mToMiles(n);
+}
+
+function convertSnowfallToInches(val, unitLabel = 'inch') {
+  const n = toFiniteNumber(val);
+  if (n === null) return 0;
+  const u = normalizeUnitCode(unitLabel);
+  if (u === 'cm') return n / 2.54;
+  if (u === 'mm') return n / 25.4;
+  return n;
+}
 
 function windComponentsKt(spdKt, dirFromDeg) {
-  const rad = (dirFromDeg * Math.PI) / 180;
-  return [-spdKt * Math.sin(rad), -spdKt * Math.cos(rad)];
+  const spd = Math.max(0, toFiniteNumber(spdKt) ?? 0);
+  const dir = toFiniteNumber(dirFromDeg) ?? 0;
+  const rad = (dir * Math.PI) / 180;
+  return [-spd * Math.sin(rad), -spd * Math.cos(rad)];
 }
 
 function vectorShearKt(spd1Kt, dir1Deg, spd2Kt, dir2Deg) {
@@ -81,23 +203,30 @@ function vectorShearKt(spd1Kt, dir1Deg, spd2Kt, dir2Deg) {
  * Positive for clockwise-curving Northern Hemisphere hodographs with RM storm motion to the right.
  */
 function integrateSrh(levelsMs, stormU, stormV) {
+  if (!Array.isArray(levelsMs) || levelsMs.length < 2 || !Number.isFinite(stormU) || !Number.isFinite(stormV)) {
+    return 0;
+  }
   let total = 0;
   for (let i = 0; i < levelsMs.length - 1; i++) {
     const [u1, v1] = levelsMs[i];
     const [u2, v2] = levelsMs[i + 1];
+    if (!Number.isFinite(u1) || !Number.isFinite(v1) || !Number.isFinite(u2) || !Number.isFinite(v2)) continue;
     total += (u2 - stormU) * (v1 - stormV) - (u1 - stormU) * (v2 - stormV);
   }
-  return total;
+  return Number.isFinite(total) ? total : 0;
 }
 
-function findCurrentHourIndex(hourly) {
+function findCurrentHourIndex(hourly, nowMs = Date.now(), utcOffsetSeconds = 0) {
   const times = hourly?.time || [];
   if (!times.length) return 0;
-  const nowMs = Date.now();
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const offsetOpts = Number.isFinite(utcOffsetSeconds) && utcOffsetSeconds !== 0 ? { utcOffsetSeconds } : {};
   let bestIdx = 0;
   let bestDiff = Infinity;
   for (let i = 0; i < times.length; i++) {
-    const diff = Math.abs(new Date(times[i]).getTime() - nowMs);
+    const tMs = parseUtcTimestampMs(times[i], offsetOpts);
+    if (tMs == null || !Number.isFinite(tMs)) continue;
+    const diff = Math.abs(tMs - refMs);
     if (diff < bestDiff) {
       bestDiff = diff;
       bestIdx = i;
@@ -109,35 +238,41 @@ function findCurrentHourIndex(hourly) {
 /**
  * Multi-station NWS ASOS/AWOS + NDFD/NBM + Open-Meteo (HRRR/GFS) Accuracy Consensus Resolver
  */
-export function resolveCurrentConditions(nwsBundle, openMeteo) {
+export function resolveCurrentConditions(nwsBundle, openMeteo, nowMs = Date.now()) {
   const cur = openMeteo?.current || {};
+  const curUnits = openMeteo?.current_units || {};
   const hourly = openMeteo?.hourly || {};
-  const idx = findCurrentHourIndex(hourly);
+  const hourlyUnits = openMeteo?.hourly_units || {};
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const idx = findCurrentHourIndex(hourly, refMs, openMeteo?.utc_offset_seconds ?? 0);
 
   const stationTemps = [];
   const stationDews = [];
   const stationNames = [];
   let primaryObs = null;
 
-  const omTemp = cur.temperature_2m ?? null;
-  const nwsHourlyTemp = nwsBundle?.hourlyPeriods?.[0]?.temperature ?? null;
+  const omTemp = convertTempToF(cur.temperature_2m, curUnits.temperature_2m || '°F');
+  const firstNwsPeriod = nwsBundle?.hourlyPeriods?.[0];
+  const nwsHourlyTemp = convertTempToF(firstNwsPeriod?.temperature, firstNwsPeriod?.temperatureUnit || 'F');
   const anchorTemp = nwsHourlyTemp ?? omTemp;
 
   // Outlier rejection (screens rural municipal AWOS cold-drainage glitches > 4.5°F from NDFD/HRRR anchor)
   const validStations = [];
   for (const obs of nwsBundle?.observations || []) {
-    const p = obs.props;
+    const p = obs?.props;
     if (!p) continue;
     if (p.timestamp) {
-      const ageMin = (Date.now() - new Date(p.timestamp).getTime()) / 60000;
-      if (ageMin > 90) continue;
+      const obsMs = parseUtcTimestampMs(p.timestamp);
+      if (obsMs == null || !Number.isFinite(obsMs)) continue;
+      const ageMin = (refMs - obsMs) / 60000;
+      if (ageMin > 90 || ageMin < -15) continue;
     }
-    const tF = cToF(p.temperature?.value);
-    const dF = cToF(p.dewpoint?.value);
-    const rh = p.relativeHumidity?.value ?? null;
+    const tF = convertTempToF(p.temperature?.value, p.temperature?.unitCode || 'wmoUnit:degC');
+    const dF = convertTempToF(p.dewpoint?.value, p.dewpoint?.unitCode || 'wmoUnit:degC');
+    const rh = toFiniteNumber(p.relativeHumidity?.value);
     const desc = String(p.textDescription || '').toLowerCase();
     const bogusClear100Rh = rh != null && rh >= 99 && (desc.includes('clear') || desc.includes('fair') || desc.includes('sunny'));
-    if (tF != null && !Number.isNaN(tF)) {
+    if (tF != null && Number.isFinite(tF)) {
       if (anchorTemp != null && Math.abs(tF - anchorTemp) > 4.5) continue;
       validStations.push({ obs, tF, dF: bogusClear100Rh ? null : dF, rh: bogusClear100Rh ? null : rh });
     }
@@ -147,7 +282,7 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
     stationTemps.push(vs.tF);
     stationNames.push(vs.obs.stationId);
     if (!primaryObs) primaryObs = vs.obs;
-    if (vs.dF != null && !Number.isNaN(vs.dF)) stationDews.push(vs.dF);
+    if (vs.dF != null && Number.isFinite(vs.dF)) stationDews.push(vs.dF);
   }
 
   const samples = [];
@@ -164,27 +299,42 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
     ? Math.max(...samples.map((s) => s.v)) - Math.min(...samples.map((s) => s.v))
     : 0;
 
+  const omDewF = convertTempToF(cur.dew_point_2m, curUnits.dew_point_2m || curUnits.temperature_2m || '°F');
   const dewpointF = stationDews.length
-    ? (stationDews[0] * 0.55 + (cur.dew_point_2m ?? stationDews[0]) * 0.45)
-    : (cur.dew_point_2m ?? null);
+    ? (stationDews[0] * 0.55 + (omDewF ?? stationDews[0]) * 0.45)
+    : omDewF;
 
-  const pressureHpa = paToHpa(primaryObs?.props?.seaLevelPressure?.value)
-    ?? paToHpa(primaryObs?.props?.barometricPressure?.value)
-    ?? cur.pressure_msl
-    ?? hourly.pressure_msl?.[idx]
-    ?? cur.surface_pressure
+  const pressureHpa = convertPressureToHpa(primaryObs?.props?.seaLevelPressure?.value, primaryObs?.props?.seaLevelPressure?.unitCode || 'wmoUnit:Pa')
+    ?? convertPressureToHpa(primaryObs?.props?.barometricPressure?.value, primaryObs?.props?.barometricPressure?.unitCode || 'wmoUnit:Pa')
+    ?? convertPressureToHpa(cur.pressure_msl, curUnits.pressure_msl || 'hPa')
+    ?? convertPressureToHpa(hourly.pressure_msl?.[idx], hourlyUnits.pressure_msl || 'hPa')
+    ?? convertPressureToHpa(cur.surface_pressure, curUnits.surface_pressure || 'hPa')
     ?? null;
 
-  const pNowMsl = hourly.pressure_msl?.[idx] ?? cur.pressure_msl ?? null;
-  const p3hAgoMsl = idx >= 3 ? hourly.pressure_msl?.[idx - 3] : hourly.pressure_msl?.[0];
+  const pNowMsl = convertPressureToHpa(hourly.pressure_msl?.[idx], hourlyUnits.pressure_msl || 'hPa')
+    ?? convertPressureToHpa(cur.pressure_msl, curUnits.pressure_msl || 'hPa')
+    ?? null;
+  const p3hAgoRaw = idx >= 3 ? hourly.pressure_msl?.[idx - 3] : hourly.pressure_msl?.[0];
+  const p3hAgoMsl = convertPressureToHpa(p3hAgoRaw, hourlyUnits.pressure_msl || 'hPa');
   const pressureTrend3h = (pNowMsl != null && p3hAgoMsl != null) ? (pNowMsl - p3hAgoMsl) : 0;
 
-  const windMph = kmhToMph(primaryObs?.props?.windSpeed?.value) ?? cur.wind_speed_10m ?? 0;
-  const gustMph = kmhToMph(primaryObs?.props?.windGust?.value) ?? cur.wind_gusts_10m ?? null;
-  const windDir = primaryObs?.props?.windDirection?.value ?? cur.wind_direction_10m ?? null;
+  const obsWindMph = convertWindToMph(primaryObs?.props?.windSpeed?.value, primaryObs?.props?.windSpeed?.unitCode || 'wmoUnit:km_h-1');
+  const omWindMph = convertWindToMph(cur.wind_speed_10m, curUnits.wind_speed_10m || 'mp/h');
+  const windMph = Math.max(0, obsWindMph ?? omWindMph ?? 0);
+
+  const obsGustMph = convertWindToMph(primaryObs?.props?.windGust?.value, primaryObs?.props?.windGust?.unitCode || 'wmoUnit:km_h-1');
+  const omGustMph = convertWindToMph(cur.wind_gusts_10m, curUnits.wind_gusts_10m || curUnits.wind_speed_10m || 'mp/h');
+  const gustRaw = obsGustMph ?? omGustMph;
+  const gustMph = gustRaw != null ? Math.max(0, gustRaw) : null;
+
+  const windDir = toFiniteNumber(primaryObs?.props?.windDirection?.value) ?? toFiniteNumber(cur.wind_direction_10m) ?? null;
   const validRh = validStations.find((v) => v.rh != null)?.rh ?? null;
-  const humidity = validRh ?? cur.relative_humidity_2m ?? null;
-  const visMi = mToMiles(primaryObs?.props?.visibility?.value) ?? mToMiles(hourly.visibility?.[idx]) ?? 10;
+  const humidityRaw = validRh ?? toFiniteNumber(cur.relative_humidity_2m);
+  const humidity = humidityRaw != null ? Math.max(0, Math.min(100, humidityRaw)) : null;
+
+  const obsVisMi = convertVisibilityToMiles(primaryObs?.props?.visibility?.value, primaryObs?.props?.visibility?.unitCode || 'wmoUnit:m');
+  const omVisMi = convertVisibilityToMiles(hourly.visibility?.[idx], hourlyUnits.visibility || 'm');
+  const visMi = Math.max(0, obsVisMi ?? omVisMi ?? 10);
 
   const [wmoLabel, wmoIcon] = wmoInfo(cur.weather_code);
   const conditionText = primaryObs?.props?.textDescription || wmoLabel;
@@ -194,10 +344,12 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
     : 'NWS NDFD/NBM + NOAA HRRR/GFS';
 
   const confidence = spreadF <= 2.5 ? 'High' : spreadF <= 5 ? 'Moderate' : 'Variable';
+  const feelsLikeF = convertTempToF(cur.apparent_temperature, curUnits.apparent_temperature || curUnits.temperature_2m || '°F');
+  const pressureInHgVal = pressureHpa != null ? hpaToInHg(pressureHpa) : null;
 
   return {
     tempF: tempF != null ? Math.round(tempF) : null,
-    feelsLikeF: cur.apparent_temperature != null ? Math.round(cur.apparent_temperature) : (tempF != null ? Math.round(tempF) : null),
+    feelsLikeF: feelsLikeF != null ? Math.round(feelsLikeF) : (tempF != null ? Math.round(tempF) : null),
     dewpointF: dewpointF != null ? Math.round(dewpointF) : null,
     humidity: humidity != null ? Math.round(humidity) : null,
     windMph: Math.round(windMph),
@@ -205,10 +357,10 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
     windDirDeg: windDir,
     windCompass: degToCompass(windDir),
     pressureHpa: pressureHpa != null ? Number(pressureHpa.toFixed(1)) : null,
-    pressureInHg: pressureHpa != null ? (pressureHpa * 0.02953).toFixed(2) : '--',
+    pressureInHg: pressureInHgVal != null ? pressureInHgVal.toFixed(2) : '--',
     pressureTrend3h: Number(pressureTrend3h.toFixed(1)),
     visibilityMi: Number(visMi.toFixed(1)),
-    cloudCover: cur.cloud_cover ?? null,
+    cloudCover: toFiniteNumber(cur.cloud_cover),
     conditionText,
     icon: wmoIcon,
     sourceLabel,
@@ -221,38 +373,50 @@ export function resolveCurrentConditions(nwsBundle, openMeteo) {
  * True Upper-Air Convective, Supercell, HSLC & Dixie Alley Nocturnal Readiness Analyzer
  * Uses real 10m -> 850 hPa (~0-1.5km) and 10m -> 500 hPa (~0-6km) vector wind shear from NOAA HRRR/GFS.
  */
-export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {}) {
+export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, options = {}) {
+  const safeCurrent = current || {};
   const thresholdMode = options.convectiveAlertThreshold || 'STANDARD'; // SENSITIVE | STANDARD | HIGH_ONLY
   const nocturnalEnabled = options.nocturnalReadinessEnabled !== false;
+  const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
 
   const hourly = openMeteo?.hourly || {};
-  const idx = findCurrentHourIndex(hourly);
+  const hourlyUnits = openMeteo?.hourly_units || {};
+  const windUnit = hourlyUnits.wind_speed_10m || hourlyUnits.wind_speed_500hPa || 'mp/h';
+  const tempUnit = hourlyUnits.temperature_2m || '°F';
+  const upperTempUnit = hourlyUnits.temperature_700hPa || tempUnit;
+  const idx = findCurrentHourIndex(hourly, nowMs, openMeteo?.utc_offset_seconds ?? 0);
 
   const calcAt = (i) => {
-    const cape = hourly.cape?.[i] ?? 0;
-    const cin = hourly.convective_inhibition?.[i] ?? 0;
-    const tempF = hourly.temperature_2m?.[i] ?? current.tempF ?? 65;
-    const dewF = hourly.dew_point_2m?.[i] ?? current.dewpointF ?? 50;
+    const cape = Math.max(0, toFiniteNumber(hourly.cape?.[i]) ?? 0);
+    const cin = toFiniteNumber(hourly.convective_inhibition?.[i]) ?? 0;
+    const tempF = convertTempToF(hourly.temperature_2m?.[i], tempUnit) ?? toFiniteNumber(safeCurrent.tempF) ?? 65;
+    const dewF = convertTempToF(hourly.dew_point_2m?.[i], hourlyUnits.dew_point_2m || tempUnit) ?? toFiniteNumber(safeCurrent.dewpointF) ?? 50;
 
-    const w10 = mphToKt(hourly.wind_speed_10m?.[i] ?? current.windMph ?? 0);
-    const d10 = hourly.wind_direction_10m?.[i] ?? current.windDirDeg ?? 0;
-    const w850 = mphToKt(hourly.wind_speed_850hPa?.[i] ?? hourly.wind_speed_10m?.[i] ?? 0);
-    const d850 = hourly.wind_direction_850hPa?.[i] ?? d10;
-    const w500 = mphToKt(hourly.wind_speed_500hPa?.[i] ?? hourly.wind_speed_850hPa?.[i] ?? 0);
-    const d500 = hourly.wind_direction_500hPa?.[i] ?? d850;
+    const w10 = Math.max(0, convertWindToKt(hourly.wind_speed_10m?.[i], hourlyUnits.wind_speed_10m || windUnit)
+      ?? mphToKt(toFiniteNumber(safeCurrent.windMph) ?? 0)
+      ?? 0);
+    const d10 = toFiniteNumber(hourly.wind_direction_10m?.[i]) ?? toFiniteNumber(safeCurrent.windDirDeg) ?? 0;
+
+    const w850 = Math.max(0, convertWindToKt(hourly.wind_speed_850hPa?.[i], hourlyUnits.wind_speed_850hPa || windUnit) ?? w10);
+    const d850 = toFiniteNumber(hourly.wind_direction_850hPa?.[i]) ?? d10;
+
+    const w500 = Math.max(0, convertWindToKt(hourly.wind_speed_500hPa?.[i], hourlyUnits.wind_speed_500hPa || windUnit) ?? w850);
+    const d500 = toFiniteNumber(hourly.wind_direction_500hPa?.[i]) ?? d850;
 
     const [u0, v0] = windComponentsKt(w10, d10);
     const [u850, v850] = windComponentsKt(w850, d850);
     const [u500, v500] = windComponentsKt(w500, d500);
 
-    const has925 = hourly.wind_speed_925hPa?.[i] != null && hourly.wind_direction_925hPa?.[i] != null;
-    const [u925, v925] = has925
-      ? windComponentsKt(mphToKt(hourly.wind_speed_925hPa[i]), hourly.wind_direction_925hPa[i])
+    const w925Val = convertWindToKt(hourly.wind_speed_925hPa?.[i], hourlyUnits.wind_speed_925hPa || windUnit);
+    const d925Val = toFiniteNumber(hourly.wind_direction_925hPa?.[i]);
+    const [u925, v925] = (w925Val != null && d925Val != null)
+      ? windComponentsKt(Math.max(0, w925Val), d925Val)
       : [(u0 + u850) * 0.5, (v0 + v850) * 0.5];
 
-    const has700 = hourly.wind_speed_700hPa?.[i] != null && hourly.wind_direction_700hPa?.[i] != null;
-    const [u700, v700] = has700
-      ? windComponentsKt(mphToKt(hourly.wind_speed_700hPa[i]), hourly.wind_direction_700hPa[i])
+    const w700Val = convertWindToKt(hourly.wind_speed_700hPa?.[i], hourlyUnits.wind_speed_700hPa || windUnit);
+    const d700Val = toFiniteNumber(hourly.wind_direction_700hPa?.[i]);
+    const [u700, v700] = (w700Val != null && d700Val != null)
+      ? windComponentsKt(Math.max(0, w700Val), d700Val)
       : [(u850 + u500) * 0.5, (v850 + v500) * 0.5];
 
     const hodographPoints = [
@@ -265,18 +429,23 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
 
     const lowShearKt = vectorShearKt(w10, d10, w850, d850);
     const deepShearKt = vectorShearKt(w10, d10, w500, d500);
-    const veer850 = angularDiffDeg(d10, d850);
+    const rawVeer = angularDiffDeg(d10, d850);
+    const veer850 = Number.isFinite(rawVeer) ? rawVeer : 0;
 
-    // Bunkers Right-Mover Storm Motion (m/s)
+    // Bunkers Right-Mover Storm Motion (m/s) — guard zero/near-zero shear cleanly
     const meanU = ((u0 + u925 + u850 + u700 + u500) / 5) * KT_TO_MS;
     const meanV = ((v0 + v925 + v850 + v700 + v500) / 5) * KT_TO_MS;
     const shearU = (u500 - u0) * KT_TO_MS;
     const shearV = (v500 - v0) * KT_TO_MS;
-    const shearMag = Math.max(0.01, Math.hypot(shearU, shearV));
-    const cx = meanU + 7.5 * (shearV / shearMag);
-    const cy = meanV + 7.5 * (-shearU / shearMag);
+    const rawShearMag = Math.hypot(shearU, shearV);
+    const devScale = rawShearMag >= 0.1 ? 7.5 : 0;
+    const shearDenom = rawShearMag >= 0.1 ? rawShearMag : 1;
+    const cx = meanU + devScale * (shearV / shearDenom);
+    const cy = meanV + devScale * (-shearU / shearDenom);
     const bunkersSpeedKt = Math.hypot(cx, cy) / KT_TO_MS;
-    const bunkersHeadingDeg = ((Math.atan2(cx, cy) * 180) / Math.PI + 360) % 360;
+    const bunkersHeadingDeg = bunkersSpeedKt > 0.01
+      ? (((Math.atan2(cx, cy) * 180) / Math.PI) % 360 + 360) % 360
+      : 0;
 
     // 1.0 km interpolated wind vector & exact Davies-Jones SRH
     const u1km = (u925 + (u850 - u925) * (0.25 / 0.75)) * KT_TO_MS;
@@ -293,29 +462,34 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
       [u700 * KT_TO_MS, v700 * KT_TO_MS]
     ], cx, cy));
 
-    // Espy LCL height (m) & 700-500 hPa lapse rate (C/km)
-    const tempC = ((tempF - 32) * 5) / 9;
-    const dewC = ((dewF - 32) * 5) / 9;
+    // Espy LCL height (m) & 700-500 hPa lapse rate (°C/km)
+    const tempC = fToC(tempF) ?? 18.3;
+    const dewC = fToC(dewF) ?? 10.0;
     const lclMeters = Math.max(50, Math.min(5000, Math.round(125 * Math.max(0, tempC - dewC))));
 
-    const t700 = hourly.temperature_700hPa?.[i];
-    const t500 = hourly.temperature_500hPa?.[i];
-    const h700 = hourly.geopotential_height_700hPa?.[i];
-    const h500 = hourly.geopotential_height_500hPa?.[i];
+    const t700Raw = toFiniteNumber(hourly.temperature_700hPa?.[i]);
+    const t500Raw = toFiniteNumber(hourly.temperature_500hPa?.[i]);
+    const h700 = toFiniteNumber(hourly.geopotential_height_700hPa?.[i]);
+    const h500 = toFiniteNumber(hourly.geopotential_height_500hPa?.[i]);
     let lapseRate700to500 = 5.8;
-    if (t700 != null && t500 != null && h700 != null && h500 != null && (h500 - h700) > 500) {
-      const dTC = ((t700 - t500) * 5) / 9;
-      lapseRate700to500 = Math.round((dTC / ((h500 - h700) / 1000)) * 10) / 10;
+    if (t700Raw != null && t500Raw != null && h700 != null && h500 != null && (h500 - h700) > 500) {
+      const t700C = normalizeUnitCode(upperTempUnit).includes('c') ? t700Raw : fToC(t700Raw);
+      const t500C = normalizeUnitCode(upperTempUnit).includes('c') ? t500Raw : fToC(t500Raw);
+      const lr = (t700C - t500C) / ((h500 - h700) / 1000);
+      if (Number.isFinite(lr)) {
+        lapseRate700to500 = Math.round(Math.max(-5, Math.min(15, lr)) * 10) / 10;
+      }
     }
 
-    // Official SPC Fixed-Layer Significant Tornado Parameter (STP) & Supercell Composite (SCP)
+    // Official SPC Fixed-Layer Significant Tornado Parameter (STP) & Supercell Composite Parameter (SCP)
     const bulkShearMs = deepShearKt * KT_TO_MS;
     const lclTerm = lclMeters > 2000 ? 0 : lclMeters < 1000 ? 1 : (2000 - lclMeters) / 1000;
-    const shearTerm = bulkShearMs < 12.5 ? 0 : bulkShearMs > 30 ? 1.5 : bulkShearMs / 20;
+    const stpShearTerm = bulkShearMs < 12.5 ? 0 : bulkShearMs > 30 ? 1.5 : bulkShearMs / 20;
+    const scpShearTerm = bulkShearMs < 10 ? 0 : Math.min(1.0, bulkShearMs / 20);
     const cinAbs = Math.abs(cin);
     const cinTerm = cinAbs >= 200 ? 0 : cinAbs <= 50 ? 1 : (200 - cinAbs) / 150;
-    const stp = Math.round(Math.min(12, Math.max(0, (cape / 1500) * lclTerm * (srh0to1 / 150) * shearTerm * cinTerm)) * 10) / 10;
-    const scp = Math.round(Math.min(25, Math.max(0, (cape / 1000) * (srh0to3 / 50) * Math.min(1.5, bulkShearMs / 20))) * 10) / 10;
+    const stp = Math.round(Math.min(12, Math.max(0, (cape / 1500) * lclTerm * (srh0to1 / 150) * stpShearTerm * cinTerm)) * 10) / 10;
+    const scp = Math.round(Math.min(25, Math.max(0, (cape / 1000) * (srh0to3 / 50) * scpShearTerm)) * 10) / 10;
 
     return {
       cape, cin, lowShearKt, deepShearKt, veer850,
@@ -339,8 +513,11 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
   const veeringDeg = Math.round(nowSample.veer850);
   const cinNow = Math.round(nowSample.cin);
 
-  const dewF = current.dewpointF ?? 45;
-  const pTrend = current.pressureTrend3h ?? 0;
+  const dewF = toFiniteNumber(safeCurrent.dewpointF) ?? 45;
+  const pTrend = toFiniteNumber(safeCurrent.pressureTrend3h) ?? 0;
+  const activeMcdCount = Math.max(0, Math.floor(toFiniteNumber(mcdCount) ?? 0));
+
+  const hasInstability = peakCape12h >= 100 || activeMcdCount > 0;
 
   let score = 0;
   // Instability (CAPE)
@@ -348,50 +525,64 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
   else if (peakCape12h >= 750) score += 2;
   else if (peakCape12h >= 200) score += 1;
 
-  // Deep-layer supercell shear (0-6 km: 10m -> 500 hPa)
-  if (peakBulkShearKt >= 45) score += 3;
-  else if (peakBulkShearKt >= 35) score += 2;
-  else if (peakBulkShearKt >= 25) score += 1;
+  // Deep-layer supercell shear (0-6 km: 10m -> 500 hPa) — gated on instability
+  if (hasInstability) {
+    if (peakBulkShearKt >= 45) score += 3;
+    else if (peakBulkShearKt >= 35) score += 2;
+    else if (peakBulkShearKt >= 25) score += 1;
 
-  // Low-level tornado shear & veering (0-1.5 km: 10m -> 850 hPa)
-  if (peakLowLevelShearKt >= 30 && veeringDeg >= 20) score += 3;
-  else if (peakLowLevelShearKt >= 22 && veeringDeg >= 10) score += 2;
-  else if (peakLowLevelShearKt >= 16) score += 1;
+    // Low-level tornado shear & veering (0-1.5 km: 10m -> 850 hPa)
+    if (peakLowLevelShearKt >= 30 && veeringDeg >= 20) score += 3;
+    else if (peakLowLevelShearKt >= 22 && veeringDeg >= 10) score += 2;
+    else if (peakLowLevelShearKt >= 16) score += 1;
+  }
 
   // Low-level moisture (Dewpoint)
   if (dewF >= 64) score += 2;
   else if (dewF >= 58) score += 1;
 
-  // Synoptic forcing (3-hr MSLP fall)
-  if (pTrend <= -3.0) score += 2;
-  else if (pTrend <= -1.5) score += 1;
+  // Synoptic forcing (3-hr MSLP fall) — gated on instability for convective scoring
+  if (hasInstability) {
+    if (pTrend <= -3.0) score += 2;
+    else if (pTrend <= -1.5) score += 1;
+  }
 
-  if (mcdCount > 0) score += 2;
+  if (activeMcdCount > 0) score += 2;
+
+  if (Math.abs(cinNow) >= 200 && activeMcdCount === 0) {
+    score = Math.round(score * 0.6);
+  }
+
+  if (!hasInstability) {
+    score = Math.min(score, 2);
+  }
 
   // High-Shear, Low-CAPE (Dixie Alley classic) signature
-  const isHslc = peakCape12h >= 100 && peakCape12h <= 750 &&
+  const isHslc = hasInstability && peakCape12h >= 100 && peakCape12h <= 750 &&
     peakLowLevelShearKt >= 25 && peakBulkShearKt >= 35 && dewF >= 58;
 
   // Strong moisture + shear + CAPE supercell setup
-  const isSupercellSetup = peakCape12h >= 500 && peakBulkShearKt >= 35 && peakLowLevelShearKt >= 20 && dewF >= 58;
+  const isSupercellSetup = hasInstability && peakCape12h >= 500 && peakBulkShearKt >= 35 && peakLowLevelShearKt >= 20 && dewF >= 58;
 
   let regime = 'Quiet / Stable';
   let level = 'low';
 
-  if (score >= 9 || (isSupercellSetup && score >= 8)) {
-    regime = isHslc ? 'HSLC Rotating Threat' : 'Supercell Favorable';
-    level = 'high';
-  } else if (score >= 6 || isHslc) {
-    regime = isHslc ? 'HSLC Watchful (Shear-Driven)' : 'Elevated Convective';
-    level = 'mod';
-  } else if (score >= 4 && peakCape12h >= 150) {
-    regime = 'Marginal Convective';
-    level = 'mod';
+  if (hasInstability) {
+    if (score >= 9 || (isSupercellSetup && score >= 8)) {
+      regime = isHslc ? 'HSLC Rotating Threat' : 'Supercell Favorable';
+      level = 'high';
+    } else if (score >= 6 || isHslc) {
+      regime = isHslc ? 'HSLC Watchful (Shear-Driven)' : 'Elevated Convective';
+      level = 'mod';
+    } else if (score >= 4 && peakCape12h >= 150) {
+      regime = 'Marginal Convective';
+      level = 'mod';
+    }
   }
 
-  const hourLocal = new Date().getHours();
+  const hourLocal = getCentralHour24(nowMs, options.timeZone || DEFAULT_TIME_ZONE) ?? new Date(nowMs).getUTCHours();
   const isEveningOrNight = hourLocal >= 17 || hourLocal <= 6;
-  const nocturnalEscalated = nocturnalEnabled && isEveningOrNight && (level === 'high' || (level === 'mod' && (isHslc || peakLowLevelShearKt >= 25)));
+  const nocturnalEscalated = hasInstability && nocturnalEnabled && isEveningOrNight && (level === 'high' || (level === 'mod' && (isHslc || peakLowLevelShearKt >= 25)));
 
   const nocturnalRisk = nocturnalEscalated
     ? 'NOCTURNAL READINESS: Elevated overnight shear/convective setup — keep Borden Tempest open & screen awake.'
@@ -399,7 +590,9 @@ export function analyzeEnvironment(openMeteo, current, mcdCount = 0, options = {
       ? 'High convective & rotating storm potential — monitor radar closely.'
       : level === 'mod'
         ? 'Marginal/elevated shear or instability developing — stay weather aware.'
-        : 'No nocturnal severe-weather readiness escalation needed.';
+        : peakBulkShearKt >= 35
+          ? `Strong shear aloft (${bulkShear0to6KmKt} kt), but air mass is stable (CAPE ${Math.round(peakCape12h)}) — non-convective.`
+          : 'No nocturnal severe-weather readiness escalation needed.';
 
   // Respect user's convective alert threshold sensitivity
   const shouldTriggerProactive =
@@ -513,27 +706,43 @@ export function evaluateMultiDayOutlooks(userLat, userLon, intel) {
 /**
  * Full Winter / Ground Temp / Black Ice / Freezing Fog Suite
  */
-export function analyzeWinterSuite(openMeteo, current, groundFreezeThresholdF = 32) {
+export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThresholdF = 32, nowMs = Date.now()) {
+  const safeCurrent = current || {};
   const hourly = openMeteo?.hourly || {};
-  const idx = findCurrentHourIndex(hourly);
+  const hourlyUnits = openMeteo?.hourly_units || {};
+  const tempUnit = hourlyUnits.temperature_2m || '°F';
+  const soil0Unit = hourlyUnits.soil_temperature_0cm || tempUnit;
+  const soil6Unit = hourlyUnits.soil_temperature_6cm || tempUnit;
+  const snowUnit = hourlyUnits.snowfall || 'inch';
+  const idx = findCurrentHourIndex(hourly, nowMs, openMeteo?.utc_offset_seconds ?? 0);
 
-  const ground0cmF = hourly.soil_temperature_0cm?.[idx] != null ? Math.round(hourly.soil_temperature_0cm[idx]) : null;
-  const ground6cmF = hourly.soil_temperature_6cm?.[idx] != null ? Math.round(hourly.soil_temperature_6cm[idx]) : null;
-  const freezingLevelRaw = hourly.freezing_level_height?.[idx] ?? null;
-  const freezingUnit = openMeteo?.hourly_units?.freezing_level_height || 'm';
+  const g0Val = convertTempToF(hourly.soil_temperature_0cm?.[idx], soil0Unit);
+  const g6Val = convertTempToF(hourly.soil_temperature_6cm?.[idx], soil6Unit);
+  const ground0cmF = g0Val != null ? Math.round(g0Val) : null;
+  const ground6cmF = g6Val != null ? Math.round(g6Val) : null;
+
+  const freezingLevelRaw = toFiniteNumber(hourly.freezing_level_height?.[idx]);
+  const freezingUnit = normalizeUnitCode(hourlyUnits.freezing_level_height || 'm');
   const freezingLevelFt = freezingLevelRaw != null
-    ? Math.round(freezingUnit === 'm' ? freezingLevelRaw * 3.28084 : freezingLevelRaw)
+    ? Math.max(0, Math.round(freezingUnit === 'm' || freezingUnit === 'meter' ? mToFeet(freezingLevelRaw) : freezingLevelRaw))
     : null;
 
-  const next24Temps = (hourly.temperature_2m || []).slice(idx, idx + 24);
-  const hoursBelowFreezingNext24h = next24Temps.filter((t) => t != null && t <= 32).length;
-  const minTemp24h = next24Temps.length ? Math.round(Math.min(...next24Temps)) : current.tempF;
+  const next24Temps = (hourly.temperature_2m || [])
+    .slice(idx, idx + 24)
+    .map((t) => convertTempToF(t, tempUnit))
+    .filter((t) => t != null && Number.isFinite(t));
+  const hoursBelowFreezingNext24h = next24Temps.filter((t) => t <= 32).length;
+  const minTemp24h = next24Temps.length
+    ? Math.round(Math.min(...next24Temps))
+    : (toFiniteNumber(safeCurrent.tempF) ?? null);
 
-  const next24Snow = (hourly.snowfall || []).slice(idx, idx + 24).reduce((a, b) => a + (b || 0), 0);
-  const precipNow = openMeteo?.current?.precipitation ?? 0;
+  const next24Snow = (hourly.snowfall || [])
+    .slice(idx, idx + 24)
+    .reduce((a, b) => a + Math.max(0, convertSnowfallToInches(b, snowUnit)), 0);
+  const precipNow = Math.max(0, toFiniteNumber(openMeteo?.current?.precipitation) ?? 0);
   const wmo = openMeteo?.current?.weather_code ?? 0;
-  const airF = current.tempF ?? 50;
-  const visMi = current.visibilityMi ?? 10;
+  const airF = toFiniteNumber(safeCurrent.tempF) ?? 50;
+  const visMi = Math.max(0, toFiniteNumber(safeCurrent.visibilityMi) ?? 10);
 
   let hazardLevel = 'CLEAR';
   let statusLabel = 'Clear / Above Freezing';
@@ -585,9 +794,9 @@ export function analyzeWinterSuite(openMeteo, current, groundFreezeThresholdF = 
       summary: `Visibility reduced to ${visMi} mi • Air ${airF}°F.`,
       severity: 'mod'
     });
-  } else if (minTemp24h <= 28 || (isColdGround && airF <= 34)) {
+  } else if ((minTemp24h != null && minTemp24h <= 28) || (isColdGround && airF <= 34)) {
     hazardLevel = 'ADVISORY';
-    statusLabel = minTemp24h <= 28 ? `Hard Freeze (${minTemp24h}°F)` : 'Frost / Near-Freezing Surface';
+    statusLabel = (minTemp24h != null && minTemp24h <= 28) ? `Hard Freeze (${minTemp24h}°F)` : 'Frost / Near-Freezing Surface';
     roadBridgeRiskLabel = 'Watch Shaded Bridges for Patchy Frost';
   }
 
@@ -630,22 +839,24 @@ function parseMesoRank(rawMeso) {
  * - Spatially deduplicates overlapping radar detections within 8 miles into one confirmed cell.
  */
 export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadiusMi = 120, nowMs = Date.now()) {
+  if (!isValidLatLon(userLat, userLon)) return [];
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
   const features = stormCellsGeoJson?.features || [];
   const candidates = [];
 
   for (const f of features) {
-    const coords = f.geometry?.coordinates;
-    if (!coords || coords.length < 2) continue;
+    const coords = f?.geometry?.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) continue;
     const [lon, lat] = coords;
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    if (!isValidLatLon(lat, lon)) continue;
     const dist = haversineMiles(userLat, userLon, lat, lon);
-    if (dist > maxRadiusMi) continue;
+    if (!Number.isFinite(dist) || dist > maxRadiusMi) continue;
 
     const p = f.properties || {};
     if (p.valid) {
-      const validMs = new Date(p.valid).getTime();
-      if (Number.isFinite(validMs)) {
-        const ageMin = (nowMs - validMs) / 60000;
+      const validMs = parseAlertTimestampMs(p.valid);
+      if (validMs != null) {
+        const ageMin = (refMs - validMs) / 60000;
         if (ageMin > 25) continue;
       }
     }
@@ -653,7 +864,7 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
     const nexrad = String(p.nexrad || 'NEXRAD').trim().toUpperCase();
     const isTdwr = TDWR_SITES.has(nexrad);
     const radarRangeKm = parseFloat(p.range || '0') || 0;
-    const radarRangeMi = radarRangeKm > 0 ? Number((radarRangeKm * 0.621371).toFixed(0)) : null;
+    const radarRangeMi = radarRangeKm > 0 ? Number(kmhToMph(radarRangeKm).toFixed(0)) : null;
 
     const rawTvs = String(p.tvs || '').trim().toUpperCase();
     const rawMeso = String(p.meso || '').trim().toUpperCase();
@@ -720,7 +931,7 @@ export function analyzeStormCells(stormCellsGeoJson, userLat, userLon, maxRadius
 
     // 2. Verified Storm Motion (IEM drct = meteorological FROM -> moveTo = (drct + 180) % 360)
     const speedKtRaw = parseFloat(p.sknt || '0') || 0;
-    const speedMphRaw = Math.round(speedKtRaw * 1.15078);
+    const speedMphRaw = Math.round(ktToMph(speedKtRaw) ?? 0);
     const drctFromRaw = p.drct != null && p.drct !== '' ? parseFloat(p.drct) : null;
     const motionUnreliable =
       speedKtRaw <= 0 ||
@@ -844,7 +1055,7 @@ function parseNwsEventMotion(rawMotion) {
   const speedKt = parseInt(m[2], 10);
   if (Number.isNaN(fromDeg) || Number.isNaN(speedKt)) return null;
   const moveToBearing = (fromDeg + 180) % 360;
-  const speedMph = Math.round(speedKt * 1.15078);
+  const speedMph = Math.round(ktToMph(speedKt) ?? 0);
   const moveToCompass = degToCompass(moveToBearing);
   const moveFromCompass = degToCompass(fromDeg);
   return {
@@ -859,11 +1070,150 @@ function parseNwsEventMotion(rawMotion) {
   };
 }
 
+function parseAlertTimestampMs(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (raw instanceof Date) {
+    const ms = raw.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const s = String(raw).trim();
+  if (!s) return null;
+  // Naive ISO timestamps without timezone suffix are treated strictly as UTC to prevent local-TZ drift
+  const normalized = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)
+    ? `${s.replace(' ', 'T')}Z`
+    : s;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function canonicalAlertId(rawId) {
+  if (rawId === null || rawId === undefined) return '';
+  let s = String(rawId).trim();
+  if (!s) return '';
+  const alertsPathIdx = s.toLowerCase().lastIndexOf('/alerts/');
+  if (alertsPathIdx >= 0) {
+    s = s.slice(alertsPathIdx + '/alerts/'.length);
+  }
+  return s.trim().toLowerCase();
+}
+
+function extractAlertIdVariants(featureOrAlert) {
+  const variants = new Set();
+  if (!featureOrAlert || typeof featureOrAlert !== 'object') return variants;
+  const p = featureOrAlert.properties || featureOrAlert;
+  const candidates = [
+    featureOrAlert.id,
+    featureOrAlert.canonicalId,
+    featureOrAlert.identifier,
+    featureOrAlert.atId,
+    p['@id'],
+    p.id,
+    p.identifier
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    const raw = String(c).trim().toLowerCase();
+    if (raw) variants.add(raw);
+    const canon = canonicalAlertId(c);
+    if (canon) variants.add(canon);
+  }
+  return variants;
+}
+
+function extractReferencedIds(featureOrAlert) {
+  const refs = new Set();
+  if (!featureOrAlert || typeof featureOrAlert !== 'object') return [];
+  const p = featureOrAlert.properties || featureOrAlert;
+  const rawRefs = p.references ?? featureOrAlert.references;
+
+  const addToken = (tok) => {
+    if (!tok) return;
+    const s = String(tok).trim();
+    if (!s) return;
+    // CAP space-delimited reference format: "sender,identifier,sent"
+    if (s.includes(',')) {
+      const parts = s.split(',');
+      if (parts[1]) {
+        const c = canonicalAlertId(parts[1]);
+        if (c) refs.add(c);
+      }
+      return;
+    }
+    const rawLow = s.toLowerCase();
+    refs.add(rawLow);
+    const canon = canonicalAlertId(s);
+    if (canon) refs.add(canon);
+  };
+
+  if (Array.isArray(rawRefs)) {
+    for (const r of rawRefs) {
+      if (!r) continue;
+      if (typeof r === 'string') {
+        for (const piece of r.trim().split(/\s+/)) addToken(piece);
+      } else if (typeof r === 'object') {
+        addToken(r.identifier);
+        addToken(r['@id']);
+        addToken(r.id);
+      }
+    }
+  } else if (typeof rawRefs === 'string') {
+    for (const piece of rawRefs.trim().split(/\s+/)) addToken(piece);
+  }
+
+  return Array.from(refs);
+}
+
+/**
+ * Determines whether an NWS GeoJSON alert feature or classified alert is expired, cancelled,
+ * or explicitly superseded via `replacedBy` at `nowMs`.
+ */
+export function isAlertExpired(featureOrAlert, nowMs = Date.now()) {
+  if (!featureOrAlert || typeof featureOrAlert !== 'object') return true;
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const p = featureOrAlert.properties || featureOrAlert;
+
+  const status = String(p.status ?? featureOrAlert.status ?? '').trim().toLowerCase();
+  if (status === 'cancel' || status === 'cancelled' || status === 'canceled' || status === 'expired') {
+    return true;
+  }
+
+  const messageType = String(p.messageType ?? featureOrAlert.messageType ?? '').trim().toLowerCase();
+  if (messageType === 'cancel') {
+    return true;
+  }
+
+  const replacedBy = p.replacedBy ?? featureOrAlert.replacedBy;
+  if (typeof replacedBy === 'string' && replacedBy.trim().length > 0) {
+    const replacedAtMs = parseAlertTimestampMs(p.replacedAt ?? featureOrAlert.replacedAt);
+    if (replacedAtMs == null || replacedAtMs <= refMs) {
+      return true;
+    }
+  }
+
+  const expiresMs = Number.isFinite(featureOrAlert.expiresMs)
+    ? featureOrAlert.expiresMs
+    : parseAlertTimestampMs(p.expires ?? featureOrAlert.expires);
+  if (expiresMs != null && expiresMs <= refMs) {
+    return true;
+  }
+
+  const endsMs = Number.isFinite(featureOrAlert.endsMs)
+    ? featureOrAlert.endsMs
+    : parseAlertTimestampMs(p.ends ?? featureOrAlert.ends);
+  if (endsMs != null && endsMs <= refMs) {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * Classify NWS Alert into Borden Tempest Severe Tiers with Point-in-Polygon & PDS/Observed Detection
  */
-export function classifyNwsAlert(feature, userLat = null, userLon = null) {
-  const p = feature.properties || {};
+export function classifyNwsAlert(feature, userLat = null, userLon = null, nowMs = Date.now()) {
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const p = feature?.properties || {};
   const ev = (p.event || '').toLowerCase();
   const params = p.parameters || {};
   const tornadoDetection = params.tornadoDetection?.[0] || null;
@@ -889,10 +1239,18 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
   const isFlashFloodEmergency = (flashFloodDamageThreat || '').toUpperCase() === 'CATASTROPHIC' ||
     (p.headline || '').toLowerCase().includes('flash flood emergency');
 
+  const sentMs = parseAlertTimestampMs(p.sent);
+  const effectiveMs = parseAlertTimestampMs(p.effective || p.onset);
+  const expiresMs = parseAlertTimestampMs(p.expires);
+  const endsMs = parseAlertTimestampMs(p.ends);
   const expiresIso = p.expires || p.ends || null;
-  const isExpired = expiresIso ? new Date(expiresIso).getTime() < Date.now() : false;
+  const references = extractReferencedIds(feature);
+  const rawId = feature?.id || p.id || p['@id'] || `${p.event || 'Alert'}_${p.sent || ''}`;
+  const canonicalId = canonicalAlertId(rawId) || String(rawId).toLowerCase();
 
-  const insidePolygon = (userLat != null && userLon != null && feature.geometry)
+  const isExpired = isAlertExpired(feature, refMs);
+
+  const insidePolygon = (userLat != null && userLon != null && feature?.geometry)
     ? isPointInGeometry(userLat, userLon, feature.geometry)
     : null;
 
@@ -928,7 +1286,15 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
   ].join('|');
 
   return {
-    id: feature.id || p.id || `${p.event}_${p.sent}`,
+    id: rawId,
+    canonicalId,
+    identifier: p.id || feature?.id || p['@id'] || null,
+    atId: p['@id'] || feature?.id || null,
+    status: p.status || 'Actual',
+    messageType: p.messageType || 'Alert',
+    references,
+    replacedBy: p.replacedBy || null,
+    replacedAt: p.replacedAt || null,
     escalationFingerprint,
     event: p.event || 'Weather Alert',
     headline: p.headline || p.event || '',
@@ -937,7 +1303,13 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
     areaDesc: p.areaDesc || '',
     senderName: p.senderName || 'NWS',
     sent: p.sent || null,
+    effective: p.effective || null,
     expires: expiresIso,
+    ends: p.ends || null,
+    sentMs,
+    effectiveMs,
+    expiresMs,
+    endsMs,
     isExpired,
     insidePolygon,
     severity: p.severity || 'Unknown',
@@ -955,6 +1327,89 @@ export function classifyNwsAlert(feature, userLat = null, userLon = null) {
     tier,
     color,
     rank,
-    geometry: feature.geometry || null
+    geometry: feature?.geometry || null
   };
+}
+
+/**
+ * Classifies (if raw GeoJSON), purges expired/cancelled/superseded NWS alerts,
+ * deduplicates by canonical ID, and sorts by severity rank & polygon containment.
+ */
+export function filterAndDeduplicateAlerts(features, userLat = null, userLon = null, nowMs = Date.now()) {
+  if (!Array.isArray(features) || features.length === 0) return [];
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+
+  // Pass 1: collect all superseded IDs across ALL alerts (including Cancel & Update messages)
+  const supersededIds = new Set();
+  for (const item of features) {
+    if (!item || typeof item !== 'object') continue;
+    const selfVariants = extractAlertIdVariants(item);
+    const refs = extractReferencedIds(item);
+    for (const refId of refs) {
+      if (refId && !selfVariants.has(refId)) {
+        supersededIds.add(refId);
+      }
+    }
+    const p = item.properties || item;
+    if (typeof p.replacedBy === 'string' && p.replacedBy.trim().length > 0) {
+      const replacedAtMs = parseAlertTimestampMs(p.replacedAt ?? item.replacedAt);
+      if (replacedAtMs == null || replacedAtMs <= refMs) {
+        for (const v of selfVariants) supersededIds.add(v);
+      }
+    }
+  }
+
+  // Pass 2: classify/refresh, drop expired/cancelled/superseded, and deduplicate by canonical ID
+  const byCanon = new Map();
+  for (const item of features) {
+    if (!item || typeof item !== 'object') continue;
+    const isRawFeature = Boolean(item.properties) || item.tier === undefined;
+    const alert = isRawFeature
+      ? classifyNwsAlert(item, userLat, userLon, refMs)
+      : {
+        ...item,
+        canonicalId: item.canonicalId || canonicalAlertId(item.id || item.identifier || item.atId),
+        isExpired: isAlertExpired(item, refMs),
+        insidePolygon: (userLat != null && userLon != null && item.geometry)
+          ? isPointInGeometry(userLat, userLon, item.geometry)
+          : item.insidePolygon ?? null
+      };
+
+    if (alert.isExpired) continue;
+
+    const idVariants = extractAlertIdVariants(alert);
+    let isSuperseded = false;
+    for (const v of idVariants) {
+      if (supersededIds.has(v)) {
+        isSuperseded = true;
+        break;
+      }
+    }
+    if (isSuperseded) continue;
+
+    const dedupKey = alert.canonicalId || canonicalAlertId(alert.id) || `${alert.event}_${alert.sentMs ?? ''}`;
+    const existing = byCanon.get(dedupKey);
+    if (!existing) {
+      byCanon.set(dedupKey, alert);
+    } else {
+      const existingSent = existing.sentMs ?? -Infinity;
+      const candSent = alert.sentMs ?? -Infinity;
+      const preferCand =
+        candSent > existingSent ||
+        (candSent === existingSent && alert.rank > existing.rank) ||
+        (candSent === existingSent && alert.rank === existing.rank && !existing.geometry && Boolean(alert.geometry)) ||
+        (candSent === existingSent && alert.rank === existing.rank && existing.insidePolygon !== true && alert.insidePolygon === true);
+      if (preferCand) {
+        byCanon.set(dedupKey, alert);
+      }
+    }
+  }
+
+  return Array.from(byCanon.values()).sort((a, b) => {
+    if (b.rank !== a.rank) return b.rank - a.rank;
+    const aIn = a.insidePolygon === true ? 1 : 0;
+    const bIn = b.insidePolygon === true ? 1 : 0;
+    if (bIn !== aIn) return bIn - aIn;
+    return (b.sentMs ?? 0) - (a.sentMs ?? 0);
+  });
 }
