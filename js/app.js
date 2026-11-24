@@ -120,8 +120,11 @@ const radarMap = new RadarMapController('radar-map-container', {
     const feedEl = document.getElementById('radar-feed-tag');
     const scrub = document.getElementById('radar-scrubber');
     if (scrub) {
-      scrub.max = Math.max(0, total - 1);
+      const maxVal = Math.max(0, total - 1);
+      scrub.max = maxVal;
       scrub.value = idx;
+      const pct = maxVal > 0 ? Math.round((idx / maxVal) * 100) : 100;
+      scrub.style.setProperty('--scrubber-pct', `${pct}%`);
     }
     if (timeEl) timeEl.textContent = fr ? fr.label : 'No radar frames';
     if (feedEl) feedEl.textContent = fr ? fr.feedLabel : 'IEM';
@@ -614,7 +617,10 @@ function wireEvents() {
     radarMap.stopPlayback();
     const playBtn = document.getElementById('btn-radar-play');
     if (playBtn) playBtn.textContent = '▶';
-    radarMap.scrubTo(Number(e.target.value));
+    const maxVal = Math.max(1, Number(e.target.max) || 1);
+    const curVal = Number(e.target.value) || 0;
+    e.target.style.setProperty('--scrubber-pct', `${Math.round((curVal / maxVal) * 100)}%`);
+    radarMap.scrubTo(curVal);
   });
   document.getElementById('btn-radar-recenter')?.addEventListener('click', () => {
     radarMap.flyTo(state.activeLocation.lat, state.activeLocation.lon, 8.2, true);
@@ -658,10 +664,13 @@ function wireEvents() {
 
   const opSlider = document.getElementById('radar-opacity-slider');
   if (opSlider) {
-    opSlider.value = Math.round(state.settings.radarOpacity * 100);
+    const initPct = Math.round(state.settings.radarOpacity * 100);
+    opSlider.value = initPct;
+    opSlider.style.setProperty('--range-pct', `${Math.round(((initPct - 25) / 75) * 100)}%`);
     document.getElementById('radar-opacity-val').textContent = `${opSlider.value}%`;
     opSlider.addEventListener('input', (e) => {
       const pct = Number(e.target.value);
+      opSlider.style.setProperty('--range-pct', `${Math.round(((pct - 25) / 75) * 100)}%`);
       document.getElementById('radar-opacity-val').textContent = `${pct}%`;
       state.settings.radarOpacity = pct / 100;
       saveSettings();
@@ -1521,14 +1530,14 @@ function formatCoordPair(lat, lon) {
 
 function renderDbzSpectrumBar(maxDbz, maxDbzHeightKft = null) {
   const dbz = Number(maxDbz) || 0;
-  const pct = Math.max(4, Math.min(100, Math.round(((dbz - 15) / 60) * 100)));
+  const pct = Math.max(4, Math.min(100, Math.round(((dbz - 20) / 50) * 100)));
   const tierLabel = dbz >= 65
     ? 'Extreme Hail / Debris Core'
     : dbz >= 58
       ? 'Severe Convective Core'
       : dbz >= 50
         ? 'Heavy Storm Core'
-        : dbz >= 38
+        : dbz >= 35
           ? 'Moderate Precipitation'
           : 'Light Echo';
   return `
@@ -1542,7 +1551,7 @@ function renderDbzSpectrumBar(maxDbz, maxDbzHeightKft = null) {
         <div class="dbz-bar-marker" style="left:${pct}%;"></div>
       </div>
       <div class="inspect-gauge-foot">
-        <span>20</span><span>35</span><span>50</span><span>60</span><span>75+ dBZ</span>
+        <span>20</span><span>35</span><span>50</span><span>65+ dBZ</span>
       </div>
       <div class="inspect-gauge-caption">${tierLabel}</div>
     </div>
@@ -1643,7 +1652,7 @@ function openInspectSheet(type, item, ctx = null) {
       ${switcherHtml}
       <div class="tag-row" style="margin-top:0;">
         <span class="badge-${item.tvs ? 'red' : item.meso ? 'magenta' : item.threatScore >= 2 ? 'amber' : 'muted'}">${escapeHtml(item.threatLevel.replace('_', ' '))}</span>
-        ${item.tvs ? `<span class="badge-red">TVS: ${escapeHtml(item.tvs)}</span>` : ''}
+        ${item.tvs && String(item.tvs).toUpperCase() !== 'TVS' ? `<span class="badge-red">TVS: ${escapeHtml(item.tvs)}</span>` : ''}
         ${item.meso ? `<span class="badge-magenta">MESO RANK ${escapeHtml(item.meso)}</span>` : ''}
         ${item.maxHailIn > 0 ? `<span class="badge-amber">Hail ${item.maxHailIn}"</span>` : ''}
         ${item.confirmingRadars?.length > 1 ? `<span class="badge-cyan">${item.confirmingRadars.length}x Confirmed</span>` : ''}
@@ -2099,7 +2108,7 @@ function skyAtmosphereClass(condText, isNight) {
   return isNight ? 'cond-night' : 'cond-clear';
 }
 
-function renderWeatherGraphicSvg(conditionText, isNight = false, size = 76) {
+function renderWeatherGraphicSvg(conditionText, isNight = false, size = 86) {
   const s = String(conditionText || '').toLowerCase();
   const uid = `wg${++_svgUid}`;
   const isStorm = s.includes('thunder') || s.includes('t-storm') || s.includes('storm');
@@ -2109,127 +2118,192 @@ function renderWeatherGraphicSvg(conditionText, isNight = false, size = 76) {
   const isPartly = s.includes('partly') || s.includes('mostly clear') || s.includes('few') || s.includes('scattered') || s.includes('mostly sunny');
   const isOvercast = s.includes('overcast') || s.includes('cloudy');
 
-  const sunOrb = `
+  const defs = `
     <defs>
-      <radialGradient id="${uid}_sun" cx="42%" cy="38%" r="58%">
-        <stop offset="0%" stop-color="#fef08a"/>
-        <stop offset="55%" stop-color="#facc15"/>
-        <stop offset="100%" stop-color="#f97316"/>
+      <radialGradient id="${uid}_sunHalo" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#fde68a" stop-opacity="0.46"/>
+        <stop offset="52%" stop-color="#f59e0b" stop-opacity="0.16"/>
+        <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
       </radialGradient>
+      <radialGradient id="${uid}_sunCore" cx="34%" cy="30%" r="68%">
+        <stop offset="0%" stop-color="#fefce8"/>
+        <stop offset="35%" stop-color="#fde047"/>
+        <stop offset="76%" stop-color="#f59e0b"/>
+        <stop offset="100%" stop-color="#ea580c"/>
+      </radialGradient>
+      <radialGradient id="${uid}_moonHalo" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.34"/>
+        <stop offset="56%" stop-color="#6366f1" stop-opacity="0.12"/>
+        <stop offset="100%" stop-color="#6366f1" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="${uid}_moonCore" x1="18%" y1="12%" x2="84%" y2="88%">
+        <stop offset="0%" stop-color="#ffffff"/>
+        <stop offset="52%" stop-color="#dbeafe"/>
+        <stop offset="100%" stop-color="#93c5fd"/>
+      </linearGradient>
+      <linearGradient id="${uid}_cloudLight" x1="25%" y1="0%" x2="65%" y2="100%">
+        <stop offset="0%" stop-color="#ffffff" stop-opacity="0.96"/>
+        <stop offset="55%" stop-color="#dbe4f0" stop-opacity="0.92"/>
+        <stop offset="100%" stop-color="#94a3b8" stop-opacity="0.88"/>
+      </linearGradient>
+      <linearGradient id="${uid}_cloudMid" x1="20%" y1="0%" x2="70%" y2="100%">
+        <stop offset="0%" stop-color="#cbd5e1" stop-opacity="0.86"/>
+        <stop offset="60%" stop-color="#8da2bc" stop-opacity="0.84"/>
+        <stop offset="100%" stop-color="#475569" stop-opacity="0.86"/>
+      </linearGradient>
+      <linearGradient id="${uid}_cloudStorm" x1="22%" y1="0%" x2="74%" y2="100%">
+        <stop offset="0%" stop-color="#94a3b8" stop-opacity="0.92"/>
+        <stop offset="52%" stop-color="#475569" stop-opacity="0.94"/>
+        <stop offset="100%" stop-color="#1e293b" stop-opacity="0.96"/>
+      </linearGradient>
+      <linearGradient id="${uid}_rain" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.2"/>
+        <stop offset="55%" stop-color="#38bdf8" stop-opacity="0.95"/>
+        <stop offset="100%" stop-color="#e0f2fe" stop-opacity="1"/>
+      </linearGradient>
+      <linearGradient id="${uid}_bolt" x1="30%" y1="0%" x2="65%" y2="100%">
+        <stop offset="0%" stop-color="#fef9c3"/>
+        <stop offset="48%" stop-color="#facc15"/>
+        <stop offset="100%" stop-color="#f59e0b"/>
+      </linearGradient>
+      <radialGradient id="${uid}_stormGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#fde047" stop-opacity="0.32"/>
+        <stop offset="55%" stop-color="#a855f7" stop-opacity="0.14"/>
+        <stop offset="100%" stop-color="#a855f7" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="${uid}_mist" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#cbd5e1" stop-opacity="0"/>
+        <stop offset="22%" stop-color="#cbd5e1" stop-opacity="0.72"/>
+        <stop offset="78%" stop-color="#94a3b8" stop-opacity="0.68"/>
+        <stop offset="100%" stop-color="#94a3b8" stop-opacity="0"/>
+      </linearGradient>
     </defs>
-    <circle cx="32" cy="32" r="22" fill="#facc15" opacity="0.18"/>
-    <circle cx="32" cy="32" r="14.5" fill="url(#${uid}_sun)"/>
   `;
 
-  const moonOrb = `
-    <circle cx="33" cy="30" r="19" fill="#818cf8" opacity="0.16"/>
-    <path d="M36 16a14 14 0 1 0 13 18.5A11.5 11.5 0 0 1 36 16Z" fill="#e2e8f0" stroke="#93c5fd" stroke-width="1"/>
-    <circle cx="46" cy="20" r="1.4" fill="#fde68a"/>
-    <circle cx="20" cy="22" r="1.1" fill="#bae6fd"/>
+  const sunOrb = (cx = 32, cy = 32, r = 13.5, haloR = 29) => `
+    <circle cx="${cx}" cy="${cy}" r="${haloR}" fill="url(#${uid}_sunHalo)"/>
+    <circle cx="${cx}" cy="${cy}" r="${(r * 1.32).toFixed(1)}" fill="#fbbf24" opacity="0.14"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="url(#${uid}_sunCore)"/>
+    <ellipse cx="${(cx - r * 0.28).toFixed(1)}" cy="${(cy - r * 0.3).toFixed(1)}" rx="${(r * 0.42).toFixed(1)}" ry="${(r * 0.26).toFixed(1)}" transform="rotate(-28 ${cx} ${cy})" fill="#ffffff" opacity="0.34"/>
   `;
 
-  const cloudShape = (fill = '#cbd5e1', yOff = 0) => `
-    <path d="M22 ${44 + yOff}h23a9 9 0 0 0 1.4-17.9A12.5 12.5 0 0 0 22.8 29a8.2 8.2 0 0 0-.8 15Z" fill="${fill}" opacity="0.96"/>
+  const moonOrb = (tx = 0, ty = 0, sc = 1) => `
+    <g transform="translate(${tx},${ty}) scale(${sc})">
+      <circle cx="32" cy="31" r="25" fill="url(#${uid}_moonHalo)"/>
+      <path d="M37.4 15.5a15.2 15.2 0 1 0 12.8 20.6A12.2 12.2 0 0 1 37.4 15.5Z" fill="url(#${uid}_moonCore)" stroke="rgba(255,255,255,0.45)" stroke-width="0.6"/>
+      <path d="M47 17.2l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z" fill="#fef3c7" opacity="0.92"/>
+      <circle cx="17.5" cy="21" r="1.15" fill="#bae6fd" opacity="0.75"/>
+      <circle cx="49.5" cy="29.5" r="0.9" fill="#e0f2fe" opacity="0.65"/>
+    </g>
+  `;
+
+  const cloudLayer = (fillUrl, tx = 0, ty = 0, sc = 1, opacity = 1, rim = true) => `
+    <g transform="translate(${tx},${ty}) scale(${sc})" opacity="${opacity}">
+      <path d="M18.5 44h26.5a9.4 9.4 0 0 0 1.4-18.7A13.4 13.4 0 0 0 21.5 28a8.6 8.6 0 0 0-3 16Z"
+        fill="url(#${fillUrl})"
+        ${rim ? 'stroke="rgba(255,255,255,0.42)" stroke-width="0.65"' : ''}/>
+      ${rim ? '<path d="M22.8 28.4A12.6 12.6 0 0 1 44.5 25.8" fill="none" stroke="rgba(255,255,255,0.58)" stroke-width="0.85" stroke-linecap="round"/>' : ''}
+    </g>
   `;
 
   let body = '';
   if (isStorm) {
     body = `
-      ${cloudShape('#64748b', -4)}
-      ${cloudShape('#94a3b8', 0)}
-      <polygon points="34,40 27,51 33,51 29,60 40,48 34,48" fill="#facc15" stroke="#fef08a" stroke-width="0.6" stroke-linejoin="round"/>
-      <line x1="21" y1="47" x2="18" y2="55" stroke="#38bdf8" stroke-width="2.4" stroke-linecap="round"/>
-      <line x1="45" y1="47" x2="42" y2="55" stroke="#38bdf8" stroke-width="2.4" stroke-linecap="round"/>
+      <ellipse cx="32" cy="45" rx="18" ry="9" fill="url(#${uid}_stormGlow)"/>
+      ${cloudLayer(`${uid}_cloudMid`, 6, -7, 0.78, 0.72, false)}
+      ${cloudLayer(`${uid}_cloudStorm`, -1, -3, 1.0, 0.98, true)}
+      <line x1="19.5" y1="44.5" x2="16.8" y2="52.5" stroke="url(#${uid}_rain)" stroke-width="1.65" stroke-linecap="round"/>
+      <line x1="44.5" y1="44.5" x2="41.8" y2="52.5" stroke="url(#${uid}_rain)" stroke-width="1.65" stroke-linecap="round"/>
+      <polygon points="34.2,37.5 27.6,48.6 32.8,48.6 29.6,58.5 39.8,46.0 34.4,46.0" fill="url(#${uid}_bolt)" stroke="rgba(254,249,195,0.75)" stroke-width="0.45" stroke-linejoin="round"/>
     `;
   } else if (isSnow) {
     body = `
-      ${cloudShape('#cbd5e1', -4)}
-      <circle cx="24" cy="50" r="2.2" fill="#e0f2fe"/>
-      <circle cx="33" cy="53" r="2.4" fill="#bae6fd"/>
-      <circle cx="42" cy="50" r="2.2" fill="#e0f2fe"/>
-      <circle cx="29" cy="46" r="1.8" fill="#ffffff"/>
-      <circle cx="38" cy="46" r="1.8" fill="#ffffff"/>
+      ${cloudLayer(`${uid}_cloudMid`, 6, -7, 0.76, 0.65, false)}
+      ${cloudLayer(`${uid}_cloudLight`, -1, -4, 0.98, 0.95, true)}
+      <g fill="#e0f2fe">
+        <circle cx="22.5" cy="48.5" r="1.8" opacity="0.95"/>
+        <circle cx="32.5" cy="52.5" r="2.1" opacity="0.98"/>
+        <circle cx="42.5" cy="48.5" r="1.7" opacity="0.9"/>
+        <circle cx="27.5" cy="44.5" r="1.25" fill="#ffffff" opacity="0.78"/>
+        <circle cx="37.8" cy="44.8" r="1.35" fill="#bae6fd" opacity="0.82"/>
+        <circle cx="26.2" cy="55.5" r="1.2" fill="#bae6fd" opacity="0.65"/>
+        <circle cx="38.5" cy="55.2" r="1.1" fill="#ffffff" opacity="0.6"/>
+      </g>
     `;
   } else if (isRain) {
     body = `
-      ${cloudShape('#94a3b8', -4)}
-      <line x1="23" y1="44" x2="19.5" y2="54" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="33" y1="45" x2="29.5" y2="56" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="43" y1="44" x2="39.5" y2="54" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+      ${cloudLayer(`${uid}_cloudMid`, 6, -7, 0.78, 0.68, false)}
+      ${cloudLayer(`${uid}_cloudLight`, -1, -4, 0.98, 0.92, true)}
+      <line x1="21.5" y1="43.5" x2="18.2" y2="53.5" stroke="url(#${uid}_rain)" stroke-width="1.75" stroke-linecap="round"/>
+      <line x1="30.5" y1="44.5" x2="27.0" y2="55.8" stroke="url(#${uid}_rain)" stroke-width="1.85" stroke-linecap="round"/>
+      <line x1="39.5" y1="43.5" x2="36.2" y2="53.5" stroke="url(#${uid}_rain)" stroke-width="1.75" stroke-linecap="round"/>
+      <line x1="46.5" y1="44.0" x2="44.0" y2="51.2" stroke="url(#${uid}_rain)" stroke-width="1.45" stroke-linecap="round" opacity="0.72"/>
     `;
   } else if (isFog) {
     body = `
-      ${cloudShape('#94a3b8', -6)}
-      <line x1="16" y1="44" x2="48" y2="44" stroke="#94a3b8" stroke-width="2.6" stroke-linecap="round"/>
-      <line x1="20" y1="50" x2="44" y2="50" stroke="#64748b" stroke-width="2.6" stroke-linecap="round"/>
+      ${cloudLayer(`${uid}_cloudMid`, 0, -6, 0.94, 0.86, true)}
+      <line x1="12" y1="43.5" x2="52" y2="43.5" stroke="url(#${uid}_mist)" stroke-width="2.2" stroke-linecap="round"/>
+      <line x1="16" y1="49" x2="48" y2="49" stroke="url(#${uid}_mist)" stroke-width="2.0" stroke-linecap="round" opacity="0.82"/>
+      <line x1="20" y1="54" x2="44" y2="54" stroke="url(#${uid}_mist)" stroke-width="1.8" stroke-linecap="round" opacity="0.58"/>
     `;
   } else if (isPartly) {
     body = isNight
-      ? `<g transform="translate(8,-4) scale(0.78)">${moonOrb}</g>${cloudShape('#e2e8f0', 2)}`
-      : `<g transform="translate(9,-4) scale(0.76)">${sunOrb}</g>${cloudShape('#e2e8f0', 2)}`;
+      ? `${moonOrb(9, -6, 0.76)}${cloudLayer(`${uid}_cloudLight`, -3, 4, 0.94, 0.94, true)}`
+      : `${sunOrb(40, 22, 10.5, 22)}${cloudLayer(`${uid}_cloudLight`, -3, 4, 0.95, 0.96, true)}`;
   } else if (isOvercast) {
-    body = `${cloudShape('#94a3b8', -5)}${cloudShape('#cbd5e1', 2)}`;
+    body = `
+      ${cloudLayer(`${uid}_cloudMid`, 7, -6, 0.82, 0.76, false)}
+      ${cloudLayer(`${uid}_cloudLight`, -2, 2, 0.98, 0.95, true)}
+    `;
   } else {
     body = isNight
-      ? moonOrb
-      : `${sunOrb}
-         <g stroke="#fde047" stroke-width="2.4" stroke-linecap="round" opacity="0.85">
-           <line x1="32" y1="9" x2="32" y2="13"/>
-           <line x1="32" y1="51" x2="32" y2="55"/>
-           <line x1="9" y1="32" x2="13" y2="32"/>
-           <line x1="51" y1="32" x2="55" y2="32"/>
-           <line x1="16" y1="16" x2="19" y2="19"/>
-           <line x1="45" y1="45" x2="48" y2="48"/>
-           <line x1="48" y1="16" x2="45" y2="19"/>
-           <line x1="19" y1="45" x2="16" y2="48"/>
-         </g>`;
+      ? moonOrb(0, 0, 1)
+      : sunOrb(32, 32, 14, 29);
   }
 
-  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" aria-hidden="true">${body}</svg>`;
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" aria-hidden="true">${defs}${body}</svg>`;
 }
 
-function renderWindCompassSvg(windDirDeg, size = 26) {
+function renderWindCompassSvg(windDirDeg, size = 24) {
   const deg = windDirDeg != null && !Number.isNaN(Number(windDirDeg)) ? Number(windDirDeg) : 0;
   return `
-    <svg viewBox="0 0 44 44" width="${size}" height="${size}" aria-hidden="true" style="flex-shrink:0;">
-      <circle cx="22" cy="22" r="19.5" fill="rgba(5,11,22,0.82)" stroke="rgba(56,189,248,0.34)" stroke-width="1.4"/>
-      <circle cx="22" cy="22" r="15" fill="none" stroke="rgba(148,163,184,0.16)" stroke-width="0.9" stroke-dasharray="2 3"/>
-      <line x1="22" y1="3" x2="22" y2="6" stroke="#38bdf8" stroke-width="1.3"/>
-      <line x1="22" y1="38" x2="22" y2="41" stroke="rgba(148,163,184,0.45)" stroke-width="1.1"/>
-      <line x1="3" y1="22" x2="6" y2="22" stroke="rgba(148,163,184,0.45)" stroke-width="1.1"/>
-      <line x1="38" y1="22" x2="41" y2="22" stroke="rgba(148,163,184,0.45)" stroke-width="1.1"/>
-      <text x="22" y="11.5" text-anchor="middle" fill="#cbd5e1" font-size="6.5" font-weight="800">N</text>
-      <g transform="rotate(${deg} 22 22)">
-        <polygon points="22,8.5 26.5,22 22,19 17.5,22" fill="#00e0ff"/>
-        <polygon points="22,35.5 24.4,22 22,24 19.6,22" fill="#475569"/>
+    <svg viewBox="0 0 40 40" width="${size}" height="${size}" aria-hidden="true" style="flex-shrink:0;">
+      <circle cx="20" cy="20" r="17.5" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.16)" stroke-width="1.1"/>
+      <line x1="20" y1="3" x2="20" y2="6.2" stroke="#7dd3fc" stroke-width="1.3" stroke-linecap="round"/>
+      <line x1="20" y1="33.8" x2="20" y2="37" stroke="rgba(255,255,255,0.2)" stroke-width="1" stroke-linecap="round"/>
+      <line x1="3" y1="20" x2="6.2" y2="20" stroke="rgba(255,255,255,0.2)" stroke-width="1" stroke-linecap="round"/>
+      <line x1="33.8" y1="20" x2="37" y2="20" stroke="rgba(255,255,255,0.2)" stroke-width="1" stroke-linecap="round"/>
+      <g transform="rotate(${deg} 20 20)">
+        <polygon points="20,8 23.8,20.4 20,17.8 16.2,20.4" fill="#38bdf8"/>
+        <polygon points="20,31.5 22.1,20.4 20,22.2 17.9,20.4" fill="rgba(148,163,184,0.38)"/>
       </g>
-      <circle cx="22" cy="22" r="2.4" fill="#f8fafc" stroke="#040811" stroke-width="0.8"/>
+      <circle cx="20" cy="20" r="1.9" fill="#f8fafc"/>
     </svg>
   `;
 }
 
-function renderPressureArcSvg(pressureHpa, trend3h, width = 34, height = 22) {
+function renderPressureArcSvg(pressureHpa, trend3h, width = 32, height = 20) {
   const hpa = pressureHpa != null ? Number(pressureHpa) : 1013;
-  const pct = Math.max(0, Math.min(1, (hpa - 980) / 60));
+  const pct = Math.max(0.04, Math.min(0.96, (hpa - 980) / 60));
   const angleRad = Math.PI - pct * Math.PI;
   const dx = 24 + 17 * Math.cos(angleRad);
-  const dy = 26 - 17 * Math.sin(angleRad);
-  const arrow = trend3h > 0.4 ? '▲' : trend3h < -0.4 ? '▼' : '●';
-  const arrowCol = trend3h > 0.4 ? '#34d399' : trend3h < -0.4 ? '#ff6b81' : '#94a3b8';
+  const dy = 25 - 17 * Math.sin(angleRad);
+  const arrow = trend3h > 0.4 ? '▲' : trend3h < -0.4 ? '▼' : '—';
+  const arrowCol = trend3h > 0.4 ? '#34d399' : trend3h < -0.4 ? '#fb7185' : '#94a3b8';
   const uid = `pa${++_svgUid}`;
   return `
-    <svg viewBox="0 0 48 32" width="${width}" height="${height}" aria-hidden="true" style="flex-shrink:0;">
+    <svg viewBox="0 0 48 30" width="${width}" height="${height}" aria-hidden="true" style="flex-shrink:0;">
       <defs>
         <linearGradient id="${uid}_g" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="#ff6b81"/>
-          <stop offset="50%" stop-color="#38bdf8"/>
-          <stop offset="100%" stop-color="#34d399"/>
+          <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.55"/>
+          <stop offset="60%" stop-color="#7dd3fc"/>
+          <stop offset="100%" stop-color="#e0f2fe"/>
         </linearGradient>
       </defs>
-      <path d="M 7 26 A 17 17 0 0 1 41 26" fill="none" stroke="rgba(148,163,184,0.22)" stroke-width="4" stroke-linecap="round"/>
-      <path d="M 7 26 A 17 17 0 0 1 ${dx.toFixed(1)} ${dy.toFixed(1)}" fill="none" stroke="url(#${uid}_g)" stroke-width="4" stroke-linecap="round"/>
-      <circle cx="${dx.toFixed(1)}" cy="${dy.toFixed(1)}" r="3.6" fill="#f8fafc" stroke="#00e0ff" stroke-width="1.6"/>
-      <text x="24" y="27" text-anchor="middle" fill="${arrowCol}" font-size="9.5" font-weight="800">${arrow}</text>
+      <path d="M 7 25 A 17 17 0 0 1 41 25" fill="none" stroke="rgba(255,255,255,0.13)" stroke-width="2.8" stroke-linecap="round"/>
+      <path d="M 7 25 A 17 17 0 0 1 ${dx.toFixed(1)} ${dy.toFixed(1)}" fill="none" stroke="url(#${uid}_g)" stroke-width="2.8" stroke-linecap="round"/>
+      <circle cx="${dx.toFixed(1)}" cy="${dy.toFixed(1)}" r="2.9" fill="#f8fafc" stroke="#0b1324" stroke-width="1"/>
+      <text x="24" y="25.5" text-anchor="middle" fill="${arrowCol}" font-size="7.5" font-weight="700">${arrow}</text>
     </svg>
   `;
 }
@@ -2243,14 +2317,16 @@ function sectionIcon(name, tone = '') {
     hourly: `<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>`,
     daily: `<rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>`,
     ota: `<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/>`,
-    shield: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/>`
+    shield: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/>`,
+    sim: `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>`,
+    phone: `<rect x="5" y="2" width="14" height="20" rx="2.5"/><line x1="12" y1="18" x2="12.01" y2="18"/>`
   };
-  return `<span class="section-icon ${tone}"><svg viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ''}</svg></span>`;
+  return `<span class="section-icon ${tone}"><svg viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ''}</svg></span>`;
 }
 
 function severityMeter(pct, color) {
   const clamped = Math.max(4, Math.min(100, Math.round(Number.isFinite(pct) ? pct : 0)));
-  return `<div class="metric-meter"><div class="metric-meter-fill" style="width:${clamped}%;background:${color};box-shadow:0 0 8px ${color}66;"></div></div>`;
+  return `<div class="metric-meter"><div class="metric-meter-fill" style="width:${clamped}%;background:${color};"></div></div>`;
 }
 
 /* ==================== RENDER: DASHBOARD ==================== */
@@ -2321,43 +2397,43 @@ function renderDashboard() {
         <div class="hero-temp-wrap">
           <div class="hero-temp">${c.tempF != null ? `${c.tempF}<span class="hero-deg">°</span>` : '--'}</div>
           <div class="hero-cond">${escapeHtml(c.conditionText)}</div>
-          <div class="hero-feels">Feels like ${c.feelsLikeF ?? '--'}° • Dewpoint ${c.dewpointF ?? '--'}°F</div>
+          <div class="hero-feels">Feels like ${c.feelsLikeF ?? '--'}° · Dewpoint ${c.dewpointF ?? '--'}°F</div>
         </div>
         <div class="hero-right">
           <div class="hero-graphic-stage">
-            ${renderWeatherGraphicSvg(c.conditionText, isNightNow, 76)}
+            ${renderWeatherGraphicSvg(c.conditionText, isNightNow, 88)}
           </div>
         </div>
       </div>
 
       <div class="hero-status-strip">
-        <span class="badge-cyan">${c.confidence} Consensus</span>
-        <span class="badge-muted">±${c.spreadF}°F spread</span>
-        <span class="badge-muted">${nearestRadar.id} · ${nearestRadar.distanceMi.toFixed(0)} mi</span>
+        <span class="hero-meta-chip accent">${c.confidence} Consensus</span>
+        <span class="hero-meta-chip">±${c.spreadF}°F spread</span>
+        <span class="hero-meta-chip">${nearestRadar.id} · ${nearestRadar.distanceMi.toFixed(0)} mi</span>
       </div>
 
-      <div class="metrics-grid">
-        <div class="metric-box">
+      <div class="hero-telemetry-strip">
+        <div class="hero-telem-cell">
           <div class="metric-head-row">
             <span class="metric-label">Wind</span>
-            ${renderWindCompassSvg(c.windDirDeg, 24)}
+            ${renderWindCompassSvg(c.windDirDeg, 22)}
           </div>
           <div class="metric-value">${c.windCompass} ${c.windMph} mph</div>
           <div class="metric-sub">${c.gustMph ? `Gusts ${c.gustMph} mph` : 'Steady flow'}</div>
         </div>
-        <div class="metric-box">
+        <div class="hero-telem-cell">
           <div class="metric-head-row">
             <span class="metric-label">Humidity</span>
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="rgba(56,189,248,0.28)" stroke="#38bdf8" stroke-width="2" aria-hidden="true"><path d="M12 2.7C12 2.7 6 9.8 6 14.3a6 6 0 0 0 12 0C18 9.8 12 2.7 12 2.7z"/></svg>
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="rgba(56,189,248,0.18)" stroke="#7dd3fc" stroke-width="1.75" aria-hidden="true"><path d="M12 2.7C12 2.7 6 9.8 6 14.3a6 6 0 0 0 12 0C18 9.8 12 2.7 12 2.7z"/></svg>
           </div>
           <div class="metric-value">${c.humidity ?? '--'}%</div>
-          <div class="metric-sub">Td ${c.dewpointF ?? '--'}° • ${c.visibilityMi} mi</div>
+          <div class="metric-sub">Td ${c.dewpointF ?? '--'}° · ${c.visibilityMi} mi</div>
           ${severityMeter(c.humidity ?? 0, '#38bdf8')}
         </div>
-        <div class="metric-box">
+        <div class="hero-telem-cell">
           <div class="metric-head-row">
             <span class="metric-label">Pressure</span>
-            ${renderPressureArcSvg(c.pressureHpa, c.pressureTrend3h, 30, 20)}
+            ${renderPressureArcSvg(c.pressureHpa, c.pressureTrend3h, 30, 19)}
           </div>
           <div class="metric-value">${c.pressureInHg}"</div>
           <div class="metric-sub">${pTrendSign}${c.pressureTrend3h} hPa/3h</div>
@@ -2381,13 +2457,13 @@ function renderDashboard() {
       </div>
       <div class="metrics-grid">
         <div class="metric-box">
-          <div class="metric-label">Sig Tor (STP)</div>
+          <div class="metric-label">Sig Tor · STP</div>
           <div class="metric-value">${(env.stp ?? 0).toFixed(1)}</div>
           <div class="metric-sub">SPC Fixed-Lyr</div>
-          ${severityMeter(((env.stp ?? 0) / 3) * 100, (env.stp ?? 0) >= 1 ? '#ff2b4a' : '#10b981')}
+          ${severityMeter(((env.stp ?? 0) / 3) * 100, (env.stp ?? 0) >= 1 ? '#f43f5e' : '#10b981')}
         </div>
         <div class="metric-box">
-          <div class="metric-label">Supercell (SCP)</div>
+          <div class="metric-label">Supercell · SCP</div>
           <div class="metric-value">${(env.scp ?? 0).toFixed(1)}</div>
           <div class="metric-sub">0–3km SRH ${env.srh0to3Km ?? 0}</div>
           ${severityMeter(((env.scp ?? 0) / 5) * 100, (env.scp ?? 0) >= 1 ? '#d946ef' : '#38bdf8')}
@@ -2396,42 +2472,42 @@ function renderDashboard() {
           <div class="metric-label">0–1km SRH</div>
           <div class="metric-value">${env.srh0to1Km ?? 0}</div>
           <div class="metric-sub">m²/s² Helicity</div>
-          ${severityMeter(((env.srh0to1Km ?? 0) / 300) * 100, (env.srh0to1Km ?? 0) >= 150 ? '#ff9800' : '#00d4ff')}
+          ${severityMeter(((env.srh0to1Km ?? 0) / 300) * 100, (env.srh0to1Km ?? 0) >= 150 ? '#f59e0b' : '#38bdf8')}
         </div>
       </div>
       <div class="metrics-grid" style="margin-top:8px;">
         <div class="metric-box">
           <div class="metric-label">CAPE / CIN</div>
           <div class="metric-value">${env.peakCape12h}</div>
-          <div class="metric-sub">Now ${env.capeNow} • CIN ${env.cinNow}</div>
-          ${severityMeter(((env.peakCape12h ?? 0) / 3000) * 100, Math.abs(env.cinNow ?? 0) >= 200 ? '#facc15' : (env.peakCape12h ?? 0) >= 1500 ? '#ff8c1a' : '#38bdf8')}
+          <div class="metric-sub">Now ${env.capeNow} · CIN ${env.cinNow}</div>
+          ${severityMeter(((env.peakCape12h ?? 0) / 3000) * 100, Math.abs(env.cinNow ?? 0) >= 200 ? '#facc15' : (env.peakCape12h ?? 0) >= 1500 ? '#f59e0b' : '#38bdf8')}
         </div>
         <div class="metric-box">
           <div class="metric-label">0–6km Shear</div>
           <div class="metric-value">${env.bulkShear0to6KmKt} kt</div>
           <div class="metric-sub">0–1.5km: ${env.lowLevelShearKt} kt</div>
-          ${severityMeter(((env.bulkShear0to6KmKt ?? 0) / 60) * 100, (env.bulkShear0to6KmKt ?? 0) >= 40 ? '#e040fb' : '#00e0ff')}
+          ${severityMeter(((env.bulkShear0to6KmKt ?? 0) / 60) * 100, (env.bulkShear0to6KmKt ?? 0) >= 40 ? '#d946ef' : '#38bdf8')}
         </div>
         <div class="metric-box">
           <div class="metric-label">LCL / Lapse</div>
           <div class="metric-value">${env.lclMeters ?? '--'} m</div>
           <div class="metric-sub">7–5mb: ${env.lapseRate700to500 ?? 5.8}°/km</div>
-          ${severityMeter((((env.lapseRate700to500 ?? 5.8) - 4) / 5) * 100, (env.lapseRate700to500 ?? 5.8) >= 7.0 ? '#ff8c1a' : '#10b981')}
+          ${severityMeter((((env.lapseRate700to500 ?? 5.8) - 4) / 5) * 100, (env.lapseRate700to500 ?? 5.8) >= 7.0 ? '#f59e0b' : '#10b981')}
         </div>
       </div>
       <div class="hodograph-wrap">
         <div class="hodograph-head">
-          <span style="color:var(--cyan);">LIVE 5-LEVEL HODOGRAPH (KT)</span>
-          <span style="color:var(--watch-yellow);">RM ${escapeHtml(env.bunkersCompass || '--')} @ ${env.bunkersSpeedKt ?? 0} kt</span>
+          <span class="hodo-title">LIVE 5-LEVEL HODOGRAPH (KT)</span>
+          <span class="hodo-rm">RM ${escapeHtml(env.bunkersCompass || '--')} @ ${env.bunkersSpeedKt ?? 0} kt</span>
         </div>
         <canvas id="hodograph-canvas" class="hodograph-canvas"></canvas>
         <div class="hodograph-foot">
           <div class="hodo-legend">
-            <span><i class="hodo-dot" style="background:#ff3d5a"></i>0–1km</span>
-            <span><i class="hodo-dot" style="background:#facc15"></i>1–3km</span>
-            <span><i class="hodo-dot" style="background:#00d4ff"></i>3–6km</span>
+            <span><i class="hodo-dot" style="background:#f43f5e"></i>0–1km</span>
+            <span><i class="hodo-dot" style="background:#f59e0b"></i>1–3km</span>
+            <span><i class="hodo-dot" style="background:#38bdf8"></i>3–6km</span>
           </div>
-          <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer • ${state.stormCells.length} verified cell${state.stormCells.length === 1 ? '' : 's'}</span>
+          <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer · ${state.stormCells.length} verified cell${state.stormCells.length === 1 ? '' : 's'}</span>
         </div>
       </div>
     </div>
@@ -2619,9 +2695,9 @@ function drawHodographCanvas(env) {
 
   // Radar-scope radial gradient backdrop
   const scopeGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, maxR);
-  scopeGrad.addColorStop(0, 'rgba(0, 212, 255, 0.09)');
-  scopeGrad.addColorStop(0.65, 'rgba(13, 24, 44, 0.45)');
-  scopeGrad.addColorStop(1, 'rgba(6, 11, 20, 0.88)');
+  scopeGrad.addColorStop(0, 'rgba(56, 189, 248, 0.06)');
+  scopeGrad.addColorStop(0.65, 'rgba(13, 21, 36, 0.42)');
+  scopeGrad.addColorStop(1, 'rgba(5, 9, 18, 0.84)');
   ctx.fillStyle = scopeGrad;
   ctx.beginPath();
   ctx.arc(cx, cy, maxR, 0, Math.PI * 2);
@@ -2629,9 +2705,9 @@ function drawHodographCanvas(env) {
 
   // Dashed speed rings
   const step = maxRing <= 30 ? 10 : 20;
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.24)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.10)';
   ctx.lineWidth = 1;
-  ctx.fillStyle = '#7c8ea6';
+  ctx.fillStyle = '#64748b';
   ctx.font = '9.5px "JetBrains Mono", ui-monospace, monospace';
   for (let rk = step; rk <= maxRing; rk += step) {
     const r = rk * pxPerKt;
@@ -2644,13 +2720,13 @@ function drawHodographCanvas(env) {
   ctx.setLineDash([]);
 
   // Cardinal axes
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.26)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
   ctx.beginPath();
   ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy);
   ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR);
   ctx.stroke();
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '700 10px "Inter", -apple-system, sans-serif';
+  ctx.fillStyle = '#8da2bc';
+  ctx.font = '600 9.5px "Inter", -apple-system, sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('N', cx, cy - maxR - 4);
   ctx.fillText('S', cx, cy + maxR + 11);
@@ -2667,7 +2743,7 @@ function drawHodographCanvas(env) {
   // Shaded 0-3km SRH inflow wedge
   const lowPts = pts.filter((p) => p.heightKm <= 3.2);
   if (lowPts.length >= 2) {
-    ctx.fillStyle = 'rgba(255, 61, 90, 0.20)';
+    ctx.fillStyle = 'rgba(244, 63, 94, 0.16)';
     ctx.beginPath();
     ctx.moveTo(rmX, rmY);
     lowPts.forEach((p) => { const [x, y] = toXY(p.uKt, p.vKt); ctx.lineTo(x, y); });
@@ -2676,8 +2752,8 @@ function drawHodographCanvas(env) {
   }
 
   // Origin -> RM dashed motion vector
-  ctx.strokeStyle = 'rgba(250, 204, 21, 0.58)';
-  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = 'rgba(245, 158, 11, 0.52)';
+  ctx.lineWidth = 1.3;
   ctx.setLineDash([4, 3]);
   ctx.beginPath();
   ctx.moveTo(cx, cy);
@@ -2686,13 +2762,13 @@ function drawHodographCanvas(env) {
   ctx.setLineDash([]);
 
   // Height-colored hodograph segments
-  ctx.lineWidth = 3.2;
+  ctx.lineWidth = 2.8;
   ctx.lineCap = 'round';
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i], b = pts[i + 1];
     const [x1, y1] = toXY(a.uKt, a.vKt);
     const [x2, y2] = toXY(b.uKt, b.vKt);
-    ctx.strokeStyle = b.heightKm <= 1.2 ? '#ff3d5a' : b.heightKm <= 3.2 ? '#facc15' : '#00d4ff';
+    ctx.strokeStyle = b.heightKm <= 1.2 ? '#f43f5e' : b.heightKm <= 3.2 ? '#f59e0b' : '#38bdf8';
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
@@ -2701,13 +2777,13 @@ function drawHodographCanvas(env) {
 
   // Points & de-crowded altitude labels
   const placedLabels = [];
-  ctx.font = '700 9.5px "Inter", -apple-system, sans-serif';
+  ctx.font = '600 9.5px "Inter", -apple-system, sans-serif';
   pts.forEach((p, idx) => {
     const [x, y] = toXY(p.uKt, p.vKt);
-    ctx.fillStyle = '#090d16';
-    ctx.beginPath(); ctx.arc(x, y, 4.6, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = p.heightKm <= 1.2 ? '#ff3d5a' : p.heightKm <= 3.2 ? '#facc15' : '#00d4ff';
-    ctx.beginPath(); ctx.arc(x, y, 3.0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#050912';
+    ctx.beginPath(); ctx.arc(x, y, 4.4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = p.heightKm <= 1.2 ? '#f43f5e' : p.heightKm <= 3.2 ? '#f59e0b' : '#38bdf8';
+    ctx.beginPath(); ctx.arc(x, y, 2.8, 0, Math.PI * 2); ctx.fill();
 
     // Always prioritize Sfc, 850, 700, 500 labels; skip 925 if crowded
     if (p.label === '925') return;
@@ -2721,20 +2797,20 @@ function drawHodographCanvas(env) {
       ly = y + (idx % 2 === 0 ? -9 : 13);
     }
     placedLabels.push([lx, ly]);
-    ctx.fillStyle = '#f8fafc';
+    ctx.fillStyle = '#e2e8f0';
     ctx.fillText(p.label, Math.max(6, Math.min(size - 26, lx - 6)), Math.max(12, Math.min(size - 6, ly)));
   });
 
   // RM Crosshair reticle
-  ctx.strokeStyle = '#facc15';
-  ctx.lineWidth = 1.6;
-  ctx.beginPath(); ctx.arc(rmX, rmY, 5.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.arc(rmX, rmY, 5.2, 0, Math.PI * 2); ctx.stroke();
   ctx.beginPath();
-  ctx.moveTo(rmX - 8, rmY); ctx.lineTo(rmX + 8, rmY);
-  ctx.moveTo(rmX, rmY - 8); ctx.lineTo(rmX, rmY + 8);
+  ctx.moveTo(rmX - 7.5, rmY); ctx.lineTo(rmX + 7.5, rmY);
+  ctx.moveTo(rmX, rmY - 7.5); ctx.lineTo(rmX, rmY + 7.5);
   ctx.stroke();
-  ctx.fillStyle = '#facc15';
-  ctx.font = '800 10px "Inter", -apple-system, sans-serif';
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = '700 9.5px "Inter", -apple-system, sans-serif';
   ctx.fillText('RM', rmX + 7, rmY + 11);
 }
 
@@ -2911,14 +2987,24 @@ function renderAlerts() {
   }
 
   if (!parts.length) {
+    const loc = state.activeLocation || getSavedHomeLocation();
+    const site = state.selectedRadarSite || findNearestNexradStation(loc.lat, loc.lon).id;
     parts.push(`
-      <div class="card" style="text-align:center;padding:30px 18px;">
-        <div style="display:inline-flex;align-items:center;justify-content:center;width:54px;height:54px;border-radius:16px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.34);color:#34d399;margin-bottom:10px;">
-          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+      <div class="card alerts-clear-hero">
+        <div class="alerts-clear-emblem" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
         </div>
-        <div class="alert-title">All Quiet Across Your Area</div>
-        <div class="alert-meta" style="margin-top:6px;">
-          No verified supercells, TVS signatures, or NWS warnings detected within 120 miles. Non-convective rain clutter is automatically filtered.
+        <div class="alerts-clear-eyebrow">Active Watchdog · Standby</div>
+        <div class="alerts-clear-title">All Quiet Across Your Area</div>
+        <div class="alerts-clear-copy">
+          No verified supercells, TVS signatures, or NWS warnings detected within 120 miles. Non-convective clutter is automatically suppressed.
+        </div>
+        <div class="alerts-clear-meta">
+          <span>${escapeHtml(site)} NEXRAD</span>
+          <span class="telem-sep">·</span>
+          <span>120 mi Sweep</span>
+          <span class="telem-sep">·</span>
+          <span>${state.settings.adaptiveStormModeEnabled ? 'Adaptive 45s Armed' : '3m Polling'}</span>
         </div>
       </div>
     `);
@@ -2980,7 +3066,7 @@ function renderSettings() {
     <!-- SEVERE WEATHER ENGINE SETTINGS -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">${sectionIcon('shield')}Severe Weather Protection Engine</div>
+        <div class="card-title">${sectionIcon('shield')}Severe Protection Engine</div>
         <span class="badge-${state.isStormWatchActive ? 'red' : 'green'}">${state.isStormWatchActive ? 'Active 45s Watch' : 'Standby 3m'}</span>
       </div>
 
@@ -3029,7 +3115,7 @@ function renderSettings() {
           <div class="setting-title">Proactive TOT Lead Window (${s.proactiveTotLeadMinutes} min)</div>
           <div class="setting-desc">Alert when an intercepting storm cell is within ${s.proactiveTotLeadMinutes} minutes of arrival.</div>
         </div>
-        <input type="range" id="set-tot-lead" min="15" max="60" step="5" value="${s.proactiveTotLeadMinutes}" style="width:96px;accent-color:var(--cyan);" />
+        <input type="range" id="set-tot-lead" class="luxury-range" min="15" max="60" step="5" value="${s.proactiveTotLeadMinutes}" style="--range-pct:${Math.round(((s.proactiveTotLeadMinutes - 15) / 45) * 100)}%;" />
       </div>
 
       <div class="setting-item">
@@ -3073,7 +3159,7 @@ function renderSettings() {
           <div class="setting-title">Ground Freeze Trigger (${s.groundFreezeThresholdF}°F)</div>
           <div class="setting-desc">Alert when 0cm surface ground temperature drops to or below threshold.</div>
         </div>
-        <input type="range" id="set-freeze-slider" min="28" max="36" value="${s.groundFreezeThresholdF}" style="width:96px;accent-color:var(--cyan);" />
+        <input type="range" id="set-freeze-slider" class="luxury-range" min="28" max="36" value="${s.groundFreezeThresholdF}" style="--range-pct:${Math.round(((s.groundFreezeThresholdF - 28) / 8) * 100)}%;" />
       </div>
     </div>
 
@@ -3081,9 +3167,9 @@ function renderSettings() {
     <div class="card">
       <div class="card-header">
         <div class="card-title">${sectionIcon('sounding', 'amber')}Tornado &amp; Severe Alert Sirens</div>
-        <span class="badge-red">8 Custom WAVs</span>
+        <span class="badge-muted">8 Custom WAVs</span>
       </div>
-      <div class="alert-meta" style="margin-bottom:10px;">
+      <div class="alert-meta" style="margin-bottom:12px;">
         Tap any siren to preview on your iPhone. Tornado Emergencies &amp; Observed Tornadoes loop continuously until you tap Silence.
       </div>
       <div class="siren-list">
@@ -3111,9 +3197,10 @@ function renderSettings() {
     <!-- TEST ALERT SIMULATOR -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">🧪 Test Alert Simulator</div>
+        <div class="card-title">${sectionIcon('sim')}Test Alert Simulator</div>
+        <span class="badge-muted">Audio + Banner</span>
       </div>
-      <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;">
+      <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:9px;">
         <button id="btn-test-tornado" class="btn-glass-danger">Test Tornado Siren</button>
         <button id="btn-test-tot" class="btn-glass-cyan">Test Storm TOT</button>
         <button id="btn-test-convective" class="btn-glass-violet">Test Convective</button>
@@ -3124,7 +3211,7 @@ function renderSettings() {
     <!-- iPHONE HOME SCREEN GUIDE -->
     <div class="card">
       <div class="card-header">
-        <div class="card-title">📱 iPhone Home Screen Setup</div>
+        <div class="card-title">${sectionIcon('phone')}iPhone Home Screen Setup</div>
       </div>
       <div class="alert-meta">
         1. Open this link in <strong>Safari</strong> on iPhone.<br/>
@@ -3199,6 +3286,7 @@ function renderSettings() {
   document.getElementById('set-tot-lead')?.addEventListener('input', (e) => {
     const val = Number(e.target.value);
     state.settings.proactiveTotLeadMinutes = val;
+    e.target.style.setProperty('--range-pct', `${Math.round(((val - 15) / 45) * 100)}%`);
     saveSettings();
     const row = e.target.closest('.setting-item');
     const titleEl = row?.querySelector('.setting-title');
@@ -3246,6 +3334,7 @@ function renderSettings() {
   document.getElementById('set-freeze-slider')?.addEventListener('input', (e) => {
     const val = Number(e.target.value);
     state.settings.groundFreezeThresholdF = val;
+    e.target.style.setProperty('--range-pct', `${Math.round(((val - 28) / 8) * 100)}%`);
     saveSettings();
     const row = e.target.closest('.setting-item');
     const titleEl = row?.querySelector('.setting-title');

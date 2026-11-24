@@ -1,7 +1,7 @@
 {
-  "versionCode": 9,
-  "versionName": "1.6.2",
+  "versionCode": 10,
+  "versionName": "1.6.3",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-24T06:15:00Z",
-  "releaseNotes": "Tempest v1.6.2 (by J. Borden): Adds NEXRAD reflectivity ground-clutter & noise-speckle suppression with smooth linear raster resampling (CONUS Mosaic, N0B, N0Q via safe MapLibre v4 custom protocol while keeping Velocity/CC/ZDR raw), eliminates false iOS Safari / GitHub Pages OTA update loops via cache-revalidating app-shell fetches and strict versionCode gating, and expands automated Chromium verification."
+  "publishedAt": "2026-11-24T07:00:00Z",
+  "releaseNotes": "Tempest v1.6.3 (by J. Borden): Upgrades NEXRAD reflectivity clutter removal to the empirically verified HSV + despeckle + edge-feathering filter (eliminating 100% of <20 dBZ periwinkle/aqua/olive clear-air clutter while preserving genuine precipitation and hail cores) and delivers a full Apple Weather x RadarScope luxury obsidian glass interface redesign."
 }

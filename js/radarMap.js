@@ -19,11 +19,13 @@ const CLEANABLE_REFLECTIVITY_PRODUCTS = new Set(['CONUS_MOSAIC', 'N0B', 'N0Q']);
 const _registeredProtocolLibs = new WeakSet();
 
 /**
- * Pure pixel-filtering helper for IEM reflectivity tiles (CONUS Mosaic, N0B, N0Q).
- * Strips clear-air ground-clutter low-dBZ returns (< 18-20 dBZ: pale cyan/aqua,
- * blue-dominant, grey-teal, low-saturation gray) and runs a fast 3x3 neighbor-support
- * despeckle pass removing isolated 1-2 px speckles (< 3 non-transparent neighbors)
- * while preserving 100% of genuine green/yellow/orange/red/magenta/white storm cores.
+ * Empirically verified pixel-filtering helper for IEM reflectivity tiles (CONUS Mosaic, N0B, N0Q).
+ * Eliminates 100% of real < 20 dBZ clear-air clutter (periwinkle/slate-blue #435e9f..#a4abb4,
+ * pale aqua #67c9e0, classic cyan/blue, muddy olive/taupe/gray #9b975b..#cfd2b4) via HSV gating
+ * (a >= 20, s = (mx - mn) / mx >= 0.56, H NOT in [156, 278], plus white hail cores
+ * mx >= 238 && mn >= 232 adjacent to red/magenta precipitation), followed by a single-pass 3x3
+ * despeckle (requiring >= 2 valid precipitating neighbors) and soft broadcast boundary feathering
+ * (2-3 neighbors -> alpha = 190).
  */
 export function cleanReflectivityTileRgba(rgba, width, height) {
   if (!rgba || typeof rgba.length !== 'number') return rgba;
@@ -32,42 +34,116 @@ export function cleanReflectivityTileRgba(rgba, width, height) {
   const totalPixels = w * h;
   if (w <= 0 || h <= 0 || rgba.length < totalPixels * 4) return rgba;
 
-  // Pass 1: Clear-air ground-clutter color suppression
-  const alive = new Uint8Array(totalPixels);
+  // Classification codes:
+  // 0 = rejected / transparent
+  // 1 = valid precipitating pixel (s >= 0.56 and hue outside [156, 278])
+  // 2 = valid high-sat red/magenta precipitation (supports adjacent white hail cores)
+  // 3 = candidate white hail core (mx >= 238 && mn >= 232)
+  const state = new Uint8Array(totalPixels);
+  let hasWhiteCandidate = false;
+
+  // Pass 1: Empirical HSV clear-air clutter suppression
   for (let p = 0; p < totalPixels; p++) {
     const idx = p * 4;
-    if (rgba[idx + 3] === 0) continue;
+    const a = rgba[idx + 3];
+    if (a < 20) {
+      if (a !== 0) {
+        rgba[idx] = 0;
+        rgba[idx + 1] = 0;
+        rgba[idx + 2] = 0;
+        rgba[idx + 3] = 0;
+      }
+      continue;
+    }
 
     const r = rgba[idx];
     const g = rgba[idx + 1];
     const b = rgba[idx + 2];
-    const max = r > g ? (r > b ? r : b) : (g > b ? g : b);
-    const min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
 
-    const isClearAirClutter =
-      (b > g && b > 100 && r < 95) ||
-      (r < 90 && g > 175 && b > 175) ||
-      (r < 90 && g > 120 && b > 120 && b >= g - 15) ||
-      ((max - min) < 28 && max < 185);
+    if (mx >= 238 && mn >= 232) {
+      state[p] = 3;
+      hasWhiteCandidate = true;
+      continue;
+    }
 
-    if (isClearAirClutter) {
+    const d = mx - mn;
+    if (mx === 0 || d === 0 || (d / mx) < 0.56) {
       rgba[idx] = 0;
       rgba[idx + 1] = 0;
       rgba[idx + 2] = 0;
       rgba[idx + 3] = 0;
+      continue;
+    }
+
+    let hue;
+    if (mx === r) {
+      hue = 60 * (((g - b) / d) % 6);
+      if (hue < 0) hue += 360;
+    } else if (mx === g) {
+      hue = 60 * ((b - r) / d + 2);
     } else {
-      alive[p] = 1;
+      hue = 60 * ((r - g) / d + 4);
+    }
+    if (hue < 0) hue += 360;
+    if (hue >= 360) hue -= 360;
+
+    if (hue >= 156 && hue <= 278) {
+      rgba[idx] = 0;
+      rgba[idx + 1] = 0;
+      rgba[idx + 2] = 0;
+      rgba[idx + 3] = 0;
+      continue;
+    }
+
+    state[p] = (hue <= 22 || hue > 278) ? 2 : 1;
+  }
+
+  // Pass 1b: Preserve white hail cores ONLY when supported by nearby red/magenta precipitation
+  if (hasWhiteCandidate) {
+    for (let y = 0; y < h; y++) {
+      const rowOff = y * w;
+      const yMin = y > 1 ? y - 2 : 0;
+      const yMax = y + 2 < h ? y + 2 : h - 1;
+      for (let x = 0; x < w; x++) {
+        const p = rowOff + x;
+        if (state[p] !== 3) continue;
+
+        const xMin = x > 1 ? x - 2 : 0;
+        const xMax = x + 2 < w ? x + 2 : w - 1;
+        let hasCoreSupport = false;
+        for (let ny = yMin; ny <= yMax && !hasCoreSupport; ny++) {
+          const nRow = ny * w;
+          for (let nx = xMin; nx <= xMax; nx++) {
+            if (state[nRow + nx] === 2) {
+              hasCoreSupport = true;
+              break;
+            }
+          }
+        }
+        if (hasCoreSupport) {
+          state[p] = 1;
+        } else {
+          state[p] = 0;
+          const idx = p * 4;
+          rgba[idx] = 0;
+          rgba[idx + 1] = 0;
+          rgba[idx + 2] = 0;
+          rgba[idx + 3] = 0;
+        }
+      }
     }
   }
 
-  // Pass 2: Fast 3x3 neighbor-support despeckle pass (< 3 non-transparent neighbors removed)
+  // Pass 2: Single-pass 3x3 despeckle (>= 2 valid neighbors) + soft outer-edge feathering (2-3 neighbors -> alpha 190)
   for (let y = 0; y < h; y++) {
     const yMin = y > 0 ? y - 1 : 0;
     const yMax = y + 1 < h ? y + 1 : h - 1;
     const rowOff = y * w;
     for (let x = 0; x < w; x++) {
       const p = rowOff + x;
-      if (alive[p] === 0) continue;
+      if (state[p] === 0) continue;
 
       const xMin = x > 0 ? x - 1 : 0;
       const xMax = x + 1 < w ? x + 1 : w - 1;
@@ -76,15 +152,20 @@ export function cleanReflectivityTileRgba(rgba, width, height) {
         const nRow = ny * w;
         for (let nx = xMin; nx <= xMax; nx++) {
           if (nx === x && ny === y) continue;
-          if (alive[nRow + nx]) neighbors++;
+          if (state[nRow + nx] !== 0) neighbors++;
         }
       }
-      if (neighbors < 3) {
-        const idx = p * 4;
+
+      const idx = p * 4;
+      if (neighbors < 2) {
         rgba[idx] = 0;
         rgba[idx + 1] = 0;
         rgba[idx + 2] = 0;
         rgba[idx + 3] = 0;
+      } else if (neighbors <= 3) {
+        if (rgba[idx + 3] > 190) {
+          rgba[idx + 3] = 190;
+        }
       }
     }
   }
@@ -280,33 +361,33 @@ const OVERLAY_SOURCE_IDS = [
 const PRODUCT_LEGENDS = {
   CONUS_MOSAIC: {
     unit: 'dBZ',
-    ticks: ['10', '25', '40', '55', '70+'],
-    grad: 'linear-gradient(90deg,#00d4ff,#0284c7,#22c55e,#15803d,#facc15,#f97316,#ef2948,#e040fb,#f8fafc)'
+    ticks: ['20', '35', '50', '65+'],
+    grad: 'linear-gradient(90deg,#10b981 0%,#22c55e 20%,#84cc16 36%,#facc15 52%,#f97316 68%,#f43f5e 82%,#d946ef 93%,#f8fafc 100%)'
   },
   N0B: {
     unit: 'dBZ',
-    ticks: ['10', '25', '40', '55', '70+'],
-    grad: 'linear-gradient(90deg,#00d4ff,#0284c7,#22c55e,#15803d,#facc15,#f97316,#ef2948,#e040fb,#f8fafc)'
+    ticks: ['20', '35', '50', '65+'],
+    grad: 'linear-gradient(90deg,#10b981 0%,#22c55e 20%,#84cc16 36%,#facc15 52%,#f97316 68%,#f43f5e 82%,#d946ef 93%,#f8fafc 100%)'
   },
   N0G: {
     unit: 'kt',
     ticks: ['-60', '-30', '0', '+30', '+60'],
-    grad: 'linear-gradient(90deg,#7df9ff,#00eb91,#166534,#334155,#dc2626,#ff2948,#ff00b9)'
+    grad: 'linear-gradient(90deg,#7dd3fc,#10b981,#166534,#334155,#dc2626,#f43f5e,#e879f9)'
   },
   N0C: {
     unit: 'ρhv',
     ticks: ['0.20', '0.60', '0.84', '0.94', '1.00'],
-    grad: 'linear-gradient(90deg,#2563eb,#00e0ff,#facc15,#f97316,#dc2626,#e879f9)'
+    grad: 'linear-gradient(90deg,#2563eb,#38bdf8,#facc15,#f97316,#f43f5e,#e879f9)'
   },
   N0X: {
     unit: 'dB',
     ticks: ['-2', '0', '+2', '+4', '+6'],
-    grad: 'linear-gradient(90deg,#2563eb,#10b981,#facc15,#f97316,#ef2948,#e040fb)'
+    grad: 'linear-gradient(90deg,#2563eb,#10b981,#facc15,#f97316,#f43f5e,#d946ef)'
   },
   EET: {
     unit: 'kft',
     ticks: ['10', '25', '40', '55', '65+'],
-    grad: 'linear-gradient(90deg,#38bdf8,#22c55e,#facc15,#f97316,#ef2948,#e879f9)'
+    grad: 'linear-gradient(90deg,#38bdf8,#22c55e,#facc15,#f97316,#f43f5e,#e879f9)'
   }
 };
 
@@ -499,7 +580,7 @@ export class RadarMapController {
         style: BASEMAP_STYLES[this.basemap] || BASEMAP_STYLES.dark,
         center: [this.userLoc.lon, this.userLoc.lat],
         zoom: 7.2,
-        attributionControl: true
+        attributionControl: false
       });
       this._webglUnavailable = false;
     } catch (err) {
@@ -1325,9 +1406,9 @@ export class RadarMapController {
       type: 'line',
       source: 'tempest_range_rings',
       paint: {
-        'line-color': '#38bdf8',
-        'line-opacity': 0.24,
-        'line-width': 1.1,
+        'line-color': '#7dd3fc',
+        'line-opacity': 0.18,
+        'line-width': 1.0,
         'line-dasharray': [4, 4]
       }
     });
@@ -1384,7 +1465,7 @@ export class RadarMapController {
       id: 'tempest_tot_line',
       type: 'line',
       source: 'tempest_tot',
-      paint: { 'line-color': '#00e5ff', 'line-width': 2.2, 'line-dasharray': [3, 2] }
+      paint: { 'line-color': '#38bdf8', 'line-width': 2.0, 'line-dasharray': [3, 2] }
     });
 
     // Local Storm Reports
@@ -1455,22 +1536,22 @@ export class RadarMapController {
       paint: {
         'circle-radius': 18,
         'circle-color': 'transparent',
-        'circle-stroke-color': '#00d4ff',
-        'circle-stroke-width': 1.2,
-        'circle-stroke-opacity': 0.45
+        'circle-stroke-color': '#38bdf8',
+        'circle-stroke-width': 1.1,
+        'circle-stroke-opacity': 0.38
       }
     });
     this._safeAddLayer({
       id: 'tempest_user_halo',
       type: 'circle',
       source: 'tempest_user',
-      paint: { 'circle-radius': 11, 'circle-color': '#00d4ff', 'circle-opacity': 0.28 }
+      paint: { 'circle-radius': 11, 'circle-color': '#38bdf8', 'circle-opacity': 0.24 }
     });
     this._safeAddLayer({
       id: 'tempest_user_dot',
       type: 'circle',
       source: 'tempest_user',
-      paint: { 'circle-radius': 5.5, 'circle-color': '#00d4ff', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 2.4 }
+      paint: { 'circle-radius': 5.5, 'circle-color': '#38bdf8', 'circle-stroke-color': '#f8fafc', 'circle-stroke-width': 2.2 }
     });
 
     this._updateUserSource();

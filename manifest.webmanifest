@@ -8,8 +8,8 @@
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],
   "orientation": "any",
-  "background_color": "#040811",
-  "theme_color": "#040811",
+  "background_color": "#050912",
+  "theme_color": "#050912",
   "categories": ["weather", "utilities"],
   "icons": [
     {
