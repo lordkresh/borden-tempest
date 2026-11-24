@@ -1,0 +1,580 @@
+{
+  "total": 89,
+  "passed": 89,
+  "failed": 0,
+  "screenshots": [
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_desktop_1280x800.png",
+      "caption": "Headless Desktop 1280x800 verified clear dashboard"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_430x932.png",
+      "caption": "Headless Mobile430 430x932 verified clear dashboard"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_390x844.png",
+      "caption": "Headless Mobile390 390x844 verified clear dashboard"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_375x812.png",
+      "caption": "Headless Mobile375 375x812 verified clear dashboard"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_landscape_844x390.png",
+      "caption": "Headless MobileLandscape 844x390 verified clear dashboard"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_stale_banner.png",
+      "caption": "Mobile staleness warning banner visible for >15m data"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_tornado_warning.png",
+      "caption": "Synthetic Tornado Warning alert popup on mobile"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_radar_inspect_cell.png",
+      "caption": "Mobile Radar + Storm Cell Weather-System Inspector Sheet open"
+    },
+    {
+      "path": "C:\\Users\\jamie\\.gemini\\antigravity\\brain\\486ac362-a3b8-4367-b9d9-8d712da3fcbb\\tempest_mobile_radar_inspect_warning.png",
+      "caption": "Mobile Radar + NWS Tornado Warning Inspector & Multi-System Switcher"
+    }
+  ],
+  "failures": [],
+  "checks": [
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Exports required staleness, UTC/Central time, and binary radar helpers",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "parseUtcTimestampMs parses UTC ISO, offset ISO, naive ISO as UTC, and epoch ms safely",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "formatCentralTime strictly converts UTC to America/Chicago (CST & CDT) regardless of host TZ",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "evaluateDataStaleness enforces hard >15-minute threshold on radar frames & Open-Meteo",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "validateRadarBinaryFrame accepts valid PNG/GZIP/NEXRAD L3 and rejects truncated/corrupted frames",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "fetchRadarBinaryFrame fast-fails on 404 & CORS, retries bounded on 503, rejects truncated binary, and aborts on timeout",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Public fetchers attach _meta timestamps, do not poison TTL cache on error, and have zero unhandled rejections offline",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "updater.checkForUpdates handles 503, network errors, and timeouts gracefully without throwing",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Regressions for @data-auditor #31 fixes: undefined-id alerts, compact IEM UTC, utc_offset_seconds, omitted siteId fallback",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Regressions for #35: fetchNwsAfd 64-entry cache cap & fetchIemStormIntel expired wpc_ero eviction",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Regressions for #35: updater.js malformed schema, stalled timeout & idempotent init() listener guard",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Regressions for @ios-pwa-auditor #41-2: NWS cached-points offline throw, IEM null cellsFetchedAtMs, NEXRAD msgLen<18, PNG missing IDAT, Central hour helpers",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Data Pipeline & Network Resilience (@data-auditor)",
+      "name": "Regressions for @ios-pwa-auditor #41-4: updater Retry-After support & already-waiting SW surfaced on relaunch",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Point-in-Polygon & Geometry Hardening (@alert-auditor)",
+      "name": "Interior, exterior, exact vertex, and exact horizontal/vertical/diagonal edge checks",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Point-in-Polygon & Geometry Hardening (@alert-auditor)",
+      "name": "Polygon with interior hole and MultiPolygon with hole",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Point-in-Polygon & Geometry Hardening (@alert-auditor)",
+      "name": "Antimeridian (\u00b1180\u00b0) crossing polygon works accurately on both sides",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Point-in-Polygon & Geometry Hardening (@alert-auditor)",
+      "name": "Swapped [lat, lon] and malformed/NaN geometry coordinates are guarded safely without throwing",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Point-in-Polygon & Geometry Hardening (@alert-auditor)",
+      "name": "haversineMiles, computeStormIntercept & geometryCentroid have zero NaN on edge cases",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:NWS Alert Expiry, Superseding, Deduplication & Classification (@alert-auditor)",
+      "name": "Exports isAlertExpired and filterAndDeduplicateAlerts",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:NWS Alert Expiry, Superseding, Deduplication & Classification (@alert-auditor)",
+      "name": "isAlertExpired immediately rejects expired, exact-boundary, Cancel, and Expired alerts",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:NWS Alert Expiry, Superseding, Deduplication & Classification (@alert-auditor)",
+      "name": "filterAndDeduplicateAlerts purges expired, superseded (references / replacedBy / Cancel), and duplicates",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "Unit conversion functions match exact meteorological constants and guard null/NaN",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "analyzeEnvironment matches exact hand-calculated CAPE, SRH, 0-6km & 0-1.5km shear, Bunkers RM, LCL, lapse, STP & SCP",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "analyzeEnvironment produces ZERO NaN on degenerate/zero-shear/null/extreme-CIN inputs",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "Regressions for @alert-auditor #33: summer null hourly temp (no 0\u00b0F Hard Freeze) & audioEngine play() race",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "Regressions for #35: resolveCurrentConditions unit-code resilience (NWS WMO & Open-Meteo \u00b0C/kmh/ms/kn)",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "v1.6.0/v1.6.1 CAPE/CIN cap gating: zero-CAPE windy day stays Quiet/Stable & strong CIN (-250) damps score",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Unit Conversions & Exact Hand-Calculated Severe-Weather Math (@alert-auditor)",
+      "name": "Regressions for @ios-pwa-auditor #41-3 & #41-5: mcdCount=null/NaN CIN cap, America/Chicago nocturnal TZ & audioEngine interrupted resume",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Radar Animation Loop, Lifecycle & Memory Leak Hardening (@pwa-engineer)",
+      "name": "Zero duplicate/zombie setInterval timers across rapid start/toggle/speed/product switches",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Radar Animation Loop, Lifecycle & Memory Leak Hardening (@pwa-engineer)",
+      "name": "pauseForBackground / resumeFromBackground & visibilitychange cleanly pause and resume without zombie timers",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Radar Animation Loop, Lifecycle & Memory Leak Hardening (@pwa-engineer)",
+      "name": "Switching products cleans stale radar layers/sources (no GPU/memory leak) & handles WebGL/map errors gracefully",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Radar Animation Loop, Lifecycle & Memory Leak Hardening (@pwa-engineer)",
+      "name": "iOS Safari BFCache pagehide / pageshow (persisted=true) pauses and resumes with zero zombie intervals",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Unit:Radar Animation Loop, Lifecycle & Memory Leak Hardening (@pwa-engineer)",
+      "name": "Interactive Radar Weather-System Click Inspection (#42/#43): all 8 system types, priority & multi-system collection",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Gate",
+      "name": "Zero live network leakage in unit tests",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "A:Gate",
+      "name": "Zero uncaught exceptions / unhandled rejections / console errors in unit tests",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "B:PWA",
+      "name": "manifest.webmanifest schema & icon files valid",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "B:PWA",
+      "name": "Version consistency v1.6.1 / versionCode=8 / borden-tempest-v1.6.1-b8 across version.json, sw.js & updater.js",
+      "passed": true,
+      "detail": "version.json=1.6.1/b8"
+    },
+    {
+      "suite": "B:PWA",
+      "name": "index.html contains required iOS standalone PWA meta tags & obsidian theme-color",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "B:PWA",
+      "name": "styles.css configures all 4 iOS safe-area-insets & dynamic viewport height (100dvh/-webkit-fill-available)",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "B:SW",
+      "name": "Service Worker registers & activates cleanly",
+      "passed": true,
+      "detail": "{\"supported\": true, \"scope\": \"http://127.0.0.1:50428/\", \"activeState\": \"activated\", \"scriptURL\": \"http://127.0.0.1:50428/sw.js\"}"
+    },
+    {
+      "suite": "B:SW",
+      "name": "Service Worker controls page after reload",
+      "passed": true,
+      "detail": "controller=True"
+    },
+    {
+      "suite": "B:SW",
+      "name": "SW activate purges legacy caches (v1.5.0-b6 & v1.6.0-b7)",
+      "passed": true,
+      "detail": "keys=['borden-tempest-v1.6.1-b8']"
+    },
+    {
+      "suite": "B:SW",
+      "name": "Static app shell cached in versioned CacheStorage",
+      "passed": true,
+      "detail": "caches=['borden-tempest-v1.6.1-b8'] entries=25"
+    },
+    {
+      "suite": "B:SW",
+      "name": "Regression #41-1: Live NWS/Open-Meteo/IEM/S3/NOAA/RainViewer/tilecache/wms/ridge/alerts/query-geojson/sw.js NEVER cached",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "B:SW",
+      "name": "Offline / 503 live endpoints never serve stale cached 200 OK weather data",
+      "passed": true,
+      "detail": "{\"https://api.weather.gov/alerts/active?point=34.6581,-88.5667\": {\"ok\": false, \"status\": 503}, \"https://api.open-meteo.com/v1/forecast?latitude=34.6581&longitude=-88.5667\": {\"ok\": false, \"status\": 503}, \"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/5/8/12.png\": {\"ok\": false, \"status\": 503}, \"https://unidata-nexrad-level3.s3.amazonaws.com/KGWX/N0B_test.bin\": {\"ok\": false, \"status\": 503}}"
+    },
+    {
+      "suite": "B:SW",
+      "name": "Zero SW/page uncaught exceptions & zero live network leakage",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Clear",
+      "name": "App boots & renders mocked live weather without errors",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Clear",
+      "name": "#data-staleness-banner exists and is HIDDEN on fresh (<15m) feeds",
+      "passed": true,
+      "detail": "{\"exists\": true, \"hiddenAttr\": true, \"hasHiddenClass\": true, \"display\": \"none\", \"visible\": false}"
+    },
+    {
+      "suite": "C1:Viewport:Desktop",
+      "name": "Zero horizontal overflow across all 4 tabs at 1280x800",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile430",
+      "name": "Zero horizontal overflow across all 4 tabs at 430x932",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile430",
+      "name": "Primary mobile touch targets >= 40px at 430x932",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile390",
+      "name": "Zero horizontal overflow across all 4 tabs at 390x844",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile390",
+      "name": "Primary mobile touch targets >= 40px at 390x844",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile375",
+      "name": "Zero horizontal overflow across all 4 tabs at 375x812",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile375",
+      "name": "Primary mobile touch targets >= 40px at 375x812",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:Mobile375",
+      "name": "Regression #41-8: iOS search input >=16px (no auto-zoom) & .btn-glass-* >=44px zero clipping on 375x812",
+      "passed": true,
+      "detail": "{\"inpFont\": 16, \"glassCount\": 1, \"badGlass\": []}"
+    },
+    {
+      "suite": "C1:Viewport:MobileLandscape",
+      "name": "Zero horizontal overflow across all 4 tabs at 844x390",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Viewport:MobileLandscape",
+      "name": "Primary mobile touch targets >= 40px at 844x390",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C1:Clear",
+      "name": "Zero console errors, uncaught exceptions, or live network leaks during full E2E",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C2:Staleness",
+      "name": "Stale Open-Meteo (>15m) renders #data-staleness-banner VISIBLE in live DOM",
+      "passed": true,
+      "detail": "{\"exists\": true, \"visible\": true, \"text\": \"\\u26a0\\n        \\n          Stale Weather Data (>15m)\\n          Stale weather data (>15 min): Open-Meteo (24m old, 11:05 PM CST) \\u2014 verify live radar before acting.\\n        \\n      \\n      Refresh\"}"
+    },
+    {
+      "suite": "C2:Staleness",
+      "name": "Refreshing fresh (<15m) data hides #data-staleness-banner",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C2:Staleness",
+      "name": "Stale NEXRAD radar frame (>15m) renders #data-staleness-banner VISIBLE in live DOM",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C3:Tornado",
+      "name": "Synthetic Tornado Warning fires modal, marks inside-polygon & critical ribbon",
+      "passed": true,
+      "detail": "{\"title\": \"Tornado Warning\", \"badge\": \"OBSERVED / PDS TORNADO\", \"body\": \"YOU ARE INSIDE THE WARNING POLYGON \\u2022 Tornado: OBSERVED \\u2022 Threat: CONSIDERABLE\\n\\nTornado Warning issued for Prentiss County MS until further notice\\n\\nTAKE COVER NOW! Move to an interior room on the lowest floor of a sturdy building.\", \"ribbonCritical\": true, \"badgeCount\": \"1\"}"
+    },
+    {
+      "suite": "C3:Tornado",
+      "name": "Alerts DOM keeps active Tornado Warning and purges expired/superseded warnings",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C3:Tornado",
+      "name": "Tornado Warning fires EXACTLY ONCE across repeated refreshes (no duplicate popup)",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C3:Tornado",
+      "name": "Second distinct CRITICAL warning fires cleanly (not shadow-blocked by #1)",
+      "passed": true,
+      "detail": "{\"title\": \"Tornado Warning\", \"badge\": \"TORNADO EMERGENCY\", \"body\": \"YOU ARE INSIDE THE WARNING POLYGON \\u2022 Tornado: OBSERVED \\u2022 Threat: CATASTROPHIC\\n\\nSECOND Tornado Warning \\u2014 Tornado Emergency for Booneville MS\\n\\nTAKE COVER NOW! Move to an interior room on the lowest floor of a sturdy building.\"}"
+    },
+    {
+      "suite": "C3:Tornado",
+      "name": "Expired Tornado Warning clears immediately from DOM, badge & critical ribbon",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C4:Geolocation",
+      "name": "Graceful home fallback on PERMISSION_DENIED",
+      "passed": true,
+      "detail": "{\"loc\": \"Booneville, MS\", \"toast\": \"Location permission denied \\u2014 using Booneville, MS.\", \"spinning\": false}"
+    },
+    {
+      "suite": "C4:Geolocation",
+      "name": "Graceful home fallback on POSITION_UNAVAILABLE",
+      "passed": true,
+      "detail": "{\"loc\": \"Booneville, MS\", \"toast\": \"GPS position unavailable \\u2014 using Booneville, MS.\", \"spinning\": false}"
+    },
+    {
+      "suite": "C4:Geolocation",
+      "name": "Graceful home fallback on TIMEOUT",
+      "passed": true,
+      "detail": "{\"loc\": \"Booneville, MS\", \"toast\": \"GPS request timed out \\u2014 using Booneville, MS.\", \"spinning\": false}"
+    },
+    {
+      "suite": "C4:Geolocation",
+      "name": "Graceful home fallback on MISSING_GEOLOCATION",
+      "passed": true,
+      "detail": "{\"loc\": \"Booneville, MS\", \"toast\": \"GPS unavailable on this browser \\u2014 using Booneville, MS.\", \"spinning\": false}"
+    },
+    {
+      "suite": "C6:RadarLoop",
+      "name": "Playing radar maintains <= 1 animation interval (no duplicate timers)",
+      "passed": true,
+      "detail": "intervals=1"
+    },
+    {
+      "suite": "C6:RadarLoop",
+      "name": "Background visibilitychange pauses radar animation (0 animation intervals)",
+      "passed": true,
+      "detail": "intervals=0"
+    },
+    {
+      "suite": "C6:RadarLoop",
+      "name": "Foreground visibilitychange resumes cleanly with exactly 1 interval (no zombie timers)",
+      "passed": true,
+      "detail": "intervals=1"
+    },
+    {
+      "suite": "C6:RadarLoop",
+      "name": "iOS Safari BFCache pagehide/pageshow(persisted=true) pauses & resumes with zero zombie intervals",
+      "passed": true,
+      "detail": "hidden_anim=0, resumed_anim=1, total_before=2, total_after=2"
+    },
+    {
+      "suite": "C5:Offline",
+      "name": "Connectivity drop mid-fetch causes zero uncaught exceptions or unhandled rejections",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C5:Offline",
+      "name": "Offline refresh flags OFFLINE cleanly and preserves prior Updated timestamp honestly",
+      "passed": true,
+      "detail": "before='Updated 11:29 PM CST \u2022 Radar KGWX \u2022 v1.6.1' | after='OFFLINE \u2022 Updated 11:29 PM CST \u2022 Radar KGWX \u2022 v1.6.1'"
+    },
+    {
+      "suite": "C5:Slow3G",
+      "name": "App syncs cleanly under 500ms Slow-3G latency on mobile (0 errors, 0 leaks)",
+      "passed": true,
+      "detail": "synced=True, elapsed=6.23s, errs=0, exc=0, leaks=0"
+    },
+    {
+      "suite": "C7:iOSUX",
+      "name": "Regression #41-7: Dismissing Tornado popup cancels pending 1.2s emergency speech briefing timer",
+      "passed": true,
+      "detail": "popup_open=True, speech_count=0"
+    },
+    {
+      "suite": "C7:iOSUX",
+      "name": "Regression #41-7: Keyboard Enter on #location-picker-trigger opens location modal",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C7:iOSUX",
+      "name": "Regression #41-7: switchActiveLocation clears previous location Tornado alerts with zero cross-location bleed",
+      "passed": true,
+      "detail": "search_ready=True, switched_clean=True"
+    },
+    {
+      "suite": "C7:iOSUX",
+      "name": "Regression #41-7: Settings sliders (#set-tot-lead, #set-freeze-slider) stay connected in DOM during iOS touch input",
+      "passed": true,
+      "detail": "{\"found\": true, \"totStillConnected\": true, \"frzStillConnected\": true}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Upgraded Broadcast Obsidian Dashboard renders SVG gauges & telemetry meters with 0 overflow",
+      "passed": true,
+      "detail": "{\"hasHero\": true, \"svgs\": 34, \"meters\": 14, \"overflow\": false}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Radar map initializes cleanly under rich multi-system weather scenario",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Clicking Storm Cell opens #radar-inspect-sheet with dBZ, TVS, Hail/VIL & TOT metadata (0 overflow)",
+      "passed": true,
+      "detail": "{\"title\": \"Storm Cell K4 (KGWX)\", \"sub\": \"Scan 11:28 PM CST \\u2022 5.0 mi SW\", \"body\": \"\\n      Warning (1)WatchMCDSPC OutlookCell K4Point Intel\\n      \\n        TORNADO TVS\\n        TVS: TVS\\n        \\n        Hail 1.75\\\"\\n        \\n      \\n      \\n    \\n    \", \"overflow\": false}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Clicking NWS Tornado Warning opens rich Warning Inspector + >=44px multi-system switcher pills",
+      "passed": true,
+      "detail": "{\"title\": \"Tornado Warning\", \"pillCount\": 6, \"pills\": [{\"sys\": \"alert\", \"text\": \"Warning (1)\", \"w\": 86, \"h\": 44}, {\"sys\": \"watch\", \"text\": \"Watch\", \"w\": 59, \"h\": 44}, {\"sys\": \"mcd\", \"text\": \"MCD\", \"w\": 51, \"h\": 44}, {\"sys\": \"outlook\", \"text\": \"SPC Outlook\", \"w\": 93, \"h\": 44}, {\"sys\": \"cell\", \"text\": \"Cell K4\", \"w\": 63, \"h\": 44}, {\"sys\": \"point\", \"text\": \"Point Intel\", \"w\": 79, \"h\": 44}]}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Multi-system switcher pills cleanly flip between Watch, MCD, SPC Outlook & Point Intel",
+      "passed": true,
+      "detail": "{\"watch\": \"PDS Tornado Watch #412\", \"mcd\": \"SPC Mesoscale Discussion #1984\", \"outlook\": \"SPC Day 1 Categorical \\u2014 MDT (4/5)\", \"point\": \"Radar Point Intelligence\"}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Open-map radar tap opens Point Intel with coordinates, nearest storm cell & synoptic CAPE/Shear",
+      "passed": true,
+      "detail": "{\"title\": \"Radar Point Intelligence\", \"sub\": \"32.500\\u00b0N, 86.000\\u00b0W \\u2022 209.9 mi SE of Booneville, MS\", \"body\": \"\\n      Cell K4Point Intel\\n      Active Weather Systems at This Point\\n      \\u2713 No Active Warnings, Watches, or MCDs Covering This Point\\n\\n      Nearest Tracked Sto\"}"
+    },
+    {
+      "suite": "C8:RadarInspect",
+      "name": "Zero console errors, uncaught exceptions, or live network leaks during radar inspection E2E",
+      "passed": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Tempest QA Adversarial Unit Runner</title>
+</head>
+<body>
+  <div id="radar-map-container" style="width:400px;height:300px;"></div>
+  <div id="radar-legend-bar"></div>
+  <pre id="output">Initializing tests...</pre>
+  <script type="module">
+    import { runAllUnitTests } from './test_framework.js';
+    import './test_data_pipeline.js';
+    import './test_geo_and_alerts.js';
+    import './test_radar_and_sw.js';
+
+    window.__RUN_UNIT_TESTS__ = async () => {
+      const report = await runAllUnitTests();
+      document.getElementById('output').textContent = JSON.stringify(report, null, 2);
+      return report;
+    };
+    window.__UNIT_RUNNER_READY__ = true;
+  </script>
+</body>
+</html>

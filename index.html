@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Tempest</title>
   <meta name="description" content="Tempest (by J. Borden) — Pro Severe Weather Intelligence, High-Res NEXRAD Radar, STP/SCP Hodograph, Storm Cell Time-on-Target, Convective & Winter Suite." />
 
@@ -78,7 +78,19 @@
         <strong id="update-banner-title">Update Available</strong>
         <span id="update-banner-sub">Tap to install the latest Tempest release.</span>
       </div>
-      <button id="btn-install-update" class="btn-update-now">Update</button>
+      <button id="btn-install-update" type="button" class="btn-update-now">Update</button>
+    </div>
+
+    <!-- Data Staleness Warning Banner (Hidden by default; shown when feeds >15m old) -->
+    <div id="data-staleness-banner" class="staleness-banner hidden" role="alert" aria-live="assertive">
+      <div class="staleness-banner-content">
+        <span class="staleness-banner-icon" aria-hidden="true">⚠</span>
+        <div class="staleness-banner-text">
+          <strong id="data-staleness-title">Stale Weather Data</strong>
+          <span id="data-staleness-message">Live radar or forecast feeds are more than 15 minutes old. Tap Refresh to sync.</span>
+        </div>
+      </div>
+      <button id="btn-staleness-refresh" type="button" class="btn-staleness-refresh" aria-label="Refresh weather feeds">Refresh</button>
     </div>
 
     <!-- Main Tab Views -->
@@ -159,9 +171,10 @@
 
         <!-- Radar Layers Popover -->
         <div id="radar-layers-sheet" class="floating-sheet hidden">
+          <div class="sheet-drag-pill" aria-hidden="true"></div>
           <div class="sheet-header">
             <h3>Radar Layers &amp; Style</h3>
-            <button id="btn-close-layers" class="icon-btn-sm">✕</button>
+            <button id="btn-close-layers" type="button" class="icon-btn-sm" aria-label="Close Radar Layers">✕</button>
           </div>
           <div class="sheet-body">
             <label class="toggle-row">
@@ -214,11 +227,15 @@
           </div>
         </div>
 
-        <!-- Radar Inspect Bottom Sheet (Alert or Storm Cell) -->
-        <div id="radar-inspect-sheet" class="floating-sheet hidden">
+        <!-- Radar Inspect Bottom Sheet (Weather Systems & Point Intelligence) -->
+        <div id="radar-inspect-sheet" class="floating-sheet hidden" role="region" aria-label="Weather System Inspector">
+          <div class="sheet-drag-pill" aria-hidden="true"></div>
           <div class="sheet-header">
-            <h3 id="inspect-title">Details</h3>
-            <button id="btn-close-inspect" class="icon-btn-sm">✕</button>
+            <div class="sheet-header-titles">
+              <h3 id="inspect-title">Details</h3>
+              <div id="inspect-sub" class="sheet-header-sub"></div>
+            </div>
+            <button id="btn-close-inspect" type="button" class="icon-btn-sm" aria-label="Close Details">✕</button>
           </div>
           <div id="inspect-body" class="sheet-body"></div>
         </div>
@@ -264,7 +281,7 @@
     <div class="modal-card">
       <div class="sheet-header">
         <h3>Locations</h3>
-        <button id="btn-close-location-modal" class="icon-btn-sm">✕</button>
+        <button id="btn-close-location-modal" type="button" class="icon-btn-sm" aria-label="Close Locations">✕</button>
       </div>
       <div class="modal-search-row">
         <input type="text" id="location-search-input" placeholder="Search city, state, or ZIP..." autocomplete="off" />
@@ -281,7 +298,7 @@
     <div class="modal-card">
       <div class="sheet-header">
         <h3>Select NEXRAD Site</h3>
-        <button id="btn-close-site-modal" class="icon-btn-sm">✕</button>
+        <button id="btn-close-site-modal" type="button" class="icon-btn-sm" aria-label="Close Site Selector">✕</button>
       </div>
       <div class="modal-search-row">
         <input type="text" id="site-search-input" placeholder="Filter by code, city, or state (e.g. KGWX)..." autocomplete="off" />
@@ -298,7 +315,7 @@
           <h3 id="afd-modal-title">NWS Forecast Discussion</h3>
           <div id="afd-modal-sub" class="header-status-sub"></div>
         </div>
-        <button id="btn-close-afd-modal" class="icon-btn-sm">✕</button>
+        <button id="btn-close-afd-modal" type="button" class="icon-btn-sm" aria-label="Close Forecast Discussion">✕</button>
       </div>
       <pre id="afd-modal-text" class="afd-full-pre"></pre>
     </div>

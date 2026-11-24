@@ -1,7 +1,7 @@
 {
-  "versionCode": 7,
-  "versionName": "1.6.0",
+  "versionCode": 8,
+  "versionName": "1.6.1",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-23T01:05:00Z",
-  "releaseNotes": "Tempest v1.6.0 (by J. Borden): Fixes atmospheric convection mislabeling on stable zero-CAPE high-shear days (CAPE & CIN cap gating), plus specular obsidian glass polish and tinted-glass action buttons harmonized with Android v1.5.0."
+  "publishedAt": "2026-11-24T04:45:00Z",
+  "releaseNotes": "Tempest v1.6.1 (by J. Borden): Full production hardening release building on v1.6.0 (CAPE/CIN cap gating & obsidian glass polish) — adds strict network-only live weather/radar SW isolation, bounded retry/backoff + binary NEXRAD validation, America/Chicago UTC conversion + hard >15m staleness alert banner, edge/hole/antimeridian polygon geometry & SPC SCP math fixes, immediate expired/superseded NWS alert purging, zero-leak radar loop background lifecycle, graceful GPS fallback, and 63/63 automated Chromium verification tests."
 }
