@@ -401,32 +401,110 @@ export function resolveCurrentConditions(nwsBundle, openMeteo, nowMs = Date.now(
 }
 
 /**
- * True Upper-Air Convective, Supercell, HSLC & Dixie Alley Nocturnal Readiness Analyzer
- * Uses real 10m -> 850 hPa (~0-1.5km) and 10m -> 500 hPa (~0-6km) vector wind shear from NOAA HRRR/GFS.
+ * True Upper-Air Convective, Supercell, Hail (SHIP), Damaging Wind (QLCS/DCAPE),
+ * HSLC & Dixie Alley Nocturnal Readiness Analyzer.
+ * Uses real 10m -> 925 -> 850 -> 700 -> 500 hPa wind/thermal profiles from NOAA HRRR/GFS
+ * fused with official SPC Day 1 Categorical/Probabilistic Outlooks & Active Watches.
  */
+function parseSpcProbPct(probStr) {
+  const s = String(probStr || '').trim().toUpperCase();
+  if (!s || s === 'NONE') return { pct: 0, sig: false };
+  const m = s.match(/(\d+)/);
+  return { pct: m ? Number(m[1]) : 0, sig: s.includes('SIG') };
+}
+
+function spcCategoryRank(cat) {
+  const map = { NONE: 0, TSTM: 1, MRGL: 2, SLGT: 3, ENH: 4, MDT: 5, HIGH: 6 };
+  return map[String(cat || 'NONE').trim().toUpperCase()] || 0;
+}
+
+function hazardTierMeta(rank, detail) {
+  const tiers = [
+    { tier: 'NONE', label: 'None', color: '#64748b' },
+    { tier: 'LOW', label: 'Low', color: '#38bdf8' },
+    { tier: 'MODERATE', label: 'Moderate', color: '#f59e0b' },
+    { tier: 'HIGH', label: 'High', color: '#f43f5e' },
+    { tier: 'EXTREME', label: 'Extreme', color: '#d946ef' }
+  ];
+  const clamped = Math.max(0, Math.min(4, Math.round(rank)));
+  return { ...tiers[clamped], rank: clamped, detail: detail || tiers[clamped].label };
+}
+
+export function computeMixingRatioGkg(dewpointC, pressureHpa = 1000) {
+  const tdC = toFiniteNumber(dewpointC);
+  if (tdC == null) return 8.0;
+  const pHpa = Math.max(500, Math.min(1060, toFiniteNumber(pressureHpa) ?? 1000));
+  const e = 6.112 * Math.exp((17.67 * tdC) / (tdC + 243.5));
+  const w = (621.97 * e) / Math.max(200, pHpa - e);
+  return Number.isFinite(w) ? Math.max(0, Math.min(35, w)) : 8.0;
+}
+
+/**
+ * Official NOAA/SPC Significant Hail Parameter (SHIP):
+ *   SHIP = (CAPE * mixingRatio_gkg * LR_700_500 * (-T500_C) * min(27, shear06_ms)) / 42,000,000
+ * with official SPC regime modifiers for low CAPE (<1300), weak lapse (<5.8), low moisture (<11 g/kg),
+ * warm 500 hPa (>-5.5 C), or weak deep shear (<7 m/s).
+ * Thresholds: >= 0.5 severe hail (1"+), >= 1.0 significant hail (2"+), >= 2.0 giant hail (2.5"+).
+ */
+export function computeSpcShip({
+  cape = 0,
+  mixingRatioGkg = 0,
+  lapseRate700to500 = 5.8,
+  temp500C = -10,
+  bulkShear0to6Ms = 0
+} = {}) {
+  const c = Math.max(0, toFiniteNumber(cape) ?? 0);
+  const w = Math.max(0, toFiniteNumber(mixingRatioGkg) ?? 0);
+  const lr = Math.max(0, toFiniteNumber(lapseRate700to500) ?? 0);
+  const t500 = toFiniteNumber(temp500C);
+  const shr = Math.max(0, toFiniteNumber(bulkShear0to6Ms) ?? 0);
+  if (c < 100 || shr < 7.0 || t500 == null || t500 >= -5.5 || lr < 4.5 || w < 4.0) {
+    return 0;
+  }
+  const shrEff = Math.min(27.0, shr);
+  let ship = (c * w * lr * (-t500) * shrEff) / 42000000;
+  if (c < 1300) ship *= c / 1300;
+  if (lr < 5.8) ship *= lr / 5.8;
+  if (w < 11.0) ship *= w / 11.0;
+  if (t500 > -8.0) ship *= (-t500) / 8.0;
+  return Number.isFinite(ship) ? Math.round(Math.min(6.0, Math.max(0, ship)) * 10) / 10 : 0;
+}
+
 export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, options = {}) {
   const safeCurrent = current || {};
   const thresholdMode = options.convectiveAlertThreshold || 'STANDARD'; // SENSITIVE | STANDARD | HIGH_ONLY
   const nocturnalEnabled = options.nocturnalReadinessEnabled !== false;
   const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  const multiDaySpc = options.multiDaySpc || null;
 
   const hourly = openMeteo?.hourly || {};
   const hourlyUnits = openMeteo?.hourly_units || {};
   const windUnit = hourlyUnits.wind_speed_10m || hourlyUnits.wind_speed_500hPa || 'mp/h';
+  const gustUnit = hourlyUnits.wind_gusts_10m || windUnit;
   const tempUnit = hourlyUnits.temperature_2m || '°F';
-  const upperTempUnit = hourlyUnits.temperature_700hPa || tempUnit;
-  const idx = findCurrentHourIndex(hourly, nowMs, openMeteo?.utc_offset_seconds ?? 0);
+  const upperTempUnit = hourlyUnits.temperature_700hPa || hourlyUnits.temperature_500hPa || tempUnit;
+  const offsetSec = openMeteo?.utc_offset_seconds ?? 0;
+  const offsetOpts = Number.isFinite(offsetSec) && offsetSec !== 0 ? { utcOffsetSeconds: offsetSec } : {};
+  const idx = findCurrentHourIndex(hourly, nowMs, offsetSec);
 
   const calcAt = (i) => {
     const cape = Math.max(0, toFiniteNumber(hourly.cape?.[i]) ?? 0);
     const cin = toFiniteNumber(hourly.convective_inhibition?.[i]) ?? 0;
     const tempF = convertTempToF(hourly.temperature_2m?.[i], tempUnit) ?? toFiniteNumber(safeCurrent.tempF) ?? 65;
     const dewF = convertTempToF(hourly.dew_point_2m?.[i], hourlyUnits.dew_point_2m || tempUnit) ?? toFiniteNumber(safeCurrent.dewpointF) ?? 50;
+    const sfcPressureHpa = convertPressureToHpa(
+      hourly.surface_pressure?.[i] ?? hourly.pressure_msl?.[i],
+      hourlyUnits.surface_pressure || hourlyUnits.pressure_msl || 'hPa'
+    ) ?? toFiniteNumber(safeCurrent.pressureHpa) ?? 1005;
 
     const w10 = Math.max(0, convertWindToKt(hourly.wind_speed_10m?.[i], hourlyUnits.wind_speed_10m || windUnit)
       ?? mphToKt(toFiniteNumber(safeCurrent.windMph) ?? 0)
       ?? 0);
     const d10 = toFiniteNumber(hourly.wind_direction_10m?.[i]) ?? toFiniteNumber(safeCurrent.windDirDeg) ?? 0;
+    const gustMph = Math.max(
+      0,
+      convertWindToMph(hourly.wind_gusts_10m?.[i], gustUnit) ?? toFiniteNumber(safeCurrent.gustMph) ?? ktToMph(w10) ?? 0
+    );
 
     const w850 = Math.max(0, convertWindToKt(hourly.wind_speed_850hPa?.[i], hourlyUnits.wind_speed_850hPa || windUnit) ?? w10);
     const d850 = toFiniteNumber(hourly.wind_direction_850hPa?.[i]) ?? d10;
@@ -459,6 +537,7 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
     ];
 
     const lowShearKt = vectorShearKt(w10, d10, w850, d850);
+    const shear0to3KmKt = Math.hypot(u700 - u0, v700 - v0);
     const deepShearKt = vectorShearKt(w10, d10, w500, d500);
     const rawVeer = angularDiffDeg(d10, d850);
     const veer850 = Number.isFinite(rawVeer) ? rawVeer : 0;
@@ -493,26 +572,30 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
       [u700 * KT_TO_MS, v700 * KT_TO_MS]
     ], cx, cy));
 
-    // Espy LCL height (m) & 700-500 hPa lapse rate (°C/km)
+    // Espy LCL height (m), surface mixing ratio (g/kg), & 700-500 hPa lapse rate (°C/km)
     const tempC = fToC(tempF) ?? 18.3;
     const dewC = fToC(dewF) ?? 10.0;
-    const lclMeters = Math.max(50, Math.min(5000, Math.round(125 * Math.max(0, tempC - dewC))));
+    const dewDepC = Math.max(0, tempC - dewC);
+    const lclMeters = Math.max(50, Math.min(5000, Math.round(125 * dewDepC)));
+    const mixingRatioGkg = computeMixingRatioGkg(dewC, sfcPressureHpa);
 
     const t700Raw = toFiniteNumber(hourly.temperature_700hPa?.[i]);
     const t500Raw = toFiniteNumber(hourly.temperature_500hPa?.[i]);
     const h700 = toFiniteNumber(hourly.geopotential_height_700hPa?.[i]);
     const h500 = toFiniteNumber(hourly.geopotential_height_500hPa?.[i]);
+    const t500C = t500Raw != null
+      ? (normalizeUnitCode(hourlyUnits.temperature_500hPa || upperTempUnit).includes('c') ? t500Raw : fToC(t500Raw))
+      : null;
     let lapseRate700to500 = 5.8;
-    if (t700Raw != null && t500Raw != null && h700 != null && h500 != null && (h500 - h700) > 500) {
+    if (t700Raw != null && t500C != null && h700 != null && h500 != null && (h500 - h700) > 500) {
       const t700C = normalizeUnitCode(upperTempUnit).includes('c') ? t700Raw : fToC(t700Raw);
-      const t500C = normalizeUnitCode(upperTempUnit).includes('c') ? t500Raw : fToC(t500Raw);
       const lr = (t700C - t500C) / ((h500 - h700) / 1000);
       if (Number.isFinite(lr)) {
         lapseRate700to500 = Math.round(Math.max(-5, Math.min(15, lr)) * 10) / 10;
       }
     }
 
-    // Official SPC Fixed-Layer Significant Tornado Parameter (STP) & Supercell Composite Parameter (SCP)
+    // Official SPC Fixed-Layer Significant Tornado Parameter (STP), Supercell Composite (SCP), & Significant Hail Parameter (SHIP)
     const bulkShearMs = deepShearKt * KT_TO_MS;
     const lclTerm = lclMeters > 2000 ? 0 : lclMeters < 1000 ? 1 : (2000 - lclMeters) / 1000;
     const stpShearTerm = bulkShearMs < 12.5 ? 0 : bulkShearMs > 30 ? 1.5 : bulkShearMs / 20;
@@ -521,34 +604,84 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
     const cinTerm = cinAbs >= 200 ? 0 : cinAbs <= 50 ? 1 : (200 - cinAbs) / 150;
     const stp = Math.round(Math.min(12, Math.max(0, (cape / 1500) * lclTerm * (srh0to1 / 150) * stpShearTerm * cinTerm)) * 10) / 10;
     const scp = Math.round(Math.min(25, Math.max(0, (cape / 1000) * (srh0to3 / 50) * scpShearTerm)) * 10) / 10;
+    const ship = computeSpcShip({
+      cape,
+      mixingRatioGkg,
+      lapseRate700to500,
+      temp500C: t500C ?? -10,
+      bulkShear0to6Ms: bulkShearMs
+    });
+
+    // Evaporative / Downburst Wind Index (DCAPE proxy in J/kg) — elevated in steep-lapse/inverted-V convective regimes
+    const dcapeProxy = cape >= 200
+      ? Math.round(Math.max(0, Math.min(1800, dewDepC * 45 + Math.max(0, lapseRate700to500 - 5.5) * 220 + Math.min(500, cape * 0.25))))
+      : 0;
+
+    const slotMs = parseUtcTimestampMs(hourly.time?.[i], offsetOpts) ?? (nowMs + Math.max(0, i - idx) * 3600000);
+    const compositeRank = stp * 3.0 + scp * 0.65 + ship * 1.6 + (cape >= 200 ? (shear0to3KmKt >= 35 ? 1.2 : 0) : 0);
 
     return {
-      cape, cin, lowShearKt, deepShearKt, veer850,
-      srh0to1, srh0to3, lclMeters, lapseRate700to500, stp, scp,
+      slotMs,
+      cape, cin, dewF, lowShearKt, shear0to3KmKt, deepShearKt, veer850, gustMph,
+      srh0to1, srh0to3, lclMeters, lapseRate700to500, temp500C: t500C, mixingRatioGkg,
+      stp, scp, ship, dcapeProxy, compositeRank,
       bunkersHeadingDeg, bunkersSpeedKt, hodographPoints
     };
   };
 
   const nowSample = calcAt(idx);
   const window12 = [];
-  for (let i = idx; i < Math.min(idx + 12, (hourly.time || []).length); i++) {
+  const totalSlots = Array.isArray(hourly.time) ? hourly.time.length : 0;
+  for (let i = idx; i < Math.min(idx + 12, totalSlots); i++) {
     window12.push(calcAt(i));
   }
+  const samples = window12.length ? window12 : [nowSample];
 
-  const peakCape12h = window12.length ? Math.max(...window12.map((s) => s.cape)) : nowSample.cape;
-  const peakLowLevelShearKt = Math.round(window12.length ? Math.max(...window12.map((s) => s.lowShearKt)) : nowSample.lowShearKt);
-  const peakBulkShearKt = Math.round(window12.length ? Math.max(...window12.map((s) => s.deepShearKt)) : nowSample.deepShearKt);
+  const peakCape12h = Math.max(...samples.map((s) => s.cape));
+  const peakLowLevelShearKt = Math.round(Math.max(...samples.map((s) => s.lowShearKt)));
+  const peakShear0to3KmKt = Math.round(Math.max(...samples.map((s) => s.shear0to3KmKt)));
+  const peakBulkShearKt = Math.round(Math.max(...samples.map((s) => s.deepShearKt)));
+  const peakStp12h = Number(Math.max(...samples.map((s) => s.stp)).toFixed(1));
+  const peakScp12h = Number(Math.max(...samples.map((s) => s.scp)).toFixed(1));
+  const peakShip12h = Number(Math.max(...samples.map((s) => s.ship)).toFixed(1));
+  const peakSrh0to1_12h = Math.round(Math.max(...samples.map((s) => s.srh0to1)));
+  const peakSrh0to3_12h = Math.round(Math.max(...samples.map((s) => s.srh0to3)));
+  const peakDcape12h = Math.round(Math.max(...samples.map((s) => s.dcapeProxy)));
+  const peakWindGust12hMph = Math.round(Math.max(...samples.map((s) => s.gustMph)));
+  const peakLapse12h = Number(Math.max(...samples.map((s) => s.lapseRate700to500)).toFixed(1));
+  const peakDew12h = Math.round(Math.max(...samples.map((s) => s.dewF)));
+
+  let peakSlot = samples[0];
+  for (const s of samples) {
+    if (s.compositeRank > peakSlot.compositeRank) peakSlot = s;
+  }
+  const peakThreatTimeLabel = (peakSlot.compositeRank >= 0.8 || peakCape12h >= 250)
+    ? formatWinterClock(peakSlot.slotMs, true)
+    : 'Quiet next 12h';
 
   const lowLevelShearKt = Math.round(nowSample.lowShearKt);
+  const shear0to3KmKt = Math.round(nowSample.shear0to3KmKt);
   const bulkShear0to6KmKt = Math.round(nowSample.deepShearKt);
   const veeringDeg = Math.round(nowSample.veer850);
   const cinNow = Math.round(nowSample.cin);
 
-  const dewF = toFiniteNumber(safeCurrent.dewpointF) ?? 45;
+  const dewF = toFiniteNumber(safeCurrent.dewpointF) ?? Math.round(nowSample.dewF) ?? 45;
+  const effDewF = Math.max(dewF, peakDew12h);
   const pTrend = toFiniteNumber(safeCurrent.pressureTrend3h) ?? 0;
   const activeMcdCount = Math.max(0, Math.floor(toFiniteNumber(mcdCount) ?? 0));
 
-  const hasInstability = peakCape12h >= 100 || activeMcdCount > 0;
+  // Official SPC Day 1 Outlook & Active Watch Integration
+  const spcDay1Cat = String(multiDaySpc?.day1Category || 'NONE').toUpperCase();
+  const spcRank = spcCategoryRank(spcDay1Cat);
+  const spcTor = parseSpcProbPct(multiDaySpc?.day1TornadoProb);
+  const spcHail = parseSpcProbPct(multiDaySpc?.day1HailProb);
+  const spcWind = parseSpcProbPct(multiDaySpc?.day1WindProb);
+  const activeWatches = Array.isArray(multiDaySpc?.activeWatches) ? multiDaySpc.activeWatches : [];
+  const hasTorWatch = activeWatches.some((w) => String(w?.type || '').includes('TOR'));
+  const hasPdsTorWatch = activeWatches.some((w) => String(w?.type || '').includes('TOR') && w?.isPds);
+  const hasSvrWatch = activeWatches.some((w) => String(w?.type || '').includes('SVR') || String(w?.type || '').includes('SEV'));
+
+  const hasInstability = peakCape12h >= 100 || activeMcdCount > 0 || spcRank >= 2 || hasTorWatch || hasSvrWatch;
 
   let score = 0;
   // Instability (CAPE)
@@ -563,14 +696,14 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
     else if (peakBulkShearKt >= 25) score += 1;
 
     // Low-level tornado shear & veering (0-1.5 km: 10m -> 850 hPa)
-    if (peakLowLevelShearKt >= 30 && veeringDeg >= 20) score += 3;
-    else if (peakLowLevelShearKt >= 22 && veeringDeg >= 10) score += 2;
+    if (peakLowLevelShearKt >= 30 && (veeringDeg >= 20 || peakSrh0to1_12h >= 200)) score += 3;
+    else if (peakLowLevelShearKt >= 22 && (veeringDeg >= 10 || peakSrh0to1_12h >= 120)) score += 2;
     else if (peakLowLevelShearKt >= 16) score += 1;
   }
 
   // Low-level moisture (Dewpoint)
-  if (dewF >= 64) score += 2;
-  else if (dewF >= 58) score += 1;
+  if (effDewF >= 64) score += 2;
+  else if (effDewF >= 58) score += 1;
 
   // Synoptic forcing (3-hr MSLP fall) — gated on instability for convective scoring
   if (hasInstability) {
@@ -579,8 +712,14 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
   }
 
   if (activeMcdCount > 0) score += 2;
+  // Official SPC composite & outlook boosts
+  if (peakStp12h >= 3.0 || peakShip12h >= 1.5) score += 2;
+  else if (peakStp12h >= 1.0 || peakScp12h >= 4.0 || peakShip12h >= 1.0) score += 1;
+  if (spcRank >= 5 || hasTorWatch) score += 3;
+  else if (spcRank >= 4 || hasSvrWatch) score += 2;
+  else if (spcRank >= 3) score += 1;
 
-  if (Math.abs(cinNow) >= 200 && activeMcdCount === 0) {
+  if (Math.abs(cinNow) >= 200 && activeMcdCount === 0 && !hasTorWatch && !hasSvrWatch && peakStp12h < 1.0) {
     score = Math.round(score * 0.6);
   }
 
@@ -590,22 +729,86 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
 
   // High-Shear, Low-CAPE (Dixie Alley classic) signature
   const isHslc = hasInstability && peakCape12h >= 100 && peakCape12h <= 750 &&
-    peakLowLevelShearKt >= 25 && peakBulkShearKt >= 35 && dewF >= 58;
+    peakLowLevelShearKt >= 25 && peakBulkShearKt >= 35 && effDewF >= 58;
 
   // Strong moisture + shear + CAPE supercell setup
-  const isSupercellSetup = hasInstability && peakCape12h >= 500 && peakBulkShearKt >= 35 && peakLowLevelShearKt >= 20 && dewF >= 58;
+  const isSupercellSetup = hasInstability && (
+    (peakCape12h >= 500 && peakBulkShearKt >= 35 && peakLowLevelShearKt >= 20 && effDewF >= 58) ||
+    peakScp12h >= 3.0 ||
+    peakStp12h >= 1.0
+  );
+
+  // Individual 3-Hazard Severe Risk Classification (Tornado, Large Hail, Damaging Wind)
+  let torRank = 0;
+  let torDetail = 'Stable / low helicity';
+  if (hasPdsTorWatch || peakStp12h >= 4.0 || (spcTor.pct >= 15 && spcTor.sig)) {
+    torRank = 4;
+    torDetail = hasPdsTorWatch ? 'PDS Tornado Watch Active' : `Peak STP ${peakStp12h} · 0–1km SRH ${peakSrh0to1_12h}`;
+  } else if (hasTorWatch || peakStp12h >= 1.5 || spcTor.pct >= 10 || (isHslc && peakSrh0to1_12h >= 250)) {
+    torRank = 3;
+    torDetail = hasTorWatch ? 'Tornado Watch Active' : `Peak STP ${peakStp12h} · SRH ${peakSrh0to1_12h} m²/s²`;
+  } else if (peakStp12h >= 0.5 || isHslc || spcTor.pct >= 5 || (hasInstability && peakSrh0to1_12h >= 150 && peakBulkShearKt >= 35)) {
+    torRank = 2;
+    torDetail = isHslc ? `HSLC QLCS/spin-up (${peakSrh0to1_12h} SRH)` : `STP ${peakStp12h} · LCL ${nowSample.lclMeters}m`;
+  } else if (spcTor.pct >= 2 || (hasInstability && peakSrh0to1_12h >= 100 && peakCape12h >= 250)) {
+    torRank = 1;
+    torDetail = spcTor.pct >= 2 ? `SPC ${multiDaySpc.day1TornadoProb} Tornado` : `Isolated rotation (${peakSrh0to1_12h} SRH)`;
+  }
+
+  let hailRank = 0;
+  let hailDetail = 'Insufficient CAPE / mid-level lapse';
+  if (peakShip12h >= 2.0 || (spcHail.pct >= 30 && spcHail.sig)) {
+    hailRank = 4;
+    hailDetail = `Giant Hail 2.5"+ risk (SHIP ${peakShip12h})`;
+  } else if (peakShip12h >= 1.0 || spcHail.pct >= 15 || (spcHail.pct >= 15 && spcHail.sig)) {
+    hailRank = 3;
+    hailDetail = `Sig Hail 2"+ risk (SHIP ${peakShip12h} · LR ${peakLapse12h}°/km)`;
+  } else if (peakShip12h >= 0.5 || spcHail.pct >= 5 || (peakCape12h >= 1200 && peakLapse12h >= 6.8 && peakBulkShearKt >= 30)) {
+    hailRank = 2;
+    hailDetail = `Severe Hail 1"+ (SHIP ${peakShip12h} · CAPE ${Math.round(peakCape12h)})`;
+  } else if (peakCape12h >= 400 && peakLapse12h >= 6.2) {
+    hailRank = 1;
+    hailDetail = `Small/sub-severe hail (CAPE ${Math.round(peakCape12h)})`;
+  }
+
+  let windRank = 0;
+  let windDetail = 'No damaging convective wind risk';
+  const hasConvectiveWindPotential = hasInstability && (peakCape12h >= 200 || hasSvrWatch || hasTorWatch || spcWind.pct >= 5);
+  if ((spcWind.pct >= 30 && spcWind.sig) || peakWindGust12hMph >= 75 || (hasConvectiveWindPotential && peakShear0to3KmKt >= 45 && peakDcape12h >= 1000)) {
+    windRank = 4;
+    windDetail = `Destructive 75+ mph / Derecho (0–3km ${peakShear0to3KmKt} kt)`;
+  } else if (hasSvrWatch || spcWind.pct >= 15 || peakWindGust12hMph >= 58 || (hasConvectiveWindPotential && peakShear0to3KmKt >= 35 && (peakDcape12h >= 800 || peakCape12h >= 1000))) {
+    windRank = 3;
+    windDetail = `Damaging 60+ mph QLCS/Bow (0–3km ${peakShear0to3KmKt} kt · DCAPE ~${peakDcape12h})`;
+  } else if (spcWind.pct >= 5 || (hasConvectiveWindPotential && (peakShear0to3KmKt >= 30 || peakDcape12h >= 700 || peakWindGust12hMph >= 45))) {
+    windRank = 2;
+    windDetail = `Gusty 50–60 mph (0–3km ${peakShear0to3KmKt} kt · Gust ${peakWindGust12hMph} mph)`;
+  } else if (hasConvectiveWindPotential && (peakBulkShearKt >= 25 || peakWindGust12hMph >= 35)) {
+    windRank = 1;
+    windDetail = `Isolated strong gusts (~${peakWindGust12hMph} mph)`;
+  }
+
+  const hazards = {
+    tornado: hazardTierMeta(torRank, torDetail),
+    hail: hazardTierMeta(hailRank, hailDetail),
+    wind: hazardTierMeta(windRank, windDetail)
+  };
+  const maxHazardRank = Math.max(torRank, hailRank, windRank);
 
   let regime = 'Quiet / Stable';
   let level = 'low';
 
   if (hasInstability) {
-    if (score >= 9 || (isSupercellSetup && score >= 8)) {
+    if (hasPdsTorWatch || spcRank >= 5 || score >= 11 || peakStp12h >= 3.0) {
+      regime = 'High-End Severe / Outbreak';
+      level = 'high';
+    } else if (hasTorWatch || hasSvrWatch || spcRank >= 4 || score >= 9 || (isSupercellSetup && score >= 8) || maxHazardRank >= 3) {
       regime = isHslc ? 'HSLC Rotating Threat' : 'Supercell Favorable';
       level = 'high';
-    } else if (score >= 6 || isHslc) {
+    } else if (spcRank >= 3 || score >= 6 || isHslc || maxHazardRank >= 2) {
       regime = isHslc ? 'HSLC Watchful (Shear-Driven)' : 'Elevated Convective';
       level = 'mod';
-    } else if (score >= 4 && peakCape12h >= 150) {
+    } else if (spcRank >= 2 || (score >= 4 && peakCape12h >= 150)) {
       regime = 'Marginal Convective';
       level = 'mod';
     }
@@ -613,14 +816,18 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
 
   const hourLocal = getCentralHour24(nowMs, options.timeZone || DEFAULT_TIME_ZONE) ?? new Date(nowMs).getUTCHours();
   const isEveningOrNight = hourLocal >= 17 || hourLocal <= 6;
-  const nocturnalEscalated = hasInstability && nocturnalEnabled && isEveningOrNight && (level === 'high' || (level === 'mod' && (isHslc || peakLowLevelShearKt >= 25)));
+  const nocturnalEscalated = hasInstability && nocturnalEnabled && isEveningOrNight && (level === 'high' || (level === 'mod' && (isHslc || peakLowLevelShearKt >= 25 || torRank >= 2)));
+
+  const spcTag = spcRank >= 2 ? `SPC Day 1 ${spcDay1Cat}` : null;
+  const watchTag = hasPdsTorWatch ? 'PDS TORNADO WATCH' : hasTorWatch ? 'TORNADO WATCH' : hasSvrWatch ? 'SEVERE T-STORM WATCH' : null;
+  const prefixTag = [watchTag, spcTag].filter(Boolean).join(' · ');
 
   const nocturnalRisk = nocturnalEscalated
-    ? 'NOCTURNAL READINESS: Elevated overnight shear/convective setup — keep Borden Tempest open & screen awake.'
+    ? `${prefixTag ? `${prefixTag}: ` : ''}NOCTURNAL READINESS — Elevated overnight shear/convective setup (Peak ${peakThreatTimeLabel}); keep Borden Tempest open & screen awake.`
     : level === 'high'
-      ? 'High convective & rotating storm potential — monitor radar closely.'
+      ? `${prefixTag ? `${prefixTag}: ` : ''}High convective & rotating storm potential (Peak ${peakThreatTimeLabel}) — monitor radar closely.`
       : level === 'mod'
-        ? 'Marginal/elevated shear or instability developing — stay weather aware.'
+        ? `${prefixTag ? `${prefixTag}: ` : ''}Marginal/elevated shear or instability developing (Peak ${peakThreatTimeLabel}) — stay weather aware.`
         : peakBulkShearKt >= 35
           ? `Strong shear aloft (${bulkShear0to6KmKt} kt), but air mass is stable (CAPE ${Math.round(peakCape12h)}) — non-convective.`
           : 'No nocturnal severe-weather readiness escalation needed.';
@@ -636,7 +843,7 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
     proactiveAlerts.push({
       id: `convective_${level}_${isHslc ? 'hslc' : 'std'}_${nocturnalEscalated ? 'night' : 'day'}`,
       title: nocturnalEscalated ? `Nocturnal ${regime}` : `${regime} Environment`,
-      summary: `0–6km Shear ${bulkShear0to6KmKt} kt (peak ${peakBulkShearKt} kt) • 0–1.5km Shear ${lowLevelShearKt} kt (${veeringDeg >= 0 ? '+' : ''}${veeringDeg}° veer) • CAPE ${Math.round(peakCape12h)} J/kg • Td ${dewF}°F • Pressure ${pTrend >= 0 ? '+' : ''}${pTrend} hPa/3hr`,
+      summary: `Peak ${peakThreatTimeLabel} • STP ${peakStp12h} • SCP ${peakScp12h} • SHIP ${peakShip12h} • 0–6km ${peakBulkShearKt} kt • 0–3km ${peakShear0to3KmKt} kt • CAPE ${Math.round(peakCape12h)} J/kg • Tor: ${hazards.tornado.label} / Hail: ${hazards.hail.label} / Wind: ${hazards.wind.label}`,
       level
     });
   }
@@ -645,18 +852,32 @@ export function analyzeEnvironment(openMeteo, current = {}, mcdCount = 0, option
     regime,
     level,
     score,
+    spcCategory: spcDay1Cat,
     capeNow: Math.round(nowSample.cape),
     peakCape12h: Math.round(peakCape12h),
     cinNow,
     lowLevelShearKt,
     peakLowLevelShearKt,
+    shear0to3KmKt,
+    peakShear0to3KmKt,
     bulkShear0to6KmKt,
     peakBulkShearKt,
     veeringDeg,
     srh0to1Km: Math.round(nowSample.srh0to1),
+    peakSrh0to1_12h,
     srh0to3Km: Math.round(nowSample.srh0to3),
+    peakSrh0to3_12h,
     stp: nowSample.stp,
+    peakStp12h,
     scp: nowSample.scp,
+    peakScp12h,
+    ship: nowSample.ship,
+    peakShip12h,
+    dcapeProxy: nowSample.dcapeProxy,
+    peakDcape12h,
+    peakWindGust12hMph,
+    peakThreatTimeLabel,
+    hazards,
     lclMeters: nowSample.lclMeters,
     lapseRate700to500: nowSample.lapseRate700to500,
     bunkersHeadingDeg: nowSample.bunkersHeadingDeg,
@@ -763,6 +984,20 @@ export function dynamicSlrForTempF(tempF) {
   if (tf >= 26) return 10;
   if (tf >= 18) return 13;
   return 16;
+}
+
+/**
+ * Official NWS / Kuchera (2004) Dynamic Snow-to-Liquid Ratio (SLR) from lower-tropospheric Tmax.
+ * Above 28°F: SLR = 12 + 2*(28 - TmaxF) (wet heavy slush drops to 4:1 near 32–34°F).
+ * At/below 28°F: SLR = 12 + (28 - TmaxF) (dry powdery snow up to 20:1 in arctic air).
+ */
+export function kucheraSlrForProfile(airTempF, temp925F = null, temp850F = null, temp700F = null) {
+  const vals = [airTempF, temp925F, temp850F, temp700F]
+    .map((v) => toFiniteNumber(v))
+    .filter((v) => v != null);
+  const tMaxF = vals.length ? Math.max(...vals) : (toFiniteNumber(airTempF) ?? 30);
+  const raw = tMaxF > 28.0 ? 12.0 + 2.0 * (28.0 - tMaxF) : 12.0 + (28.0 - tMaxF);
+  return Math.max(4, Math.min(20, Math.round(raw)));
 }
 
 const PTYPE_META = {
@@ -1219,7 +1454,8 @@ export function analyzeWinterSuite(
   const airF = toFiniteNumber(safeCurrent.tempF) ?? 50;
   const visMi = Math.max(0, toFiniteNumber(safeCurrent.visibilityMi) ?? 10);
 
-  // 72h thermal column & P-type trajectory
+  // 72h thermal column, P-type trajectory & Surface Energy-Balance Snow-Sticking Physics
+  const hasNwsGrid = Boolean(extras?.gridData && typeof extras.gridData === 'object');
   const nwsGrid = parseNwsGridWinter(extras?.gridData || null, refNowMs);
   const totalAvailable = Math.max(
     times.length,
@@ -1236,11 +1472,26 @@ export function analyzeWinterSuite(
   let maxSnowDepthIn = 0;
   let maxSnowRateHr = 0;
   let minSoil0cmWintryF = null;
+  let minSoil6cmWintryF = null;
   let minAirWintry = null;
+  let minWetBulbWintryF = null;
+  let rainDuringSnowIn = 0;
+  let peakSolarDuringSnowWm2 = 0;
   let anySlotWintry = false;
   let minTemp72hF = null;
   let minWindChill72hF = nwsGrid.minWindChill72hF;
   let hoursSubFreeze72h = 0;
+  let slrWeightedSum = 0;
+  let slrWeightTotal = 0;
+
+  // Continuous hourly snowpack depth balance (Grass/Elevated vs. Paved Roads/Asphalt)
+  let grassPackIn = 0;
+  let roadPackIn = 0;
+  let peakGrass24 = 0;
+  let peakGrass72 = 0;
+  let peakRoad24 = 0;
+  let peakRoad72 = 0;
+
   let thermalProfile = {
     airTempF: airF,
     wetBulbF: computeWetBulbF(airF, toFiniteNumber(safeCurrent.humidity) ?? 75),
@@ -1270,7 +1521,13 @@ export function analyzeWinterSuite(
     const s0 = convertTempToF(hourly.soil_temperature_0cm?.[i], soil0Unit);
     const s6 = convertTempToF(hourly.soil_temperature_6cm?.[i], soil6Unit);
     const precipIn = Math.max(0, convertPrecipToInches(hourly.precipitation?.[i], precipUnit));
+    const rainRaw = Math.max(0, convertPrecipToInches(hourly.rain?.[i], hourlyUnits.rain || precipUnit));
+    const showersRaw = Math.max(0, convertPrecipToInches(hourly.showers?.[i], hourlyUnits.showers || precipUnit));
+    const rainIn = Math.max(rainRaw + showersRaw, 0);
     const snowRawIn = Math.max(0, convertSnowfallToInches(hourly.snowfall?.[i], snowUnit));
+    const swRad = Math.max(0, toFiniteNumber(hourly.shortwave_radiation?.[i]) ?? 0);
+    const isDayVal = toFiniteNumber(hourly.is_day?.[i]);
+    const isDay = isDayVal != null ? isDayVal >= 0.5 : swRad >= 15;
     const slotWmo = Math.trunc(toFiniteNumber(hourly.weather_code?.[i]) ?? 0);
     const priorLiquid8hIn = liquidRing.reduce((a, b) => a + b, 0);
 
@@ -1288,10 +1545,60 @@ export function analyzeWinterSuite(
       groundFreezeThresholdF: freezeThreshF
     });
     const iceIn = computeHourlyIceAccretion(pType, t2m, precipIn);
+    const slotSlr = kucheraSlrForProfile(t2m, t925, t850, t700);
     let slotSnowIn = 0;
-    if (pType === 'SNOW') slotSnowIn = snowRawIn > 0 ? snowRawIn : precipIn * dynamicSlrForTempF(t2m);
+    if (pType === 'SNOW') slotSnowIn = snowRawIn > 0 ? snowRawIn : precipIn * slotSlr;
     else if (pType === 'WINTRY_MIX') slotSnowIn = snowRawIn;
     if (slotSnowIn > maxSnowRateHr) maxSnowRateHr = slotSnowIn;
+    if (slotSnowIn > 0) {
+      slrWeightedSum += slotSlr * slotSnowIn;
+      slrWeightTotal += slotSnowIn;
+      rainDuringSnowIn += rainIn;
+      if (swRad > peakSolarDuringSnowWm2) peakSolarDuringSnowWm2 = swRad;
+    }
+
+    // Surface Energy-Balance Snow-Sticking Physics (Grass vs. Pavement/Roads)
+    const effSoil0 = s0 != null && Number.isFinite(s0) ? s0 : (t2m + 1.5);
+    const effSoil6 = s6 != null && Number.isFinite(s6) ? s6 : (effSoil0 + 1.5);
+    const effRainIn = rainIn > 0 ? rainIn : (pType === 'COLD_RAIN' ? precipIn : 0);
+
+    let baseStickEff;
+    if (twF <= 31.0) baseStickEff = 1.0;
+    else if (twF <= 32.0) baseStickEff = 0.85;
+    else if (twF <= 33.0) baseStickEff = slotSnowIn >= 1.0 ? 0.72 : 0.45;
+    else if (twF <= 34.0) baseStickEff = slotSnowIn >= 1.0 ? 0.42 : 0.14;
+    else baseStickEff = (slotSnowIn >= 1.2 && t2m < 35.5) ? 0.18 : 0.03;
+
+    const rainFactorRoad = effRainIn >= 0.005 ? Math.max(0.0, 1.0 - effRainIn / 0.020) : 1.0;
+    const rainFactorGrass = effRainIn >= 0.005 ? Math.max(0.10, 1.0 - effRainIn / 0.045) : 1.0;
+    const rateCoolFactor = (slotSnowIn >= 1.0 && twF <= 33.2 && effRainIn < 0.015) ? 0.55 : 1.0;
+
+    // Effective road (asphalt conducts 6cm soil heat + absorbs solar radiation) vs. grass surface temps
+    const tRoad = 0.50 * effSoil0 + 0.30 * effSoil6 + 0.20 * t2m + (isDay ? swRad / 85.0 : 0.0);
+    const tGrass = 0.42 * effSoil0 + 0.13 * effSoil6 + 0.45 * twF + (isDay ? swRad / 220.0 : 0.0);
+
+    const roadMelt =
+      Math.max(0.0, (tRoad - 32.0) * 0.13) * rateCoolFactor +
+      (isDay ? swRad / 650.0 : 0.0) +
+      (effRainIn > 0.002 ? effRainIn * (Math.max(0.0, t2m - 32.0) * 0.5 + 4.0) : 0.0);
+    const grassMelt =
+      Math.max(0.0, (tGrass - 32.0) * 0.085) * rateCoolFactor +
+      (isDay ? swRad / 1350.0 : 0.0) +
+      (effRainIn > 0.002 ? effRainIn * (Math.max(0.0, t2m - 32.0) * 0.35 + 2.5) : 0.0);
+
+    const settle = t2m > 30.0 ? 0.97 : 0.995;
+    const warmRoadPenalty = (effSoil0 > 34.0 && twF > 32.2) ? 0.5 : 1.0;
+    const addedGrass = slotSnowIn * baseStickEff * rainFactorGrass;
+    const addedRoad = slotSnowIn * baseStickEff * rainFactorRoad * warmRoadPenalty;
+
+    grassPackIn = Math.max(0.0, grassPackIn * settle + addedGrass - grassMelt);
+    roadPackIn = Math.max(0.0, roadPackIn * settle + addedRoad - roadMelt);
+    if (relHr < 24) {
+      if (grassPackIn > peakGrass24) peakGrass24 = grassPackIn;
+      if (roadPackIn > peakRoad24) peakRoad24 = roadPackIn;
+    }
+    if (grassPackIn > peakGrass72) peakGrass72 = grassPackIn;
+    if (roadPackIn > peakRoad72) peakRoad72 = roadPackIn;
 
     liquidRing[liquidPtr % 8] = (pType === 'COLD_RAIN' || pType === 'CLEAR' || pType === 'FREEZING_RAIN' || pType === 'WINTRY_MIX' || pType === 'SLEET') ? precipIn : 0;
     liquidPtr++;
@@ -1302,8 +1609,14 @@ export function analyzeWinterSuite(
       if (s0 != null && Number.isFinite(s0) && (minSoil0cmWintryF == null || s0 < minSoil0cmWintryF)) {
         minSoil0cmWintryF = Number(s0.toFixed(1));
       }
+      if (s6 != null && Number.isFinite(s6) && (minSoil6cmWintryF == null || s6 < minSoil6cmWintryF)) {
+        minSoil6cmWintryF = Number(s6.toFixed(1));
+      }
       if (Number.isFinite(t2m) && (minAirWintry == null || t2m < minAirWintry)) {
         minAirWintry = Number(t2m.toFixed(1));
+      }
+      if (Number.isFinite(twF) && (minWetBulbWintryF == null || twF < minWetBulbWintryF)) {
+        minWetBulbWintryF = Number(twF.toFixed(1));
       }
     }
     hourlySlots.push({
@@ -1320,7 +1633,9 @@ export function analyzeWinterSuite(
       precipIn: Number(precipIn.toFixed(3)),
       snowIn: Number(slotSnowIn.toFixed(2)),
       iceIn: Number(iceIn.toFixed(3)),
-      soil0cmF: s0 != null ? Number(s0.toFixed(1)) : null
+      soil0cmF: s0 != null ? Number(s0.toFixed(1)) : null,
+      grassDepthIn: Number(grassPackIn.toFixed(2)),
+      roadDepthIn: Number(roadPackIn.toFixed(2))
     });
 
     if (relHr < 24) {
@@ -1376,8 +1691,14 @@ export function analyzeWinterSuite(
   if (minSoil0cmWintryF == null && thermalProfile.ground0cmF != null && Number.isFinite(thermalProfile.ground0cmF)) {
     minSoil0cmWintryF = Number(thermalProfile.ground0cmF.toFixed(1));
   }
+  if (minSoil6cmWintryF == null && thermalProfile.ground6cmF != null && Number.isFinite(thermalProfile.ground6cmF)) {
+    minSoil6cmWintryF = Number(thermalProfile.ground6cmF.toFixed(1));
+  }
   if (minAirWintry == null && minTemp72hF != null && Number.isFinite(minTemp72hF)) {
     minAirWintry = Number(minTemp72hF.toFixed(1));
+  }
+  if (minWetBulbWintryF == null && thermalProfile.wetBulbF != null && Number.isFinite(thermalProfile.wetBulbF)) {
+    minWetBulbWintryF = Number(thermalProfile.wetBulbF.toFixed(1));
   }
 
   const finalSnow24 = Number(Math.max(omSnow24, nwsGrid.snow24hIn).toFixed(1));
@@ -1385,16 +1706,46 @@ export function analyzeWinterSuite(
   const finalIce24 = Number(Math.max(omIce24, nwsGrid.ice24hIn).toFixed(2));
   const finalIce72 = Number(Math.max(omIce72, nwsGrid.ice72hIn).toFixed(2));
 
+  // Cross-calibrate sticking accumulation against Official NWS Grid Data
+  // If NWS explicitly forecasts accumulating snow on cold/marginal ground, honor NWS floor.
+  // If NWS explicitly forecasts 0.0" AND wet-bulb > 32.5F AND soil >= 35F, cap warm-ground slush honestly.
+  if (hasNwsGrid && nwsGrid.snow72hIn >= 0.5 && (minSoil0cmWintryF == null || minSoil0cmWintryF <= 33.5)) {
+    peakGrass72 = Math.max(peakGrass72, nwsGrid.snow72hIn);
+    peakGrass24 = Math.max(peakGrass24, nwsGrid.snow24hIn);
+    if (minSoil0cmWintryF == null || minSoil0cmWintryF <= 32.5) {
+      peakRoad72 = Math.max(peakRoad72, nwsGrid.snow72hIn);
+      peakRoad24 = Math.max(peakRoad24, nwsGrid.snow24hIn);
+    }
+  } else if (
+    hasNwsGrid &&
+    nwsGrid.snow72hIn < 0.05 &&
+    minWetBulbWintryF != null && minWetBulbWintryF > 32.5 &&
+    minSoil0cmWintryF != null && minSoil0cmWintryF >= 35.0
+  ) {
+    peakRoad24 = 0.0;
+    peakRoad72 = 0.0;
+    if (maxSnowDepthIn < 1.2) {
+      peakGrass24 = Math.min(peakGrass24, 0.2);
+      peakGrass72 = Math.min(peakGrass72, 0.2);
+    }
+  }
+
+  const grassSnow24hIn = Number(Math.min(finalSnow24, peakGrass24).toFixed(1));
+  const grassSnow72hIn = Number(Math.min(finalSnow72, Math.max(peakGrass24, peakGrass72)).toFixed(1));
+  const roadSnow24hIn = Number(Math.min(finalSnow24, peakRoad24).toFixed(1));
+  const roadSnow72hIn = Number(Math.min(finalSnow72, Math.max(peakRoad24, peakRoad72)).toFixed(1));
+
   const iceRisk = classifyIceRisk(finalIce72);
   let iceRiskDetail = iceRisk.detail;
   if (finalIce72 >= 0.25) iceRiskDetail = `${finalIce72.toFixed(2)}" glaze forecast — ${iceRisk.detail}`;
   else if (finalIce72 >= 0.01) iceRiskDetail = `${finalIce72.toFixed(2)}" ice — ${iceRisk.detail}`;
 
   const wssi = evaluateWssiAtPoint(extras?.lat, extras?.lon, extras?.wssiBundle);
+  // NEVER fabricate NWS snow/ice from Open-Meteo when official NWS gridData says 0.0"!
   const modelSpread = analyzeWinterModels(
     extras?.winterModels || null,
-    nwsGrid.snow72hIn > 0 ? nwsGrid.snow72hIn : finalSnow72,
-    nwsGrid.ice72hIn > 0 ? nwsGrid.ice72hIn : finalIce72,
+    hasNwsGrid ? nwsGrid.snow72hIn : null,
+    hasNwsGrid ? nwsGrid.ice72hIn : null,
     refNowMs
   );
 
@@ -1404,37 +1755,35 @@ export function analyzeWinterSuite(
     modelSpread.snowMaxIn >= 0.1 ||
     anySlotWintry;
 
-  const g6ValForNote = thermalProfile.ground6cmF ?? ground6cmF;
+  const g6ValForNote = minSoil6cmWintryF ?? thermalProfile.ground6cmF ?? ground6cmF;
   const g6Str = g6ValForNote != null && Number.isFinite(g6ValForNote) ? `${Math.round(g6ValForNote)}°F` : '--°F';
   const g0Str = minSoil0cmWintryF != null && Number.isFinite(minSoil0cmWintryF) ? `${Math.round(minSoil0cmWintryF)}°F` : '--°F';
+  const twStr = minWetBulbWintryF != null && Number.isFinite(minWetBulbWintryF) ? `${minWetBulbWintryF.toFixed(1)}°F` : '--°F';
+
+  const meltDrivers = [];
+  if (minSoil0cmWintryF != null && minSoil0cmWintryF >= 34.0) meltDrivers.push(`0cm ${g0Str}/6cm ${g6Str} soil`);
+  if (minWetBulbWintryF != null && minWetBulbWintryF > 32.5) meltDrivers.push(`Tw ${twStr}`);
+  if (rainDuringSnowIn >= 0.01) meltDrivers.push('mixed rain');
+  if (peakSolarDuringSnowWm2 >= 80) meltDrivers.push('daytime sun');
+  if (hasNwsGrid && nwsGrid.snow72hIn < 0.05) meltDrivers.push('NWS 0.0"');
+  const meltReasonStr = meltDrivers.length ? meltDrivers.join(', ') : `0cm ${g0Str} / 6cm ${g6Str}`;
 
   let groundAccumStatus = 'NO_WINTRY_PRECIP';
   let groundAccumNote = `No wintry precipitation expected in 72h (0cm ${g0Str} / 6cm ${g6Str}, ${hoursSubFreeze72h}h<=32°F).`;
-  let roadSnow72hIn = 0.0;
 
   if (!hasWintryActivity) {
     groundAccumStatus = 'NO_WINTRY_PRECIP';
-    roadSnow72hIn = 0.0;
-  } else if (
-    finalIce72 < 0.05 &&
-    maxSnowRateHr < 1.0 &&
-    minSoil0cmWintryF != null &&
-    (
-      minSoil0cmWintryF >= 37.0 ||
-      (minAirWintry != null && minAirWintry >= 33.5 && minSoil0cmWintryF >= 34.5) ||
-      (hoursSubFreeze72h === 0 && minSoil0cmWintryF >= 34.0)
-    )
-  ) {
+  } else if (finalIce72 < 0.05 && roadSnow72hIn < 0.1 && grassSnow72hIn < 0.25) {
     groundAccumStatus = 'WARM_GROUND_MELTS';
-    roadSnow72hIn = 0.0;
-    groundAccumNote = `Ground too warm to stick (0cm ${Math.round(minSoil0cmWintryF)}°F / 6cm ${g6Str}, ${hoursSubFreeze72h}h<=32°F): any falling snow/mix melts on contact — wet roads only, no accumulation.`;
-  } else if (finalIce72 < 0.05 && minSoil0cmWintryF != null && minSoil0cmWintryF > 32.5) {
+    groundAccumNote = `Will NOT stick (${meltReasonStr}): up to ${Math.max(finalSnow72, modelSpread.snowMaxIn).toFixed(1)}" falling aloft melts on contact — wet roads only (0.0" accum).`;
+  } else if (finalIce72 < 0.05 && roadSnow72hIn < 0.15 && grassSnow72hIn >= 0.25) {
+    groundAccumStatus = 'GRASS_SLUSH_ONLY';
+    groundAccumNote = `Wet roads (0.0"), brief slushy grass/decks ~${grassSnow72hIn.toFixed(1)}" (${meltReasonStr}): melts on pavement from warm subsoil.`;
+  } else if (finalIce72 < 0.05 && ((minSoil0cmWintryF != null && minSoil0cmWintryF > 32.5) || roadSnow72hIn < finalSnow72 * 0.55)) {
     groundAccumStatus = 'MARGINAL_SLUSHY';
-    roadSnow72hIn = Number((finalSnow72 * 0.25).toFixed(1));
-    groundAccumNote = `Marginal ground (${Math.round(minSoil0cmWintryF)}°F): melts initially on roads; slushy coating mainly on grass, decks & elevated bridges during heavier bursts.`;
+    groundAccumNote = `Marginal surface (${meltReasonStr}): ~${roadSnow72hIn.toFixed(1)}" slushy roads / ~${grassSnow72hIn.toFixed(1)}" grass out of ${finalSnow72.toFixed(1)}" falling aloft.`;
   } else {
     groundAccumStatus = 'COLD_GROUND_STICKS';
-    roadSnow72hIn = finalSnow72;
     groundAccumNote = `Sub-freezing surface (${minSoil0cmWintryF != null ? `${Math.round(minSoil0cmWintryF)}°F ground` : 'freezing temps'}): snow/ice will stick immediately to roads, bridges & overpasses.`;
   }
 
@@ -1472,13 +1821,14 @@ export function analyzeWinterSuite(
       }
     }
   }
-  if (groundAccumStatus === 'WARM_GROUND_MELTS') {
+  if (groundAccumStatus === 'WARM_GROUND_MELTS' || groundAccumStatus === 'GRASS_SLUSH_ONLY') {
+    const meltSuffix = groundAccumStatus === 'WARM_GROUND_MELTS' ? '(melts on warm ground)' : '(slushy grass / wet roads)';
     if (!changeoverLabel.startsWith('No ')) {
       changeoverLabel = changeoverLabel.includes(' @ ')
-        ? changeoverLabel.replace(' @ ', ' (melts on warm ground) @ ')
-        : `${changeoverLabel} (melts on warm ground)`;
+        ? changeoverLabel.replace(' @ ', ` ${meltSuffix} @ `)
+        : `${changeoverLabel} ${meltSuffix}`;
     } else if (finalSnow72 >= 0.05 || modelSpread.snowMaxIn >= 0.1) {
-      changeoverLabel = 'Flakes / model snow flux (melts on warm ground)';
+      changeoverLabel = `Wet snow/mix aloft ${meltSuffix}`;
     }
   }
   if (hourlySlots.length >= 6) {
@@ -1499,8 +1849,10 @@ export function analyzeWinterSuite(
     }
   }
 
-  const tForSlr = minTemp72hF ?? thermalProfile.airTempF ?? 30;
-  const slrLabel = finalSnow72 > 0 ? `${dynamicSlrForTempF(tForSlr)}:1 SLR` : 'Dry / 10:1';
+  const effKucheraSlr = slrWeightTotal > 0
+    ? Math.max(4, Math.min(20, Math.round(slrWeightedSum / slrWeightTotal)))
+    : kucheraSlrForProfile(minAirWintry ?? thermalProfile.airTempF ?? 30, thermalProfile.temp925F, thermalProfile.temp850F, thermalProfile.temp700F);
+  const slrLabel = finalSnow72 > 0 ? `${effKucheraSlr}:1 Kuchera` : 'Dry / 10:1';
 
   let headline = '72H MONITORING';
   if (finalIce72 >= 0.5 || (wssi.highestRank >= 5 && finalIce72 >= 0.25)) {
@@ -1511,16 +1863,18 @@ export function analyzeWinterSuite(
     if (wssi.highestRank >= 3) {
       headline = `WPC WSSI: ${wssi.highestImpact}`;
     } else if (finalSnow72 >= 0.1 || modelSpread.snowMaxIn >= 0.2) {
-      headline = 'MELTING FLAKES / WARM GROUND';
+      headline = 'WET SNOW / WILL NOT STICK';
     } else {
       headline = '72H MONITORING';
     }
-  } else if (finalSnow72 >= 4.0) {
-    headline = `WINTER STORM (${finalSnow72.toFixed(1)}" Snow)`;
+  } else if (groundAccumStatus === 'GRASS_SLUSH_ONLY') {
+    headline = `SLUSHY GRASS ONLY (~${grassSnow72hIn.toFixed(1)}")`;
+  } else if (roadSnow72hIn >= 4.0) {
+    headline = `WINTER STORM (${roadSnow72hIn.toFixed(1)}" Snow)`;
   } else if (finalIce72 >= 0.1) {
     headline = `FREEZING RAIN (${finalIce72.toFixed(2)}" Ice)`;
-  } else if (finalSnow72 >= 0.5) {
-    headline = `SNOW FORECAST (${finalSnow72.toFixed(1)}" / 72h)`;
+  } else if (roadSnow72hIn >= 0.5) {
+    headline = `STICKING SNOW (${roadSnow72hIn.toFixed(1)}" Roads)`;
   } else if (hourlySlots.some((s) => s.pType === 'REFREEZE')) {
     headline = 'BLACK ICE REFREEZE';
   } else if (wssi.highestRank >= 3) {
@@ -1533,10 +1887,14 @@ export function analyzeWinterSuite(
   const winterAlerts = [];
 
   const isColdGround = ground0cmF != null && ground0cmF <= freezeThreshF;
-  const isFreezingPrecip = wmo === 56 || wmo === 57 || wmo === 66 || wmo === 67 || (precipNow > 0 && (airF <= 33 || isColdGround));
+  const isFreezingPrecip = wmo === 56 || wmo === 57 || wmo === 66 || wmo === 67 || (precipNow > 0 && (airF <= 32.0 || isColdGround));
   const isFreezingFog = wmo === 48 || (visMi <= 0.5 && airF <= 32);
   const isDenseFog = visMi <= 0.5 && airF > 32;
   const hasRefreezeSlot = hourlySlots.some((s) => s.pType === 'REFREEZE');
+  const isStickingSnowAlert =
+    groundAccumStatus !== 'WARM_GROUND_MELTS' &&
+    groundAccumStatus !== 'GRASS_SLUSH_ONLY' &&
+    (roadSnow72hIn >= 1.0 || grassSnow72hIn >= 2.0);
 
   if (isFreezingPrecip) {
     hazardLevel = 'CRITICAL';
@@ -1568,18 +1926,19 @@ export function analyzeWinterSuite(
       summary: `${changeoverLabel} • Peak: ${peakWindowLabel} • ${iceRisk.detail}`,
       severity: 'high'
     });
-  } else if (groundAccumStatus !== 'WARM_GROUND_MELTS' && (next24SnowLegacy >= 1.0 || finalSnow24 >= 1.0 || finalSnow72 >= 4.0)) {
-    hazardLevel = finalSnow72 >= 4.0 ? 'HIGH' : 'MODERATE';
-    const snowDisp = Math.max(next24SnowLegacy, finalSnow24);
-    statusLabel = finalSnow72 >= 4.0
-      ? `Winter Storm Snow (${finalSnow72.toFixed(1)}" / 72h)`
-      : `Accumulating Snow (${snowDisp.toFixed(1)}" / 24h)`;
-    roadBridgeRiskLabel = isColdGround ? 'Snow Sticking Immediately to Pavement' : 'Slushy / Melting Initially';
+  } else if (isStickingSnowAlert) {
+    hazardLevel = roadSnow72hIn >= 4.0 ? 'HIGH' : 'MODERATE';
+    statusLabel = roadSnow72hIn >= 4.0
+      ? `Winter Storm Snow (${roadSnow72hIn.toFixed(1)}" Roads)`
+      : `Accumulating Snow (${roadSnow72hIn.toFixed(1)}" Roads / ${grassSnow72hIn.toFixed(1)}" Grass)`;
+    roadBridgeRiskLabel = groundAccumStatus === 'COLD_GROUND_STICKS'
+      ? 'Snow Sticking Immediately to Pavement'
+      : 'Slushy Accumulation on Roads & Bridges';
     winterAlerts.push({
       id: 'winter_snow',
       title: 'Accumulating Snow Expected',
-      summary: `${snowDisp.toFixed(1)}" snow 24h (${finalSnow72.toFixed(1)}" 72h) • Ground 0cm: ${ground0cmF ?? '--'}°F.`,
-      severity: finalSnow72 >= 4.0 ? 'high' : 'mod'
+      summary: `${roadSnow72hIn.toFixed(1)}" road / ${grassSnow72hIn.toFixed(1)}" grass sticking (${finalSnow72.toFixed(1)}" falling aloft) • Ground 0cm: ${g0Str}.`,
+      severity: roadSnow72hIn >= 4.0 ? 'high' : 'mod'
     });
   } else if (finalIce72 >= 0.1 || wssi.highestRank >= 4) {
     hazardLevel = 'HIGH';
@@ -1622,7 +1981,7 @@ export function analyzeWinterSuite(
   }
 
   if (
-    groundAccumStatus === 'WARM_GROUND_MELTS' &&
+    (groundAccumStatus === 'WARM_GROUND_MELTS' || groundAccumStatus === 'GRASS_SLUSH_ONLY') &&
     (hazardLevel === 'CLEAR' || (hazardLevel === 'ADVISORY' && !isDenseFog && !hasRefreezeSlot && finalIce72 < 0.01 && !(minTemp24h != null && minTemp24h <= 28)))
   ) {
     roadBridgeRiskLabel = groundAccumNote;
@@ -1639,7 +1998,8 @@ export function analyzeWinterSuite(
     freezingLevelFt,
     hoursBelowFreezingNext24h,
     minTemp24h,
-    snow24hIn: Number(next24SnowLegacy.toFixed(1)),
+    snow24hIn: roadSnow24hIn,
+    fallingSnow24hIn: Number(next24SnowLegacy.toFixed(1)),
     visibilityMi: visMi,
     winterAlerts,
     proWinter: {
@@ -1647,10 +2007,20 @@ export function analyzeWinterSuite(
       hourlySlots,
       snow24hIn: finalSnow24,
       snow72hIn: finalSnow72,
+      fallingSnow24hIn: finalSnow24,
+      fallingSnow72hIn: finalSnow72,
+      grassSnow24hIn,
+      grassSnow72hIn,
+      roadSnow24hIn,
       roadSnow72hIn,
       groundAccumStatus,
       groundAccumNote,
       minSoil0cmWintryF,
+      minSoil6cmWintryF,
+      minWetBulbWintryF,
+      rainDuringSnowIn: Number(rainDuringSnowIn.toFixed(2)),
+      peakSolarDuringSnowWm2: Math.round(peakSolarDuringSnowWm2),
+      hasNwsGrid,
       nwsSnow72hIn: Number(nwsGrid.snow72hIn.toFixed(1)),
       maxSnowDepthIn: Number(maxSnowDepthIn.toFixed(1)),
       slrLabel,

@@ -3394,3 +3394,49 @@ input:focus-visible {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
+
+/* ==================== SEVERE 3-HAZARD BREAKDOWN STRIP (TORNADO / HAIL / WIND) ==================== */
+.severe-hazards-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.hazard-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 8px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.hazard-k {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.hazard-v {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.hazard-d {
+  font-size: 9.5px;
+  color: var(--text-secondary);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 359px) {
+  .severe-hazards-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'borden-tempest-v1.7.1-b13';
+const CACHE_NAME = 'borden-tempest-v1.7.2-b14';
 
 const SHELL_ASSETS = [
   './',

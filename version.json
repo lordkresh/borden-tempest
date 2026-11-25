@@ -1,7 +1,7 @@
 {
-  "versionCode": 13,
-  "versionName": "1.7.1",
+  "versionCode": 14,
+  "versionName": "1.7.2",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-25T05:00:00Z",
-  "releaseNotes": "Tempest v1.7.1 (by J. Borden): Exact 1:1 Android v1.5.6 parity — warm-ground melting accumulation physics (WARM_GROUND_MELTS / MARGINAL_SLUSHY / COLD_GROUND_STICKS), surface vs. aloft warm-nose highlight fix, accurate above-freezing thaw tracking, and clean UTF-8 typography across all modules."
+  "publishedAt": "2026-11-25T23:00:00Z",
+  "releaseNotes": "Tempest v1.7.2 (by J. Borden): Real NWS/WPC surface energy-balance winter snow-sticking physics (wet-bulb phase, 0cm/6cm soil basal melt, rain-on-snow washout, solar shortwave radiation, Kuchera column SLR, honest NWS 0.0\" comparison, separate Roads vs. Grass sticking totals & bogus snow-alert suppression) + upgraded SPC severe weather engine (SHIP Significant Hail Parameter, 0-3km QLCS shear, DCAPE/downburst wind index, 12h peak severe window, Tornado/Hail/Wind hazard breakdown & SPC Day 1 outlook/watch fusion)."
 }

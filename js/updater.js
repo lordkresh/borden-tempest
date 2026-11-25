@@ -1,8 +1,8 @@
 import { DEFAULT_TIME_ZONE, formatCentralTime, parseUtcTimestampMs } from './weatherApi.js';
 
 export const APP_LOCAL_VERSION = {
-  versionCode: 13,
-  versionName: '1.7.1',
+  versionCode: 14,
+  versionName: '1.7.2',
   platform: 'iOS / Web PWA'
 };
 

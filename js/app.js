@@ -1170,6 +1170,7 @@ async function refreshAllData(silent = false) {
       state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
         convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
         nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
+        multiDaySpc: state.multiDaySpc,
         nowMs
       });
     }
@@ -1408,7 +1409,7 @@ function checkAllLiveAlertTriggers() {
       const snow72 = Number(pw.snow72hIn) || 0;
       const hasHighIce = ice72 >= 0.25 || pw.iceRiskTier === 'HIGH' || pw.iceRiskTier === 'CATASTROPHIC';
       const roadSnow = pw.roadSnow72hIn != null ? Number(pw.roadSnow72hIn) : snow72;
-      const hasHighSnow = pw.groundAccumStatus !== 'WARM_GROUND_MELTS' && roadSnow >= 4.0;
+      const hasHighSnow = pw.groundAccumStatus !== 'WARM_GROUND_MELTS' && pw.groundAccumStatus !== 'GRASS_SLUSH_ONLY' && roadSnow >= 4.0;
       const hasRefreeze = (Array.isArray(pw.hourlySlots) && pw.hourlySlots.some((slot) => slot?.pType === 'REFREEZE')) ||
         (typeof pw.refreezeLabel === 'string' && pw.refreezeLabel.length > 0 && !pw.refreezeLabel.startsWith('No '));
       if (hasHighIce) {
@@ -2603,24 +2604,33 @@ function renderProWinterCardHtml(win) {
   ];
 
   const isWarmGroundMelts = pw.groundAccumStatus === 'WARM_GROUND_MELTS';
+  const isGrassSlushOnly = pw.groundAccumStatus === 'GRASS_SLUSH_ONLY';
   const isMarginalSlushy = pw.groundAccumStatus === 'MARGINAL_SLUSHY';
-  const hasWarmFlux = isWarmGroundMelts && (Number(pw.snow72hIn || 0) > 0 || Number(spread.snowMaxIn || 0) > 0);
-  const snowHeroHtml = hasWarmFlux
-    ? `0.0"<span class="winter-hero-tag">Roads</span>`
-    : isMarginalSlushy && Number(pw.snow72hIn || 0) > 0
-      ? `${fmtFixed(Number(pw.roadSnow72hIn ?? pw.snow72hIn ?? 0), 1, '0.0')}"<span class="winter-hero-tag">Roads</span>`
-      : `${fmtFixed(Number(pw.snow72hIn ?? 0), 1, '0.0')}"`;
-  const groundMeltsTemp = Math.round(pw.minSoil0cmWintryF ?? safeWin.ground0cmF ?? 45);
   const aloftSnowIn = Number(pw.snow72hIn || 0) > 0 ? Number(pw.snow72hIn) : Number(spread.snowMaxIn || 0);
+  const roadSnowIn = Number(pw.roadSnow72hIn ?? 0);
+  const grassSnowIn = Number(pw.grassSnow72hIn ?? roadSnowIn);
+  const hasWarmFlux = isWarmGroundMelts && aloftSnowIn > 0;
+  const nwsSnowTag = pw.hasNwsGrid ? ` • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"` : '';
+  const snowHeroHtml = hasWarmFlux
+    ? `0.0"<span class="winter-hero-tag">Roads &amp; Grass</span>`
+    : isGrassSlushOnly
+      ? `0.0"<span class="winter-hero-tag">Roads · ~${fmtFixed(grassSnowIn, 1, '0.0')}" Grass</span>`
+      : isMarginalSlushy && aloftSnowIn > 0
+        ? `${fmtFixed(roadSnowIn, 1, '0.0')}"<span class="winter-hero-tag">Roads · ${fmtFixed(grassSnowIn, 1, '0.0')}" Grass</span>`
+        : `${fmtFixed(roadSnowIn > 0 ? roadSnowIn : Number(pw.snow72hIn ?? 0), 1, '0.0')}"`;
+  const groundMeltsTemp = Math.round(pw.minSoil0cmWintryF ?? safeWin.ground0cmF ?? 45);
+  const twMeltsStr = pw.minWetBulbWintryF != null ? ` (Tw ${Math.round(Number(pw.minWetBulbWintryF))}°F)` : '';
   const snowSubText = hasWarmFlux
-    ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" aloft • Melts on ${groundMeltsTemp}°F ground`
-    : isMarginalSlushy && Number(pw.snow72hIn || 0) > 0
-      ? `${fmtFixed(Number(pw.snow72hIn ?? 0), 1, '0.0')}" aloft • Slushy on ${groundMeltsTemp}°F ground • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`
-      : `24h: ${fmtFixed(Number(pw.snow24hIn ?? 0), 1, '0.0')}" • Depth: ${fmtFixed(Number(pw.maxSnowDepthIn ?? 0), 1, '0.0')}" • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`;
+    ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" falling aloft • Melts on ${groundMeltsTemp}°F ground${twMeltsStr}${nwsSnowTag}`
+    : isGrassSlushOnly
+      ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" falling aloft • Wet roads, slushy grass/decks${nwsSnowTag}`
+      : isMarginalSlushy && aloftSnowIn > 0
+        ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" aloft • Slushy on ${groundMeltsTemp}°F ground${nwsSnowTag}`
+        : `24h: ${fmtFixed(Number(pw.roadSnow24hIn ?? pw.snow24hIn ?? 0), 1, '0.0')}" • Depth: ${fmtFixed(Number(pw.maxSnowDepthIn ?? 0), 1, '0.0')}"${nwsSnowTag || ` • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`}`;
   const showAccumBannerNote = Boolean(
     pw.groundAccumNote &&
     safeWin.hazardLevel !== 'CRITICAL' &&
-    (isWarmGroundMelts || isMarginalSlushy || safeWin.hazardLevel === 'CLEAR') &&
+    (isWarmGroundMelts || isGrassSlushOnly || isMarginalSlushy || safeWin.hazardLevel === 'CLEAR') &&
     pw.groundAccumStatus !== 'NO_WINTRY_PRECIP'
   );
   const regimeBannerText = showAccumBannerNote ? pw.groundAccumNote : safeWin.roadBridgeRiskLabel;
@@ -2727,7 +2737,7 @@ function renderProWinterCardHtml(win) {
         <span>3-Model + NWS Ensemble Spread</span>
         <span class="badge-${spread.agreementLabel === 'HIGH' ? 'green' : spread.agreementLabel === 'MODERATE' ? 'amber' : 'muted'}">Agreement: ${escapeHtml(spread.agreementLabel || 'N/A')} (${spread.tempSpreadF ?? 0}°F)</span>
       </div>
-      ${isWarmGroundMelts && Number(spread.snowMaxIn || 0) > 0 ? `<div class="metric-sub winter-spread-note">Raw snow flux aloft — melts on warm ground</div>` : ''}
+      ${(isWarmGroundMelts || isGrassSlushOnly) && Number(spread.snowMaxIn || 0) > 0 ? `<div class="metric-sub winter-spread-note">Model column shows raw falling snow aloft (NWS reflects actual expected sticking snow)</div>` : ''}
       ${spread.estimates?.length ? `
         <div class="model-spread-grid">
           ${spread.estimates.map((m) => `
@@ -2751,7 +2761,7 @@ function renderDashboard() {
   if (!container || !state.current) return;
 
   const c = state.current;
-  const env = state.environment || analyzeEnvironment(state.openMeteo, c, 0);
+  const env = state.environment || analyzeEnvironment(state.openMeteo, c, 0, { multiDaySpc: state.multiDaySpc });
   const win = state.winter || analyzeWinterSuite(
     state.openMeteo,
     c,
@@ -2872,7 +2882,7 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (PRO 5-LEVEL SOUNDING + STP/SCP/SRH + LIVE HODOGRAPH) -->
+    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (PRO 5-LEVEL SOUNDING + STP/SCP/SHIP/QLCS + LIVE HODOGRAPH) -->
     <div class="card">
       <div class="card-header">
         <div class="card-title">${sectionIcon('sounding', env.level === 'high' ? 'amber' : '')}Pro Severe Sounding &amp; HSLC</div>
@@ -2881,24 +2891,41 @@ function renderDashboard() {
       <div class="regime-banner ${env.level}">
         ${escapeHtml(env.nocturnalRisk)}
       </div>
+      <div class="severe-hazards-strip">
+        <div class="hazard-chip" style="border-color:${env.hazards?.tornado?.color || '#64748b'}44;">
+          <span class="hazard-k">TORNADO</span>
+          <span class="hazard-v" style="color:${env.hazards?.tornado?.color || '#94a3b8'};">${escapeHtml(env.hazards?.tornado?.label || 'None')}</span>
+          <span class="hazard-d">${escapeHtml(env.hazards?.tornado?.detail || 'Low risk')}</span>
+        </div>
+        <div class="hazard-chip" style="border-color:${env.hazards?.hail?.color || '#64748b'}44;">
+          <span class="hazard-k">LARGE HAIL</span>
+          <span class="hazard-v" style="color:${env.hazards?.hail?.color || '#94a3b8'};">${escapeHtml(env.hazards?.hail?.label || 'None')}</span>
+          <span class="hazard-d">${escapeHtml(env.hazards?.hail?.detail || 'Low risk')}</span>
+        </div>
+        <div class="hazard-chip" style="border-color:${env.hazards?.wind?.color || '#64748b'}44;">
+          <span class="hazard-k">DMG WIND</span>
+          <span class="hazard-v" style="color:${env.hazards?.wind?.color || '#94a3b8'};">${escapeHtml(env.hazards?.wind?.label || 'None')}</span>
+          <span class="hazard-d">${escapeHtml(env.hazards?.wind?.detail || 'Low risk')}</span>
+        </div>
+      </div>
       <div class="metrics-grid">
         <div class="metric-box">
           <div class="metric-label">Sig Tor · STP</div>
-          <div class="metric-value">${(env.stp ?? 0).toFixed(1)}</div>
-          <div class="metric-sub">SPC Fixed-Lyr</div>
-          ${severityMeter(((env.stp ?? 0) / 3) * 100, (env.stp ?? 0) >= 1 ? '#f43f5e' : '#10b981')}
+          <div class="metric-value">${(env.peakStp12h ?? env.stp ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">Now ${(env.stp ?? 0).toFixed(1)} · 12h Peak</div>
+          ${severityMeter((((env.peakStp12h ?? env.stp ?? 0)) / 3) * 100, (env.peakStp12h ?? env.stp ?? 0) >= 1 ? '#f43f5e' : '#10b981')}
         </div>
         <div class="metric-box">
           <div class="metric-label">Supercell · SCP</div>
-          <div class="metric-value">${(env.scp ?? 0).toFixed(1)}</div>
-          <div class="metric-sub">0–3km SRH ${env.srh0to3Km ?? 0}</div>
-          ${severityMeter(((env.scp ?? 0) / 5) * 100, (env.scp ?? 0) >= 1 ? '#d946ef' : '#38bdf8')}
+          <div class="metric-value">${(env.peakScp12h ?? env.scp ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">0–3km SRH ${env.peakSrh0to3_12h ?? env.srh0to3Km ?? 0}</div>
+          ${severityMeter((((env.peakScp12h ?? env.scp ?? 0)) / 5) * 100, (env.peakScp12h ?? env.scp ?? 0) >= 1 ? '#d946ef' : '#38bdf8')}
         </div>
         <div class="metric-box">
-          <div class="metric-label">0–1km SRH</div>
-          <div class="metric-value">${env.srh0to1Km ?? 0}</div>
-          <div class="metric-sub">m²/s² Helicity</div>
-          ${severityMeter(((env.srh0to1Km ?? 0) / 300) * 100, (env.srh0to1Km ?? 0) >= 150 ? '#f59e0b' : '#38bdf8')}
+          <div class="metric-label">Sig Hail · SHIP</div>
+          <div class="metric-value">${(env.peakShip12h ?? env.ship ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">Now ${(env.ship ?? 0).toFixed(1)} · ≥1.0 = 2"+</div>
+          ${severityMeter((((env.peakShip12h ?? env.ship ?? 0)) / 2) * 100, (env.peakShip12h ?? env.ship ?? 0) >= 1 ? '#f59e0b' : '#38bdf8')}
         </div>
       </div>
       <div class="metrics-grid" style="margin-top:8px;">
@@ -2909,15 +2936,15 @@ function renderDashboard() {
           ${severityMeter(((env.peakCape12h ?? 0) / 3000) * 100, Math.abs(env.cinNow ?? 0) >= 200 ? '#facc15' : (env.peakCape12h ?? 0) >= 1500 ? '#f59e0b' : '#38bdf8')}
         </div>
         <div class="metric-box">
-          <div class="metric-label">0–6km Shear</div>
-          <div class="metric-value">${env.bulkShear0to6KmKt} kt</div>
-          <div class="metric-sub">0–1.5km: ${env.lowLevelShearKt} kt</div>
+          <div class="metric-label">0–6 / 0–3 Shear</div>
+          <div class="metric-value">${env.bulkShear0to6KmKt} / ${env.shear0to3KmKt ?? 0} kt</div>
+          <div class="metric-sub">0–1 SRH ${env.srh0to1Km ?? 0} · Gust ${env.peakWindGust12hMph ?? 0} mph</div>
           ${severityMeter(((env.bulkShear0to6KmKt ?? 0) / 60) * 100, (env.bulkShear0to6KmKt ?? 0) >= 40 ? '#d946ef' : '#38bdf8')}
         </div>
         <div class="metric-box">
           <div class="metric-label">LCL / Lapse</div>
           <div class="metric-value">${env.lclMeters ?? '--'} m</div>
-          <div class="metric-sub">7–5mb: ${env.lapseRate700to500 ?? 5.8}°/km</div>
+          <div class="metric-sub">7–5mb: ${env.lapseRate700to500 ?? 5.8}°/km · Peak ${escapeHtml(env.peakThreatTimeLabel || '--')}</div>
           ${severityMeter((((env.lapseRate700to500 ?? 5.8) - 4) / 5) * 100, (env.lapseRate700to500 ?? 5.8) >= 7.0 ? '#f59e0b' : '#10b981')}
         </div>
       </div>

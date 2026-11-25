@@ -1810,7 +1810,9 @@ export async function fetchOpenMeteo(lat, lon, options = {}) {
       'convective_inhibition',
       'freezing_level_height',
       'soil_temperature_0cm',
-      'soil_temperature_6cm'
+      'soil_temperature_6cm',
+      'shortwave_radiation',
+      'is_day'
     ].join(',')
   });
 
