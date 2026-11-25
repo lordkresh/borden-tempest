@@ -4,6 +4,7 @@ const GEOCODE_BASE = 'https://geocoding-api.open-meteo.com/v1/search';
 const IEM_BASE = 'https://mesonet.agron.iastate.edu';
 const SPC_MAPSERVER_BASE = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer';
 const WPC_ERO_URL = 'https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/0/query?where=1%3D1&outFields=*&f=geojson';
+const WPC_WSSI_BASE = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/wpc_wssi/MapServer';
 const SPC_DAY1_FALLBACK_URL = 'https://www.spc.noaa.gov/products/outlook/day1otlk_cat.nolyr.geojson';
 
 export const DEFAULT_TIME_ZONE = 'America/Chicago';
@@ -22,6 +23,15 @@ export const SPC_OVERLAY_MODES = [
   { id: 7, label: 'Wind %' },
   { id: 9, label: 'Day 2' },
   { id: 17, label: 'Day 3' }
+];
+
+export const WPC_WSSI_MODES = [
+  { id: 4, label: 'Days 1–3' },
+  { id: 1, label: 'Day 1' },
+  { id: 2, label: 'Day 2' },
+  { id: 3, label: 'Day 3' },
+  { id: 19, label: 'Ice' },
+  { id: 9, label: 'Snow' }
 ];
 
 export const RADAR_PRODUCTS = [
@@ -1449,15 +1459,47 @@ function normalizeStormCellsGeoJson(fc, timeZone = DEFAULT_TIME_ZONE) {
   };
 }
 
-export async function fetchNwsPointBundle(lat, lon, force = false, options = {}) {
+function assertValidCoords(lat, lon, context = 'lookup') {
   const numLat = Number(lat);
   const numLon = Number(lon);
-  if (!Number.isFinite(numLat) || !Number.isFinite(numLon)) {
-    throw new WeatherApiError('Invalid coordinates for NWS point lookup', {
+  if (
+    !Number.isFinite(numLat) ||
+    !Number.isFinite(numLon) ||
+    Math.abs(numLat) > 90 ||
+    Math.abs(numLon) > 180
+  ) {
+    throw new WeatherApiError(`Invalid coordinates for ${context}`, {
       code: 'INVALID_COORDS',
       retryable: false
     });
   }
+  return { lat: numLat, lon: numLon };
+}
+
+export function trimNwsGridData(gridPayload) {
+  const props = gridPayload?.properties;
+  if (!props || typeof props !== 'object') return null;
+  const pickSeries = (key) => {
+    const s = props[key];
+    if (!s || typeof s !== 'object' || !Array.isArray(s.values)) return null;
+    return { uom: s.uom || '', values: s.values.slice(0, 120) };
+  };
+  return {
+    snowfallAmount: pickSeries('snowfallAmount'),
+    iceAccumulation: pickSeries('iceAccumulation'),
+    windChill: pickSeries('windChill'),
+    weather: pickSeries('weather'),
+    snowLevel: pickSeries('snowLevel'),
+    quantitativePrecipitation: pickSeries('quantitativePrecipitation')
+  };
+}
+
+export async function fetchNwsPointBundle(lat, lon, force = false, options = {}) {
+  if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  }
+  const { lat: numLat, lon: numLon } = assertValidCoords(lat, lon, 'NWS point lookup');
 
   const rLat = numLat.toFixed(4);
   const rLon = numLon.toFixed(4);
@@ -1483,7 +1525,7 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
   const pointData = pointRes.data;
   const props = pointData?.properties || {};
 
-  const [forecastRes, hourlyRes, stationsRes] = await Promise.allSettled([
+  const [forecastRes, hourlyRes, stationsRes, gridRes] = await Promise.allSettled([
     props.forecast
       ? fetchJson(props.forecast, { Accept: 'application/geo+json' }, options.timeoutMs ?? 12000, fetchOpts)
       : Promise.resolve(null),
@@ -1502,6 +1544,9 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
             ...fetchOpts
           }
         )
+      : Promise.resolve(null),
+    props.forecastGridData
+      ? fetchJson(props.forecastGridData, { Accept: 'application/geo+json' }, options.timeoutMs ?? 12000, fetchOpts)
       : Promise.resolve(null)
   ]);
 
@@ -1546,6 +1591,7 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
     !pointRes.fromCache ||
     (props.forecast && forecastRes.status === 'fulfilled') ||
     (props.forecastHourly && hourlyRes.status === 'fulfilled') ||
+    (props.forecastGridData && gridRes.status === 'fulfilled' && gridRes.value != null) ||
     (!stationsFromCache && stationsPayload != null) ||
     observations.length > 0;
   if (!hasAnyLiveNwsData) {
@@ -1575,6 +1621,7 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
     radarStation: props.radarStation || null,
     forecastPeriods: forecastRes.status === 'fulfilled' ? (forecastRes.value?.properties?.periods || []) : [],
     hourlyPeriods: hourlyRes.status === 'fulfilled' ? (hourlyRes.value?.properties?.periods || []) : [],
+    gridData: gridRes.status === 'fulfilled' ? trimNwsGridData(gridRes.value) : null,
     observations,
     _meta: {
       source: 'nws-point-bundle',
@@ -1591,7 +1638,8 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
       degraded: {
         forecast: forecastRes.status !== 'fulfilled',
         hourly: hourlyRes.status !== 'fulfilled',
-        stations: stationsRes.status !== 'fulfilled'
+        stations: stationsRes.status !== 'fulfilled',
+        gridData: Boolean(props.forecastGridData) && gridRes.status !== 'fulfilled'
       }
     }
   };
@@ -1698,14 +1746,7 @@ export async function fetchNwsAlerts(lat, lon, stateCode = null, options = {}) {
 }
 
 export async function fetchOpenMeteo(lat, lon, options = {}) {
-  const numLat = Number(lat);
-  const numLon = Number(lon);
-  if (!Number.isFinite(numLat) || !Number.isFinite(numLon)) {
-    throw new WeatherApiError('Invalid coordinates for Open-Meteo lookup', {
-      code: 'INVALID_COORDS',
-      retryable: false
-    });
-  }
+  const { lat: numLat, lon: numLon } = assertValidCoords(lat, lon, 'Open-Meteo lookup');
 
   const params = new URLSearchParams({
     latitude: numLat.toFixed(4),
@@ -1715,7 +1756,7 @@ export async function fetchOpenMeteo(lat, lon, options = {}) {
     precipitation_unit: 'inch',
     timezone: 'auto',
     past_hours: '6',
-    forecast_days: '3',
+    forecast_days: '4',
     current: [
       'temperature_2m',
       'relative_humidity_2m',
@@ -1735,19 +1776,25 @@ export async function fetchOpenMeteo(lat, lon, options = {}) {
     hourly: [
       'temperature_2m',
       'dew_point_2m',
+      'wet_bulb_temperature_2m',
       'relative_humidity_2m',
       'apparent_temperature',
       'precipitation_probability',
       'precipitation',
+      'rain',
+      'showers',
       'snowfall',
+      'snow_depth',
       'weather_code',
       'pressure_msl',
       'surface_pressure',
       'visibility',
       'wind_speed_10m',
       'wind_direction_10m',
+      'temperature_925hPa',
       'wind_speed_925hPa',
       'wind_direction_925hPa',
+      'temperature_850hPa',
       'wind_speed_850hPa',
       'wind_direction_850hPa',
       'wind_speed_700hPa',
@@ -1889,6 +1936,121 @@ export async function fetchWpcFloodOutlook(force = false, options = {}) {
   } catch {
     return { type: 'FeatureCollection', features: [] };
   }
+}
+
+export async function fetchOpenMeteoWinterModels(lat, lon, force = false, options = {}) {
+  if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  } else {
+    force = Boolean(force || options?.force);
+  }
+  const { lat: rLat, lon: rLon } = assertValidCoords(lat, lon, 'Open-Meteo winter models lookup');
+  const qLat = rLat.toFixed(4);
+  const qLon = rLon.toFixed(4);
+  const params = new URLSearchParams({
+    latitude: qLat,
+    longitude: qLon,
+    models: 'gfs_hrrr,gfs_seamless,ecmwf_ifs025',
+    temperature_unit: 'fahrenheit',
+    precipitation_unit: 'inch',
+    timezone: 'UTC',
+    forecast_days: '3',
+    hourly: [
+      'temperature_2m',
+      'wet_bulb_temperature_2m',
+      'precipitation',
+      'rain',
+      'snowfall',
+      'snow_depth',
+      'weather_code',
+      'temperature_925hPa',
+      'temperature_850hPa'
+    ].join(',')
+  });
+  const url = `${OPEN_METEO_BASE}?${params.toString()}`;
+  return ttlFetchJson(`om_wint_models:${qLat},${qLon}`, url, 10 * 60 * 1000, {
+    timeoutMs: options.timeoutMs ?? 12000,
+    force,
+    validate: (d) => Boolean(d && typeof d === 'object' && d.hourly && typeof d.hourly === 'object'),
+    maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
+    retryBaseDelayMs: options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_MS,
+    fetchImpl: options.fetchImpl ?? null,
+    signal: options.signal ?? null
+  });
+}
+
+async function fetchWpcWssiLayerWithStatus(layerId = 4, force = false, options = {}) {
+  if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  }
+  const numId = Number(layerId);
+  const safeId = Number.isFinite(numId) && numId >= 0 ? Math.trunc(numId) : 4;
+  const url = `${WPC_WSSI_BASE}/${safeId}/query?where=1%3D1&outFields=*&f=geojson`;
+  try {
+    const data = await ttlFetchJson(`wpc_wssi:${safeId}`, url, 15 * 60 * 1000, {
+      timeoutMs: options.timeoutMs ?? 10000,
+      force,
+      validate: isValidFeatureCollection,
+      maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
+      retryBaseDelayMs: options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_MS,
+      fetchImpl: options.fetchImpl ?? null,
+      signal: options.signal ?? null
+    });
+    return { ok: true, data };
+  } catch {
+    return { ok: false, data: { type: 'FeatureCollection', features: [] } };
+  }
+}
+
+export async function fetchWpcWssiLayer(layerId = 4, force = false, options = {}) {
+  const res = await fetchWpcWssiLayerWithStatus(layerId, force, options);
+  return res.data;
+}
+
+export async function fetchWpcWssiBundle(overlayLayerId = 4, force = false, options = {}) {
+  if (typeof overlayLayerId === 'object' && overlayLayerId !== null) {
+    options = overlayLayerId;
+    force = Boolean(options.force);
+    overlayLayerId = options.overlayLayerId ?? 4;
+  } else if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  }
+  const layerIds = [4, 1, 2, 3, 19, 9];
+  const results = await Promise.all(
+    layerIds.map((id) => fetchWpcWssiLayerWithStatus(id, force, options))
+  );
+  const layers = {};
+  const failedLayerIds = [];
+  let succeededCount = 0;
+  layerIds.forEach((id, i) => {
+    const entry = results[i];
+    if (entry?.ok && entry.data) {
+      layers[id] = entry.data;
+      succeededCount += 1;
+    } else {
+      layers[id] = { type: 'FeatureCollection', features: [] };
+      failedLayerIds.push(id);
+    }
+  });
+  const reqId = Number(overlayLayerId);
+  const activeId = layers[reqId] ? reqId : 4;
+  const nowMs = Date.now();
+  return {
+    overlayLayerId: activeId,
+    layers,
+    overlayGeoJson: layers[activeId] || { type: 'FeatureCollection', features: [] },
+    fetchedAtMs: nowMs,
+    _meta: {
+      degraded: failedLayerIds.length > 0,
+      allFailed: succeededCount === 0,
+      succeededCount,
+      failedLayerIds,
+      fetchedAtMs: succeededCount > 0 ? nowMs : null
+    }
+  };
 }
 
 export async function fetchNwsAfd(cwa, force = false, options = {}) {

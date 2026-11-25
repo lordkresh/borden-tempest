@@ -686,6 +686,9 @@ input:focus-visible {
   border-radius: 999px;
   letter-spacing: 0.025em;
   white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .badge-cyan {
@@ -3116,5 +3119,278 @@ input:focus-visible {
   .radar-hud-pill.hud-critical,
   .telemetry-ribbon.tone-critical .telem-dot {
     animation: none !important;
+  }
+}
+
+/* ==================== PRO WINTER, THERMAL COLUMN & WSSI SUITE ==================== */
+.pro-winter-card {
+  position: relative;
+}
+
+.winter-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.winter-hero-tile {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 14px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.winter-hero-num {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  margin-top: 3px;
+}
+
+.winter-hero-tag {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+  margin-left: 3px;
+}
+
+.winter-spread-note {
+  margin-bottom: 6px;
+  color: #bae6fd;
+}
+
+.winter-subsection-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin: 12px 0 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+.thermal-column-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.thermal-cell {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  padding: 7px 6px;
+  text-align: center;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.thermal-cell.warm-nose {
+  background: rgba(249, 115, 22, 0.16);
+  border-color: rgba(251, 146, 60, 0.45);
+}
+
+.thermal-lvl {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-muted);
+  letter-spacing: 0.03em;
+}
+
+.thermal-val {
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.warm-nose-pill {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(249, 115, 22, 0.22);
+  color: #fdba74;
+  border: 1px solid rgba(251, 146, 60, 0.45);
+}
+
+.ptype-strip {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  gap: 2px;
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ptype-seg {
+  height: 100%;
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.winter-timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.winter-timeline-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.winter-timeline-swatch {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.winter-milestones-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.winter-milestone-item {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  padding: 7px 9px;
+  min-width: 0;
+}
+
+.winter-milestone-k {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.winter-milestone-v {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.wssi-pills-grid,
+.model-spread-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.wssi-pill-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  padding: 7px 9px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  min-height: 44px;
+  min-width: 0;
+  overflow: hidden;
+  transition: transform 0.12s ease, border-color 0.15s ease;
+}
+
+.wssi-pill-btn:active {
+  transform: scale(0.98);
+}
+
+.wssi-pill-k {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wssi-pill-v {
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-spread-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.model-spread-cell {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  padding: 7px 9px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+@media (max-width: 400px) {
+  .thermal-column-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .winter-hero-grid,
+  .winter-milestones-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 359px) {
+  .tab-view {
+    padding: 10px calc(10px + var(--safe-right)) calc(var(--tabbar-h) + var(--safe-bottom) + 40px) calc(10px + var(--safe-left));
+  }
+
+  .card {
+    padding: 14px 12px;
+  }
+
+  .wssi-pills-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 480px) {
+  .model-spread-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }

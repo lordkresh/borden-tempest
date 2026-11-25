@@ -1,7 +1,7 @@
 {
-  "versionCode": 11,
-  "versionName": "1.6.4",
+  "versionCode": 13,
+  "versionName": "1.7.1",
   "platform": "iOS / Web PWA",
-  "publishedAt": "2026-11-24T08:30:00Z",
-  "releaseNotes": "Tempest v1.6.4 (by J. Borden): Hardens iOS Safari standalone PWA cold-boot initialization (handles already-complete document.readyState, isolates synchronous boot steps, falls back cleanly from createImageBitmap to HTMLImageElement for radar clutter cleaning, and clears deferred MapLibre fallback notices) while preserving zero-clutter NEXRAD radar, zero OTA update loops, and luxury obsidian glass styling."
+  "publishedAt": "2026-11-25T05:00:00Z",
+  "releaseNotes": "Tempest v1.7.1 (by J. Borden): Exact 1:1 Android v1.5.6 parity — warm-ground melting accumulation physics (WARM_GROUND_MELTS / MARGINAL_SLUSHY / COLD_GROUND_STICKS), surface vs. aloft warm-nose highlight fix, accurate above-freezing thaw tracking, and clean UTF-8 typography across all modules."
 }

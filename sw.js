@@ -1,4 +1,4 @@
-const CACHE_NAME = 'borden-tempest-v1.6.4-b11';
+const CACHE_NAME = 'borden-tempest-v1.7.1-b13';
 
 const SHELL_ASSETS = [
   './',
@@ -51,7 +51,8 @@ const LIVE_WEATHER_PATH_PATTERNS = [
   /\/wms(\/|$)/i,
   /\/tiles?(\/|$)/i,
   /\/nexrad(\/|$|[-_])/i,
-  /\/(alerts|observations|forecasts?)(\/|$)/i,
+  /\/(alerts|observations|forecasts?|gridpoints)(\/|$)/i,
+  /wpc_wssi/i,
   /ridge::|unidata-nexrad|rainviewer/i,
   /\/\d+\/\d+\/\d+\.(png|jpe?g|webp|pbf|mvt)$/i
 ];
@@ -59,6 +60,7 @@ const LIVE_WEATHER_PATH_PATTERNS = [
 const LIVE_WEATHER_QUERY_PATTERNS = [
   /[?&](f|format)=(geo|p)?json(&|$)/i,
   /[?&]service=wms(&|$)/i,
+  /[?&]models=/i,
   /unidata-nexrad|ridge::|rainviewer|tilecache/i
 ];
 

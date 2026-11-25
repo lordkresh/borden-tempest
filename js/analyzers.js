@@ -185,6 +185,17 @@ function convertSnowfallToInches(val, unitLabel = 'inch') {
   return n;
 }
 
+function convertPrecipToInches(val, unitLabel = 'inch') {
+  const n = toFiniteNumber(val);
+  if (n === null) return 0;
+  const raw = normalizeUnitCode(unitLabel);
+  const u = raw.includes(':') ? raw.split(':').pop() : raw;
+  if (u === 'mm' || u.includes('millimet')) return n / 25.4;
+  if (u === 'cm' || u.includes('centimet')) return n / 2.54;
+  if (u === 'm' || u === 'meter' || u === 'meters') return n * 39.3700787;
+  return n;
+}
+
 function windComponentsKt(spdKt, dirFromDeg) {
   const spd = Math.max(0, toFiniteNumber(spdKt) ?? 0);
   const dir = toFiniteNumber(dirFromDeg) ?? 0;
@@ -227,6 +238,26 @@ function findCurrentHourIndex(hourly, nowMs = Date.now(), utcOffsetSeconds = 0) 
     const tMs = parseUtcTimestampMs(times[i], offsetOpts);
     if (tMs == null || !Number.isFinite(tMs)) continue;
     const diff = Math.abs(tMs - refMs);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+/** Matches Android ProWinterAnalyzer.findStartHourIndex (floors nowMs to top of UTC hour). */
+function findWinterStartHourIndex(times, nowMs = Date.now(), utcOffsetSeconds = 0) {
+  if (!Array.isArray(times) || !times.length) return 0;
+  const refMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const floorHourMs = Math.floor(refMs / 3600000) * 3600000;
+  const offsetOpts = Number.isFinite(utcOffsetSeconds) && utcOffsetSeconds !== 0 ? { utcOffsetSeconds } : {};
+  let bestIdx = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < times.length; i++) {
+    const tMs = parseUtcTimestampMs(times[i], offsetOpts);
+    if (tMs == null || !Number.isFinite(tMs)) continue;
+    const diff = Math.abs(tMs - floorHourMs);
     if (diff < bestDiff) {
       bestDiff = diff;
       bestIdx = i;
@@ -703,18 +734,462 @@ export function evaluateMultiDayOutlooks(userLat, userLon, intel) {
   };
 }
 
+function deriveRhFromTempDewF(tempF, dewF) {
+  const tc = fToC(tempF);
+  const tdc = fToC(dewF);
+  if (tc == null || tdc == null) return 75;
+  const es = Math.exp((17.625 * tc) / (243.04 + tc));
+  const e = Math.exp((17.625 * tdc) / (243.04 + tdc));
+  return Math.max(5, Math.min(100, (e / Math.max(1e-6, es)) * 100));
+}
+
+export function computeWetBulbF(tempF, rhPct = 75) {
+  const tf = toFiniteNumber(tempF);
+  if (tf === null) return 32;
+  const rh = Math.max(5, Math.min(100, toFiniteNumber(rhPct) ?? 75));
+  const tC = ((tf - 32) * 5) / 9;
+  const twC =
+    tC * Math.atan(0.151977 * Math.sqrt(rh + 8.313659)) +
+    Math.atan(tC + rh) -
+    Math.atan(rh - 1.676331) +
+    0.00391838 * Math.pow(rh, 1.5) * Math.atan(0.023101 * rh) -
+    4.686035;
+  return (twC * 9) / 5 + 32;
+}
+
+export function dynamicSlrForTempF(tempF) {
+  const tf = toFiniteNumber(tempF) ?? 30;
+  if (tf >= 31) return 8;
+  if (tf >= 26) return 10;
+  if (tf >= 18) return 13;
+  return 16;
+}
+
+const PTYPE_META = {
+  CLEAR: { code: 'CLEAR', label: 'Clear / Dry', shortLabel: 'Clear', color: '#475569', wintry: false },
+  COLD_RAIN: { code: 'COLD_RAIN', label: 'Cold Rain', shortLabel: 'Rain', color: '#38BDF8', wintry: false },
+  DRY_FREEZE: { code: 'DRY_FREEZE', label: 'Dry Freeze', shortLabel: 'Freeze', color: '#64748B', wintry: false },
+  REFREEZE: { code: 'REFREEZE', label: 'Black Ice Refreeze', shortLabel: 'Refreeze', color: '#818CF8', wintry: false },
+  WINTRY_MIX: { code: 'WINTRY_MIX', label: 'Wintry Mix', shortLabel: 'Mix', color: '#22D3EE', wintry: true },
+  SNOW: { code: 'SNOW', label: 'Snow', shortLabel: 'Snow', color: '#E0F2FE', wintry: true },
+  SLEET: { code: 'SLEET', label: 'Sleet (Ice Pellets)', shortLabel: 'Sleet', color: '#A78BFA', wintry: true },
+  FREEZING_RAIN: { code: 'FREEZING_RAIN', label: 'Freezing Rain (Glaze)', shortLabel: 'Fz Rain', color: '#F472B6', wintry: true }
+};
+
+export function classifyIceRisk(ice72hIn) {
+  const v = Math.max(0, toFiniteNumber(ice72hIn) ?? 0);
+  if (v >= 0.5) {
+    return { tier: 'CATASTROPHIC', label: 'CATASTROPHIC GLAZE', color: '#D946EF', detail: 'Severe tree & power outage emergency (>=0.50")' };
+  }
+  if (v >= 0.25) {
+    return { tier: 'HIGH', label: 'HIGH ICE RISK', color: '#EF4444', detail: 'Damaging glaze accretion & travel shutdown (>=0.25")' };
+  }
+  if (v >= 0.1) {
+    return { tier: 'MODERATE', label: 'MODERATE GLAZE', color: '#F97316', detail: 'Power lines & bridges icing (>=0.10")' };
+  }
+  if (v >= 0.01) {
+    return { tier: 'LOW', label: 'LOW GLAZE', color: '#38BDF8', detail: 'Patchy bridge & elevated surface glaze' };
+  }
+  return { tier: 'NONE', label: 'NO GLAZE', color: '#475569', detail: 'No measurable freezing rain accretion' };
+}
+
+function isPrecipWmoCode(wmo) {
+  return (wmo >= 51 && wmo <= 67) || (wmo >= 71 && wmo <= 77) || (wmo >= 80 && wmo <= 86);
+}
+
+export function classifyHourlyPType({
+  airTempF,
+  wetBulbF,
+  temp925F = null,
+  temp850F = null,
+  freezingLevelFt = null,
+  soil0cmF = null,
+  precipIn = 0,
+  snowIn = 0,
+  wmoCode = 0,
+  priorLiquid8hIn = 0,
+  groundFreezeThresholdF = 32
+} = {}) {
+  const airF = toFiniteNumber(airTempF) ?? 50;
+  const twF = toFiniteNumber(wetBulbF) ?? computeWetBulbF(airF, 75);
+  const t925 = toFiniteNumber(temp925F);
+  const t850 = toFiniteNumber(temp850F);
+  const frzFt = toFiniteNumber(freezingLevelFt);
+  const s0 = toFiniteNumber(soil0cmF);
+  const pIn = Math.max(0, toFiniteNumber(precipIn) ?? 0);
+  const sIn = Math.max(0, toFiniteNumber(snowIn) ?? 0);
+  const wmo = Math.trunc(toFiniteNumber(wmoCode) ?? 0);
+  const prior8 = Math.max(0, toFiniteNumber(priorLiquid8hIn) ?? 0);
+  const threshF = toFiniteNumber(groundFreezeThresholdF) ?? 32;
+
+  const precipActive = pIn >= 0.004 || sIn >= 0.02 || isPrecipWmoCode(wmo);
+  const coldSoil = s0 != null && s0 <= threshF;
+
+  if (!precipActive) {
+    const subFreeze = airF <= 32 || coldSoil;
+    if (subFreeze && prior8 >= 0.03) return 'REFREEZE';
+    return subFreeze ? 'DRY_FREEZE' : 'CLEAR';
+  }
+
+  let warmPeak = -Infinity;
+  if (t925 != null) warmPeak = Math.max(warmPeak, t925);
+  if (t850 != null) warmPeak = Math.max(warmPeak, t850);
+  const hasAloft = warmPeak > -Infinity;
+  const hasWarmNose = hasAloft && warmPeak > 33.0;
+  const deepRefreeze =
+    (t925 != null && t925 <= 30.0 && airF <= 29.0) ||
+    (t850 != null && t850 > 33.5 && t925 != null && t925 <= 29.0 && twF <= 30.0);
+
+  if (wmo === 56 || wmo === 57 || wmo === 66 || wmo === 67) return 'FREEZING_RAIN';
+  if (hasWarmNose && !deepRefreeze && (airF <= 32.5 || twF <= 32.0 || coldSoil)) return 'FREEZING_RAIN';
+  if (!hasAloft && pIn >= 0.004 && sIn < 0.01 && (airF <= 32.0 || (coldSoil && airF <= Math.max(34.0, threshF + 1.0)))) {
+    return 'FREEZING_RAIN';
+  }
+  if (hasWarmNose && deepRefreeze) return 'SLEET';
+
+  const snowWmo = wmo === 71 || wmo === 73 || wmo === 75 || wmo === 77 || wmo === 85 || wmo === 86;
+  if (!hasWarmNose && (airF <= 33.5 || twF <= 32.0) && (sIn >= 0.02 || snowWmo || (twF <= 32.5 && airF <= 34.0))) {
+    return 'SNOW';
+  }
+  if (((sIn >= 0.02 || snowWmo) && airF <= 42.0) || (twF <= 34.5 && (airF <= 35.5 || (frzFt != null && frzFt <= 1800)))) {
+    return 'WINTRY_MIX';
+  }
+  return airF <= 42.0 ? 'COLD_RAIN' : 'CLEAR';
+}
+
+export function computeHourlyIceAccretion(pType, airTempF, precipIn) {
+  const p = toFiniteNumber(precipIn);
+  if (p === null || p <= 0) return 0;
+  const tf = toFiniteNumber(airTempF) ?? 32;
+  if (pType === 'FREEZING_RAIN') {
+    let eff = tf < 27 ? 0.95 : tf < 31 ? 0.85 : 0.65;
+    if (p > 0.25 && tf >= 31.5) eff *= 0.8;
+    return p * eff;
+  }
+  if (pType === 'SLEET') return p * 0.15;
+  if (pType === 'WINTRY_MIX' && tf <= 32.5) return p * 0.25;
+  return 0;
+}
+
+function parseIsoDurationMs(durStr) {
+  const s = String(durStr || '').trim().toUpperCase();
+  const wk = s.match(/^P(\d+)W$/);
+  if (wk) {
+    const wkMs = Number(wk[1]) * 7 * 86400000;
+    return Number.isFinite(wkMs) && wkMs > 0 ? Math.max(3600000, wkMs) : 3600000;
+  }
+  const m = s.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
+  if (!m) return 3600000;
+  const days = Number(m[1] || 0);
+  const hrs = Number(m[2] || 0);
+  const mins = Number(m[3] || 0);
+  const secs = Number(m[4] || 0);
+  const ms = ((days * 24 + hrs) * 3600 + mins * 60 + secs) * 1000;
+  return Number.isFinite(ms) && ms > 0 ? Math.max(3600000, ms) : 3600000;
+}
+
+function parseNwsValidTimeSpan(validTime) {
+  const raw = String(validTime || '');
+  const slash = raw.indexOf('/');
+  if (slash <= 0 || slash + 1 >= raw.length) return null;
+  const startMs = parseUtcTimestampMs(raw.slice(0, slash));
+  if (startMs == null) return null;
+  const durMs = parseIsoDurationMs(raw.slice(slash + 1));
+  return [startMs, startMs + durMs];
+}
+
+function accumFactorInches(uom, defaultFactor = 1 / 25.4) {
+  const raw = normalizeUnitCode(uom);
+  if (!raw) return defaultFactor;
+  const u = raw.includes(':') ? raw.split(':').pop() : raw;
+  if (u.includes('inch') || u === 'in') return 1;
+  if (u.includes('cm')) return 1 / 2.54;
+  if (u === 'mm' || u.includes('millimet') || u.includes('kg_m-2') || u.includes('kg/m2')) return 1 / 25.4;
+  if (u === 'm' || u === 'meter' || u === 'meters') return 39.3700787;
+  return defaultFactor;
+}
+
+export function parseNwsGridWinter(gridData, nowMs = Date.now()) {
+  const empty = { snow24hIn: 0, snow72hIn: 0, ice24hIn: 0, ice72hIn: 0, minWindChill72hF: null, hasFreezingRainWx: false, hasSleetWx: false, hasSnowWx: false };
+  if (!gridData) return empty;
+  let parsed = gridData;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return empty;
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return empty;
+  const refNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const props = parsed.properties || parsed;
+  const end24 = refNowMs + 24 * 3600000;
+  const end72 = refNowMs + 72 * 3600000;
+
+  const integrate = (series) => {
+    if (!series || !Array.isArray(series.values)) return [0, 0];
+    const factor = accumFactorInches(series.uom, 1 / 25.4);
+    let s24 = 0;
+    let s72 = 0;
+    for (const item of series.values) {
+      const val = toFiniteNumber(item?.value);
+      if (val == null || val <= 0) continue;
+      const span = parseNwsValidTimeSpan(item.validTime);
+      if (!span || span[1] <= span[0]) continue;
+      const totalMs = span[1] - span[0];
+      const inches = val * factor;
+      const o24 = Math.min(end24, span[1]) - Math.max(refNowMs, span[0]);
+      if (o24 > 0) s24 += inches * (o24 / totalMs);
+      const o72 = Math.min(end72, span[1]) - Math.max(refNowMs, span[0]);
+      if (o72 > 0) s72 += inches * (o72 / totalMs);
+    }
+    return [Number(s24.toFixed(2)), Number(s72.toFixed(2))];
+  };
+
+  const [snow24hIn, snow72hIn] = integrate(props.snowfallAmount);
+  const [ice24hIn, ice72hIn] = integrate(props.iceAccumulation);
+
+  let minWindChillRawF = null;
+  if (props.windChill && Array.isArray(props.windChill.values)) {
+    const wcUnit = props.windChill.uom || 'wmoUnit:degC';
+    for (const item of props.windChill.values) {
+      const f = convertTempToF(item?.value, wcUnit);
+      if (f == null) continue;
+      const span = parseNwsValidTimeSpan(item.validTime);
+      if (span && (span[1] <= refNowMs || span[0] >= end72)) continue;
+      if (minWindChillRawF == null || f < minWindChillRawF) minWindChillRawF = f;
+    }
+  }
+  const minWindChill72hF = minWindChillRawF == null ? null : Math.round(minWindChillRawF);
+
+  let hasFreezingRainWx = false;
+  let hasSleetWx = false;
+  let hasSnowWx = false;
+  if (props.weather && Array.isArray(props.weather.values)) {
+    for (const item of props.weather.values) {
+      const span = parseNwsValidTimeSpan(item.validTime);
+      if (!span || span[1] <= refNowMs || span[0] >= end72) continue;
+      const entries = Array.isArray(item.value) ? item.value : [];
+      for (const e of entries) {
+        const wx = String(e?.weather || '').toLowerCase();
+        if (wx.includes('freezing_rain') || wx.includes('freezing_drizzle')) hasFreezingRainWx = true;
+        if (wx.includes('sleet') || wx.includes('ice_pellets')) hasSleetWx = true;
+        if (wx.includes('snow')) hasSnowWx = true;
+      }
+    }
+  }
+  return { snow24hIn, snow72hIn, ice24hIn, ice72hIn, minWindChill72hF, hasFreezingRainWx, hasSleetWx, hasSnowWx };
+}
+
+export function wssiImpactRank(impactRaw) {
+  const s = String(impactRaw || '').trim().toUpperCase();
+  if (s.includes('EXTREME')) return 6;
+  if (s.includes('MAJOR')) return 5;
+  if (s.includes('MODERATE')) return 4;
+  if (s.includes('MINOR')) return 3;
+  if (s.includes('LIMITED')) return 2;
+  if (s.includes('WINTER WEATHER') || s.includes('WINTER WX')) return 1;
+  return 0;
+}
+
+export function wssiMetaForRank(rank) {
+  switch (rank) {
+    case 6: return { label: 'EXTREME', color: '#D946EF' };
+    case 5: return { label: 'MAJOR', color: '#EF4444' };
+    case 4: return { label: 'MODERATE', color: '#F97316' };
+    case 3: return { label: 'MINOR', color: '#FACC15' };
+    case 2: return { label: 'LIMITED', color: '#60A5FA' };
+    case 1: return { label: 'WINTER WX', color: '#38BDF8' };
+    default: return { label: 'NONE', color: '#64748B' };
+  }
+}
+
+export function evaluateWssiAtPoint(lat, lon, wssiBundle) {
+  const nLat = toFiniteNumber(lat);
+  const nLon = toFiniteNumber(lon);
+  const validPt = nLat !== null && nLon !== null && isValidLatLon(nLat, nLon);
+  const layers = wssiBundle?.layers || (wssiBundle && typeof wssiBundle === 'object'
+    ? (wssiBundle.type === 'FeatureCollection' ? { 4: wssiBundle } : wssiBundle)
+    : null);
+  const findBest = (fc) => {
+    if (!fc || !Array.isArray(fc.features) || !validPt) return { rank: 0, label: 'NONE', color: '#64748B', validTime: null };
+    let bestRank = 0;
+    let validTime = null;
+    for (const f of fc.features) {
+      if (!f?.geometry || !isPointInGeometry(nLat, nLon, f.geometry)) continue;
+      const p = f.properties || {};
+      const r = wssiImpactRank(p.impact ?? p.IMPACT);
+      if (r > bestRank) {
+        bestRank = r;
+        validTime = p.valid_time ?? p.VALID_TIME ?? null;
+      }
+    }
+    const meta = wssiMetaForRank(bestRank);
+    return { rank: bestRank, label: meta.label, color: meta.color, validTime };
+  };
+  if (!layers) {
+    return { day1: 'NONE', day2: 'NONE', day3: 'NONE', overall: 'NONE', snowComponent: 'NONE', iceComponent: 'NONE', highestImpact: 'NONE', highestColor: '#64748B', highestRank: 0, validTime: null };
+  }
+  const d1 = findBest(layers[1]);
+  const d2 = findBest(layers[2]);
+  const d3 = findBest(layers[3]);
+  const all = findBest(layers[4]);
+  const snowC = findBest(layers[9]);
+  const iceC = findBest(layers[19]);
+  const highestRank = Math.max(d1.rank, d2.rank, d3.rank, all.rank, snowC.rank, iceC.rank);
+  const topMeta = wssiMetaForRank(highestRank);
+  return {
+    day1: d1.label,
+    day2: d2.label,
+    day3: d3.label,
+    overall: all.label,
+    snowComponent: snowC.label,
+    iceComponent: iceC.label,
+    highestImpact: topMeta.label,
+    highestColor: topMeta.color,
+    highestRank,
+    validTime: all.validTime || d1.validTime || d2.validTime || d3.validTime
+  };
+}
+
+export function analyzeWinterModels(winterModels, nwsSnow72h = null, nwsIce72h = null, nowMs = Date.now()) {
+  const refNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const hourly = winterModels?.hourly || {};
+  const units = winterModels?.hourly_units || {};
+  const offsetSec = Number.isFinite(winterModels?.utc_offset_seconds) ? winterModels.utc_offset_seconds : 0;
+  const times = Array.isArray(hourly.time) ? hourly.time : [];
+  const startIdx = times.length ? findWinterStartHourIndex(times, refNowMs, offsetSec) : 0;
+  const defs = [
+    { name: 'HRRR', suffix: 'gfs_hrrr' },
+    { name: 'GFS', suffix: 'gfs_seamless' },
+    { name: 'ECMWF', suffix: 'ecmwf_ifs025' }
+  ];
+  const estimates = [];
+  for (const def of defs) {
+    const tArr = hourly[`temperature_2m_${def.suffix}`];
+    if (!Array.isArray(tArr) || !tArr.length) continue;
+    const tUnit = units[`temperature_2m_${def.suffix}`] || units.temperature_2m || '°F';
+    const pUnit = units[`precipitation_${def.suffix}`] || units.precipitation || 'inch';
+    const sUnit = units[`snowfall_${def.suffix}`] || units.snowfall || 'inch';
+    const pArr = hourly[`precipitation_${def.suffix}`] || [];
+    const sArr = hourly[`snowfall_${def.suffix}`] || [];
+    const wArr = hourly[`weather_code_${def.suffix}`] || [];
+    const limit = Math.min(tArr.length, startIdx + 72);
+    let snowSum = 0;
+    let iceSum = 0;
+    let minT = Infinity;
+    let validCount = 0;
+    for (let i = startIdx; i < limit; i++) {
+      const t = convertTempToF(tArr[i], tUnit);
+      if (t == null) continue;
+      validCount++;
+      if (t < minT) minT = t;
+      const p = Math.max(0, convertPrecipToInches(pArr[i], pUnit));
+      const s = Math.max(0, convertSnowfallToInches(sArr[i], sUnit));
+      const w = Math.trunc(toFiniteNumber(wArr[i]) ?? 0);
+      const fz = (w === 56 || w === 57 || w === 66 || w === 67) || (p >= 0.004 && s < 0.02 && t <= 32.2);
+      if (fz) {
+        iceSum += computeHourlyIceAccretion('FREEZING_RAIN', t, p);
+      } else if (s > 0) {
+        snowSum += s;
+      } else if (p >= 0.004 && t <= 32.0) {
+        snowSum += p * dynamicSlrForTempF(t);
+      }
+    }
+    if (validCount > 0) {
+      estimates.push({
+        modelName: def.name,
+        snow72hIn: Number(snowSum.toFixed(1)),
+        ice72hIn: Number(iceSum.toFixed(2)),
+        minTemp72hF: Number(minT.toFixed(1))
+      });
+    }
+  }
+  const nwsSnowNum = toFiniteNumber(nwsSnow72h);
+  const nwsIceNum = toFiniteNumber(nwsIce72h);
+  if (nwsSnowNum !== null || nwsIceNum !== null) {
+    estimates.push({
+      modelName: 'NWS',
+      snow72hIn: Number(Math.max(0, nwsSnowNum ?? 0).toFixed(1)),
+      ice72hIn: Number(Math.max(0, nwsIceNum ?? 0).toFixed(2)),
+      minTemp72hF: estimates.length ? estimates[0].minTemp72hF : 32.0
+    });
+  }
+  if (!estimates.length) {
+    return { estimates: [], snowMinIn: 0, snowMeanIn: 0, snowMaxIn: 0, iceMinIn: 0, iceMeanIn: 0, iceMaxIn: 0, tempSpreadF: 0, agreementLabel: 'N/A' };
+  }
+  const snows = estimates.map((e) => e.snow72hIn);
+  const ices = estimates.map((e) => e.ice72hIn);
+  const temps = estimates.map((e) => e.minTemp72hF);
+  const snowMinIn = Math.min(...snows);
+  const snowMaxIn = Math.max(...snows);
+  const iceMinIn = Math.min(...ices);
+  const iceMaxIn = Math.max(...ices);
+  const tempSpreadF = Number((Math.max(...temps) - Math.min(...temps)).toFixed(1));
+  const snowSpread = snowMaxIn - snowMinIn;
+  const iceSpread = iceMaxIn - iceMinIn;
+  let agreementLabel = 'LOW';
+  if (tempSpreadF <= 2.5 && snowSpread <= 1.0 && iceSpread <= 0.08) agreementLabel = 'HIGH';
+  else if (tempSpreadF <= 5.0 && snowSpread <= 3.0 && iceSpread <= 0.2) agreementLabel = 'MODERATE';
+  return {
+    estimates,
+    snowMinIn,
+    snowMeanIn: Number((snows.reduce((a, b) => a + b, 0) / estimates.length).toFixed(1)),
+    snowMaxIn,
+    iceMinIn,
+    iceMeanIn: Number((ices.reduce((a, b) => a + b, 0) / estimates.length).toFixed(2)),
+    iceMaxIn,
+    tempSpreadF,
+    agreementLabel
+  };
+}
+
+function formatWinterClock(ms, withDay = true) {
+  if (!Number.isFinite(ms)) return '--';
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: DEFAULT_TIME_ZONE,
+      ...(withDay ? { weekday: 'short' } : {}),
+      hour: 'numeric',
+      timeZoneName: 'short'
+    }).format(new Date(ms)).replace(/[\u202f\u00a0]+/g, ' ').trim();
+  } catch {
+    return '--';
+  }
+}
+
 /**
- * Full Winter / Ground Temp / Black Ice / Freezing Fog Suite
+ * Full 72h Pro Winter / Ground Temp / Thermal Profile / Glaze Ice / WSSI Suite
  */
-export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThresholdF = 32, nowMs = Date.now()) {
+export function analyzeWinterSuite(
+  openMeteo,
+  current = {},
+  groundFreezeThresholdF = 32,
+  nowMs = Date.now(),
+  extras = {}
+) {
   const safeCurrent = current || {};
+  const freezeThreshF = toFiniteNumber(groundFreezeThresholdF) ?? 32;
+  const refNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
   const hourly = openMeteo?.hourly || {};
   const hourlyUnits = openMeteo?.hourly_units || {};
   const tempUnit = hourlyUnits.temperature_2m || '°F';
+  const dewUnit = hourlyUnits.dew_point_2m || tempUnit;
+  const wetUnit = hourlyUnits.wet_bulb_temperature_2m || tempUnit;
+  const appUnit = hourlyUnits.apparent_temperature || tempUnit;
   const soil0Unit = hourlyUnits.soil_temperature_0cm || tempUnit;
   const soil6Unit = hourlyUnits.soil_temperature_6cm || tempUnit;
+  const precipUnit = hourlyUnits.precipitation || 'inch';
   const snowUnit = hourlyUnits.snowfall || 'inch';
-  const idx = findCurrentHourIndex(hourly, nowMs, openMeteo?.utc_offset_seconds ?? 0);
+  const snowDepthUnit = hourlyUnits.snow_depth || 'ft';
+  const t925Unit = hourlyUnits.temperature_925hPa || tempUnit;
+  const t850Unit = hourlyUnits.temperature_850hPa || tempUnit;
+  const t700Unit = hourlyUnits.temperature_700hPa || tempUnit;
+  const frzUnit = normalizeUnitCode(hourlyUnits.freezing_level_height || 'm');
+  const offsetSec = openMeteo?.utc_offset_seconds ?? 0;
+  const offsetOpts = Number.isFinite(offsetSec) && offsetSec !== 0 ? { utcOffsetSeconds: offsetSec } : {};
+  const times = Array.isArray(hourly.time) ? hourly.time : [];
+  const idx = times.length ? findWinterStartHourIndex(times, refNowMs, offsetSec) : 0;
 
   const g0Val = convertTempToF(hourly.soil_temperature_0cm?.[idx], soil0Unit);
   const g6Val = convertTempToF(hourly.soil_temperature_6cm?.[idx], soil6Unit);
@@ -722,9 +1197,9 @@ export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThreshol
   const ground6cmF = g6Val != null ? Math.round(g6Val) : null;
 
   const freezingLevelRaw = toFiniteNumber(hourly.freezing_level_height?.[idx]);
-  const freezingUnit = normalizeUnitCode(hourlyUnits.freezing_level_height || 'm');
+  const isMetersFrz = frzUnit === 'm' || frzUnit === 'meter' || frzUnit === 'meters';
   const freezingLevelFt = freezingLevelRaw != null
-    ? Math.max(0, Math.round(freezingUnit === 'm' || freezingUnit === 'meter' ? mToFeet(freezingLevelRaw) : freezingLevelRaw))
+    ? Math.max(0, Math.round(isMetersFrz ? mToFeet(freezingLevelRaw) : freezingLevelRaw))
     : null;
 
   const next24Temps = (hourly.temperature_2m || [])
@@ -736,23 +1211,332 @@ export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThreshol
     ? Math.round(Math.min(...next24Temps))
     : (toFiniteNumber(safeCurrent.tempF) ?? null);
 
-  const next24Snow = (hourly.snowfall || [])
+  const next24SnowLegacy = (hourly.snowfall || [])
     .slice(idx, idx + 24)
     .reduce((a, b) => a + Math.max(0, convertSnowfallToInches(b, snowUnit)), 0);
   const precipNow = Math.max(0, toFiniteNumber(openMeteo?.current?.precipitation) ?? 0);
-  const wmo = openMeteo?.current?.weather_code ?? 0;
+  const wmo = Math.trunc(toFiniteNumber(openMeteo?.current?.weather_code) ?? 0);
   const airF = toFiniteNumber(safeCurrent.tempF) ?? 50;
   const visMi = Math.max(0, toFiniteNumber(safeCurrent.visibilityMi) ?? 10);
+
+  // 72h thermal column & P-type trajectory
+  const nwsGrid = parseNwsGridWinter(extras?.gridData || null, refNowMs);
+  const totalAvailable = Math.max(
+    times.length,
+    Array.isArray(hourly.temperature_2m) ? hourly.temperature_2m.length : 0
+  );
+  const end72Idx = Math.min(totalAvailable, idx + 72);
+  const hourlySlots = [];
+  const liquidRing = new Array(8).fill(0);
+  let liquidPtr = 0;
+  let omSnow24 = 0;
+  let omSnow72 = 0;
+  let omIce24 = 0;
+  let omIce72 = 0;
+  let maxSnowDepthIn = 0;
+  let maxSnowRateHr = 0;
+  let minSoil0cmWintryF = null;
+  let minAirWintry = null;
+  let anySlotWintry = false;
+  let minTemp72hF = null;
+  let minWindChill72hF = nwsGrid.minWindChill72hF;
+  let hoursSubFreeze72h = 0;
+  let thermalProfile = {
+    airTempF: airF,
+    wetBulbF: computeWetBulbF(airF, toFiniteNumber(safeCurrent.humidity) ?? 75),
+    temp925F: null,
+    temp850F: null,
+    temp700F: null,
+    freezingLevelFt,
+    ground0cmF,
+    ground6cmF,
+    hasWarmNose: false,
+    warmNosePeakF: null,
+    dominantPType: 'CLEAR'
+  };
+
+  for (let i = idx; i < end72Idx; i++) {
+    const relHr = i - idx;
+    const slotMs = parseUtcTimestampMs(times[i], offsetOpts) ?? (refNowMs + relHr * 3600000);
+    const t2m = convertTempToF(hourly.temperature_2m?.[i], tempUnit) ?? airF;
+    const td = convertTempToF(hourly.dew_point_2m?.[i], dewUnit);
+    const rhVal = toFiniteNumber(hourly.relative_humidity_2m?.[i]) ?? (td != null ? deriveRhFromTempDewF(t2m, td) : 75);
+    const twF = convertTempToF(hourly.wet_bulb_temperature_2m?.[i], wetUnit) ?? computeWetBulbF(t2m, rhVal);
+    const t925 = convertTempToF(hourly.temperature_925hPa?.[i], t925Unit);
+    const t850 = convertTempToF(hourly.temperature_850hPa?.[i], t850Unit);
+    const t700 = convertTempToF(hourly.temperature_700hPa?.[i], t700Unit);
+    const frzRaw = toFiniteNumber(hourly.freezing_level_height?.[i]);
+    const frzFt = frzRaw != null ? Math.max(0, Math.round(isMetersFrz ? mToFeet(frzRaw) : frzRaw)) : null;
+    const s0 = convertTempToF(hourly.soil_temperature_0cm?.[i], soil0Unit);
+    const s6 = convertTempToF(hourly.soil_temperature_6cm?.[i], soil6Unit);
+    const precipIn = Math.max(0, convertPrecipToInches(hourly.precipitation?.[i], precipUnit));
+    const snowRawIn = Math.max(0, convertSnowfallToInches(hourly.snowfall?.[i], snowUnit));
+    const slotWmo = Math.trunc(toFiniteNumber(hourly.weather_code?.[i]) ?? 0);
+    const priorLiquid8hIn = liquidRing.reduce((a, b) => a + b, 0);
+
+    const pType = classifyHourlyPType({
+      airTempF: t2m,
+      wetBulbF: twF,
+      temp925F: t925,
+      temp850F: t850,
+      freezingLevelFt: frzFt,
+      soil0cmF: s0,
+      precipIn,
+      snowIn: snowRawIn,
+      wmoCode: slotWmo,
+      priorLiquid8hIn,
+      groundFreezeThresholdF: freezeThreshF
+    });
+    const iceIn = computeHourlyIceAccretion(pType, t2m, precipIn);
+    let slotSnowIn = 0;
+    if (pType === 'SNOW') slotSnowIn = snowRawIn > 0 ? snowRawIn : precipIn * dynamicSlrForTempF(t2m);
+    else if (pType === 'WINTRY_MIX') slotSnowIn = snowRawIn;
+    if (slotSnowIn > maxSnowRateHr) maxSnowRateHr = slotSnowIn;
+
+    liquidRing[liquidPtr % 8] = (pType === 'COLD_RAIN' || pType === 'CLEAR' || pType === 'FREEZING_RAIN' || pType === 'WINTRY_MIX' || pType === 'SLEET') ? precipIn : 0;
+    liquidPtr++;
+
+    const meta = PTYPE_META[pType] || PTYPE_META.CLEAR;
+    if (meta?.wintry || slotSnowIn > 0) {
+      anySlotWintry = true;
+      if (s0 != null && Number.isFinite(s0) && (minSoil0cmWintryF == null || s0 < minSoil0cmWintryF)) {
+        minSoil0cmWintryF = Number(s0.toFixed(1));
+      }
+      if (Number.isFinite(t2m) && (minAirWintry == null || t2m < minAirWintry)) {
+        minAirWintry = Number(t2m.toFixed(1));
+      }
+    }
+    hourlySlots.push({
+      epochMs: slotMs,
+      hourLabel: formatWinterClock(slotMs, true),
+      pType,
+      pTypeLabel: meta.label,
+      pTypeShortLabel: meta.shortLabel,
+      pTypeColor: meta.color,
+      airTempF: Number(t2m.toFixed(1)),
+      wetBulbF: Number(twF.toFixed(1)),
+      temp925F: t925 != null ? Number(t925.toFixed(1)) : null,
+      temp850F: t850 != null ? Number(t850.toFixed(1)) : null,
+      precipIn: Number(precipIn.toFixed(3)),
+      snowIn: Number(slotSnowIn.toFixed(2)),
+      iceIn: Number(iceIn.toFixed(3)),
+      soil0cmF: s0 != null ? Number(s0.toFixed(1)) : null
+    });
+
+    if (relHr < 24) {
+      omSnow24 += slotSnowIn;
+      omIce24 += iceIn;
+    }
+    omSnow72 += slotSnowIn;
+    omIce72 += iceIn;
+
+    const sdVal = toFiniteNumber(hourly.snow_depth?.[i]);
+    if (sdVal != null && sdVal > 0) {
+      const sdU = normalizeUnitCode(snowDepthUnit);
+      const sdIn = sdU.includes('ft')
+        ? sdVal * 12
+        : (sdU === 'm' || sdU === 'meter' || sdU === 'meters')
+          ? sdVal * 39.3701
+          : sdU === 'cm'
+            ? sdVal / 2.54
+            : sdVal;
+      if (sdIn > maxSnowDepthIn) maxSnowDepthIn = sdIn;
+    }
+    if (t2m <= 32) hoursSubFreeze72h++;
+    if (minTemp72hF == null || t2m < minTemp72hF) minTemp72hF = Number(t2m.toFixed(1));
+    const appT = convertTempToF(hourly.apparent_temperature?.[i], appUnit);
+    if (appT != null && (minWindChill72hF == null || appT < minWindChill72hF)) {
+      minWindChill72hF = Math.round(appT);
+    }
+
+    if (relHr === 0) {
+      const peak = t925 != null && t850 != null ? Math.max(t925, t850) : (t850 ?? t925 ?? null);
+      const effGround0 = s0 != null ? Number(s0.toFixed(1)) : ground0cmF;
+      const subFreezingSfc = t2m <= 32.5 || twF <= 32.0 || (effGround0 != null && effGround0 <= 32.0);
+      thermalProfile = {
+        airTempF: Number(t2m.toFixed(1)),
+        wetBulbF: Number(twF.toFixed(1)),
+        temp925F: t925 != null ? Number(t925.toFixed(1)) : null,
+        temp850F: t850 != null ? Number(t850.toFixed(1)) : null,
+        temp700F: t700 != null ? Number(t700.toFixed(1)) : null,
+        freezingLevelFt: frzFt ?? freezingLevelFt,
+        ground0cmF: effGround0,
+        ground6cmF: s6 != null ? Number(s6.toFixed(1)) : ground6cmF,
+        hasWarmNose: peak != null && peak > 33.0 && subFreezingSfc,
+        warmNosePeakF: peak != null ? Number(peak.toFixed(1)) : null,
+        dominantPType: pType
+      };
+    }
+  }
+
+  if (hourlySlots.some((s) => s.pType === 'FREEZING_RAIN' || s.pType === 'SLEET')) {
+    thermalProfile.hasWarmNose = true;
+  }
+
+  if (minSoil0cmWintryF == null && thermalProfile.ground0cmF != null && Number.isFinite(thermalProfile.ground0cmF)) {
+    minSoil0cmWintryF = Number(thermalProfile.ground0cmF.toFixed(1));
+  }
+  if (minAirWintry == null && minTemp72hF != null && Number.isFinite(minTemp72hF)) {
+    minAirWintry = Number(minTemp72hF.toFixed(1));
+  }
+
+  const finalSnow24 = Number(Math.max(omSnow24, nwsGrid.snow24hIn).toFixed(1));
+  const finalSnow72 = Number(Math.max(omSnow72, nwsGrid.snow72hIn).toFixed(1));
+  const finalIce24 = Number(Math.max(omIce24, nwsGrid.ice24hIn).toFixed(2));
+  const finalIce72 = Number(Math.max(omIce72, nwsGrid.ice72hIn).toFixed(2));
+
+  const iceRisk = classifyIceRisk(finalIce72);
+  let iceRiskDetail = iceRisk.detail;
+  if (finalIce72 >= 0.25) iceRiskDetail = `${finalIce72.toFixed(2)}" glaze forecast — ${iceRisk.detail}`;
+  else if (finalIce72 >= 0.01) iceRiskDetail = `${finalIce72.toFixed(2)}" ice — ${iceRisk.detail}`;
+
+  const wssi = evaluateWssiAtPoint(extras?.lat, extras?.lon, extras?.wssiBundle);
+  const modelSpread = analyzeWinterModels(
+    extras?.winterModels || null,
+    nwsGrid.snow72hIn > 0 ? nwsGrid.snow72hIn : finalSnow72,
+    nwsGrid.ice72hIn > 0 ? nwsGrid.ice72hIn : finalIce72,
+    refNowMs
+  );
+
+  const hasWintryActivity =
+    finalSnow72 >= 0.05 ||
+    finalIce72 >= 0.01 ||
+    modelSpread.snowMaxIn >= 0.1 ||
+    anySlotWintry;
+
+  const g6ValForNote = thermalProfile.ground6cmF ?? ground6cmF;
+  const g6Str = g6ValForNote != null && Number.isFinite(g6ValForNote) ? `${Math.round(g6ValForNote)}°F` : '--°F';
+  const g0Str = minSoil0cmWintryF != null && Number.isFinite(minSoil0cmWintryF) ? `${Math.round(minSoil0cmWintryF)}°F` : '--°F';
+
+  let groundAccumStatus = 'NO_WINTRY_PRECIP';
+  let groundAccumNote = `No wintry precipitation expected in 72h (0cm ${g0Str} / 6cm ${g6Str}, ${hoursSubFreeze72h}h<=32°F).`;
+  let roadSnow72hIn = 0.0;
+
+  if (!hasWintryActivity) {
+    groundAccumStatus = 'NO_WINTRY_PRECIP';
+    roadSnow72hIn = 0.0;
+  } else if (
+    finalIce72 < 0.05 &&
+    maxSnowRateHr < 1.0 &&
+    minSoil0cmWintryF != null &&
+    (
+      minSoil0cmWintryF >= 37.0 ||
+      (minAirWintry != null && minAirWintry >= 33.5 && minSoil0cmWintryF >= 34.5) ||
+      (hoursSubFreeze72h === 0 && minSoil0cmWintryF >= 34.0)
+    )
+  ) {
+    groundAccumStatus = 'WARM_GROUND_MELTS';
+    roadSnow72hIn = 0.0;
+    groundAccumNote = `Ground too warm to stick (0cm ${Math.round(minSoil0cmWintryF)}°F / 6cm ${g6Str}, ${hoursSubFreeze72h}h<=32°F): any falling snow/mix melts on contact — wet roads only, no accumulation.`;
+  } else if (finalIce72 < 0.05 && minSoil0cmWintryF != null && minSoil0cmWintryF > 32.5) {
+    groundAccumStatus = 'MARGINAL_SLUSHY';
+    roadSnow72hIn = Number((finalSnow72 * 0.25).toFixed(1));
+    groundAccumNote = `Marginal ground (${Math.round(minSoil0cmWintryF)}°F): melts initially on roads; slushy coating mainly on grass, decks & elevated bridges during heavier bursts.`;
+  } else {
+    groundAccumStatus = 'COLD_GROUND_STICKS';
+    roadSnow72hIn = finalSnow72;
+    groundAccumNote = `Sub-freezing surface (${minSoil0cmWintryF != null ? `${Math.round(minSoil0cmWintryF)}°F ground` : 'freezing temps'}): snow/ice will stick immediately to roads, bridges & overpasses.`;
+  }
+
+  let changeoverLabel = 'No wintry precip in 72h';
+  let refreezeLabel = 'No wet-to-freeze refreeze detected';
+  let peakWindowLabel = 'No significant snow/ice peak';
+  let thawLabel = 'Stays above freezing (>32°F all 72h)';
+  let lastColdIdx = -1;
+
+  for (let i = 0; i < hourlySlots.length; i++) {
+    const s = hourlySlots[i];
+    const meta = PTYPE_META[s.pType];
+    if (meta?.wintry && changeoverLabel.startsWith('No ')) {
+      changeoverLabel = `${meta.label} @ ${formatWinterClock(s.epochMs, true)}`;
+    }
+    if (s.pType === 'REFREEZE' && refreezeLabel.startsWith('No ')) {
+      refreezeLabel = `Black-ice refreeze @ ${formatWinterClock(s.epochMs, true)}`;
+    }
+    if (
+      s.airTempF <= 32 ||
+      (s.soil0cmF != null && s.soil0cmF <= 32) ||
+      s.pType === 'FREEZING_RAIN' ||
+      s.pType === 'REFREEZE' ||
+      s.pType === 'DRY_FREEZE'
+    ) {
+      lastColdIdx = i;
+    }
+  }
+  if (lastColdIdx >= 0) {
+    thawLabel = 'Stays <=32°F through 72h';
+    for (let i = lastColdIdx + 1; i < hourlySlots.length; i++) {
+      if (hourlySlots[i].airTempF >= 34) {
+        thawLabel = `Thaw >=34°F @ ${formatWinterClock(hourlySlots[i].epochMs, true)}`;
+        break;
+      }
+    }
+  }
+  if (groundAccumStatus === 'WARM_GROUND_MELTS') {
+    if (!changeoverLabel.startsWith('No ')) {
+      changeoverLabel = changeoverLabel.includes(' @ ')
+        ? changeoverLabel.replace(' @ ', ' (melts on warm ground) @ ')
+        : `${changeoverLabel} (melts on warm ground)`;
+    } else if (finalSnow72 >= 0.05 || modelSpread.snowMaxIn >= 0.1) {
+      changeoverLabel = 'Flakes / model snow flux (melts on warm ground)';
+    }
+  }
+  if (hourlySlots.length >= 6) {
+    let bestScore = 0;
+    let bestStart = -1;
+    for (let i = 0; i <= hourlySlots.length - 6; i++) {
+      let sc = 0;
+      for (let j = 0; j < 6; j++) {
+        sc += hourlySlots[i + j].snowIn + hourlySlots[i + j].iceIn * 12;
+      }
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestStart = i;
+      }
+    }
+    if (bestStart >= 0 && bestScore > 0.05) {
+      peakWindowLabel = `${formatWinterClock(hourlySlots[bestStart].epochMs, false)} – ${formatWinterClock(hourlySlots[bestStart + 5].epochMs, true)}`;
+    }
+  }
+
+  const tForSlr = minTemp72hF ?? thermalProfile.airTempF ?? 30;
+  const slrLabel = finalSnow72 > 0 ? `${dynamicSlrForTempF(tForSlr)}:1 SLR` : 'Dry / 10:1';
+
+  let headline = '72H MONITORING';
+  if (finalIce72 >= 0.5 || (wssi.highestRank >= 5 && finalIce72 >= 0.25)) {
+    headline = `MAJOR ICE STORM (${finalIce72.toFixed(2)}")`;
+  } else if (finalIce72 >= 0.25) {
+    headline = `ICE STORM DANGER (${finalIce72.toFixed(2)}")`;
+  } else if (groundAccumStatus === 'WARM_GROUND_MELTS') {
+    if (wssi.highestRank >= 3) {
+      headline = `WPC WSSI: ${wssi.highestImpact}`;
+    } else if (finalSnow72 >= 0.1 || modelSpread.snowMaxIn >= 0.2) {
+      headline = 'MELTING FLAKES / WARM GROUND';
+    } else {
+      headline = '72H MONITORING';
+    }
+  } else if (finalSnow72 >= 4.0) {
+    headline = `WINTER STORM (${finalSnow72.toFixed(1)}" Snow)`;
+  } else if (finalIce72 >= 0.1) {
+    headline = `FREEZING RAIN (${finalIce72.toFixed(2)}" Ice)`;
+  } else if (finalSnow72 >= 0.5) {
+    headline = `SNOW FORECAST (${finalSnow72.toFixed(1)}" / 72h)`;
+  } else if (hourlySlots.some((s) => s.pType === 'REFREEZE')) {
+    headline = 'BLACK ICE REFREEZE';
+  } else if (wssi.highestRank >= 3) {
+    headline = `WPC WSSI: ${wssi.highestImpact}`;
+  }
 
   let hazardLevel = 'CLEAR';
   let statusLabel = 'Clear / Above Freezing';
   let roadBridgeRiskLabel = 'Dry / Safe Road Surfaces';
   const winterAlerts = [];
 
-  const isColdGround = ground0cmF != null && ground0cmF <= groundFreezeThresholdF;
+  const isColdGround = ground0cmF != null && ground0cmF <= freezeThreshF;
   const isFreezingPrecip = wmo === 56 || wmo === 57 || wmo === 66 || wmo === 67 || (precipNow > 0 && (airF <= 33 || isColdGround));
   const isFreezingFog = wmo === 48 || (visMi <= 0.5 && airF <= 32);
   const isDenseFog = visMi <= 0.5 && airF > 32;
+  const hasRefreezeSlot = hourlySlots.some((s) => s.pType === 'REFREEZE');
 
   if (isFreezingPrecip) {
     hazardLevel = 'CRITICAL';
@@ -774,15 +1558,38 @@ export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThreshol
       summary: `Air ${airF}°F • Ground ${ground0cmF ?? '--'}°F • Visibility ${visMi} mi — black ice possible on elevated roads.`,
       severity: 'high'
     });
-  } else if (next24Snow >= 1.0) {
-    hazardLevel = 'MODERATE';
-    statusLabel = `Accumulating Snow (${next24Snow.toFixed(1)}" / 24h)`;
+  } else if (finalIce72 >= 0.25) {
+    hazardLevel = 'CRITICAL';
+    statusLabel = `Damaging Ice Storm (${finalIce72.toFixed(2)}" Glaze)`;
+    roadBridgeRiskLabel = iceRisk.detail;
+    winterAlerts.push({
+      id: 'winter_ice_glaze',
+      title: `Ice Storm Glaze Threat (${finalIce72.toFixed(2)}")`,
+      summary: `${changeoverLabel} • Peak: ${peakWindowLabel} • ${iceRisk.detail}`,
+      severity: 'high'
+    });
+  } else if (groundAccumStatus !== 'WARM_GROUND_MELTS' && (next24SnowLegacy >= 1.0 || finalSnow24 >= 1.0 || finalSnow72 >= 4.0)) {
+    hazardLevel = finalSnow72 >= 4.0 ? 'HIGH' : 'MODERATE';
+    const snowDisp = Math.max(next24SnowLegacy, finalSnow24);
+    statusLabel = finalSnow72 >= 4.0
+      ? `Winter Storm Snow (${finalSnow72.toFixed(1)}" / 72h)`
+      : `Accumulating Snow (${snowDisp.toFixed(1)}" / 24h)`;
     roadBridgeRiskLabel = isColdGround ? 'Snow Sticking Immediately to Pavement' : 'Slushy / Melting Initially';
     winterAlerts.push({
       id: 'winter_snow',
       title: 'Accumulating Snow Expected',
-      summary: `${next24Snow.toFixed(1)}" snow forecast over next 24h • Ground 0cm: ${ground0cmF ?? '--'}°F.`,
-      severity: 'mod'
+      summary: `${snowDisp.toFixed(1)}" snow 24h (${finalSnow72.toFixed(1)}" 72h) • Ground 0cm: ${ground0cmF ?? '--'}°F.`,
+      severity: finalSnow72 >= 4.0 ? 'high' : 'mod'
+    });
+  } else if (finalIce72 >= 0.1 || wssi.highestRank >= 4) {
+    hazardLevel = 'HIGH';
+    statusLabel = finalIce72 >= 0.1 ? `Freezing Rain Glaze (${finalIce72.toFixed(2)}")` : `WPC WSSI ${wssi.highestImpact} Impact`;
+    roadBridgeRiskLabel = finalIce72 >= 0.1 ? iceRisk.detail : `WSSI Overall: ${wssi.overall}`;
+    winterAlerts.push({
+      id: 'winter_pro_advisory',
+      title: headline,
+      summary: `${changeoverLabel} • ${refreezeLabel} • Models: ${modelSpread.agreementLabel}`,
+      severity: 'high'
     });
   } else if (isDenseFog) {
     hazardLevel = 'ADVISORY';
@@ -794,10 +1601,33 @@ export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThreshol
       summary: `Visibility reduced to ${visMi} mi • Air ${airF}°F.`,
       severity: 'mod'
     });
-  } else if ((minTemp24h != null && minTemp24h <= 28) || (isColdGround && airF <= 34)) {
+  } else if ((minTemp24h != null && minTemp24h <= 28) || (isColdGround && airF <= 34) || hasRefreezeSlot || finalIce72 >= 0.01) {
     hazardLevel = 'ADVISORY';
-    statusLabel = (minTemp24h != null && minTemp24h <= 28) ? `Hard Freeze (${minTemp24h}°F)` : 'Frost / Near-Freezing Surface';
-    roadBridgeRiskLabel = 'Watch Shaded Bridges for Patchy Frost';
+    if (finalIce72 >= 0.01) {
+      statusLabel = `Light Glaze / Icing (${finalIce72.toFixed(2)}")`;
+      roadBridgeRiskLabel = 'Elevated Surfaces & Bridges Slick';
+    } else if (hasRefreezeSlot) {
+      statusLabel = refreezeLabel;
+      roadBridgeRiskLabel = 'Wet Roads Refreezing After Sunset';
+      winterAlerts.push({
+        id: 'winter_refreeze',
+        title: 'Black-Ice Refreeze Hazard',
+        summary: `${refreezeLabel} • Wet roads refreezing after sunset — bridges & overpasses slick.`,
+        severity: 'high'
+      });
+    } else {
+      statusLabel = (minTemp24h != null && minTemp24h <= 28) ? `Hard Freeze (${minTemp24h}°F)` : 'Frost / Near-Freezing Surface';
+      roadBridgeRiskLabel = 'Watch Shaded Bridges for Patchy Frost';
+    }
+  }
+
+  if (
+    groundAccumStatus === 'WARM_GROUND_MELTS' &&
+    (hazardLevel === 'CLEAR' || (hazardLevel === 'ADVISORY' && !isDenseFog && !hasRefreezeSlot && finalIce72 < 0.01 && !(minTemp24h != null && minTemp24h <= 28)))
+  ) {
+    roadBridgeRiskLabel = groundAccumNote;
+  } else if (groundAccumStatus === 'MARGINAL_SLUSHY' && hazardLevel === 'CLEAR') {
+    roadBridgeRiskLabel = groundAccumNote;
   }
 
   return {
@@ -809,9 +1639,39 @@ export function analyzeWinterSuite(openMeteo, current = {}, groundFreezeThreshol
     freezingLevelFt,
     hoursBelowFreezingNext24h,
     minTemp24h,
-    snow24hIn: Number(next24Snow.toFixed(1)),
+    snow24hIn: Number(next24SnowLegacy.toFixed(1)),
     visibilityMi: visMi,
-    winterAlerts
+    winterAlerts,
+    proWinter: {
+      thermalProfile,
+      hourlySlots,
+      snow24hIn: finalSnow24,
+      snow72hIn: finalSnow72,
+      roadSnow72hIn,
+      groundAccumStatus,
+      groundAccumNote,
+      minSoil0cmWintryF,
+      nwsSnow72hIn: Number(nwsGrid.snow72hIn.toFixed(1)),
+      maxSnowDepthIn: Number(maxSnowDepthIn.toFixed(1)),
+      slrLabel,
+      ice24hIn: finalIce24,
+      ice72hIn: finalIce72,
+      nwsIce72hIn: Number(nwsGrid.ice72hIn.toFixed(2)),
+      minTemp72hF,
+      minWindChill72hF,
+      hoursSubFreeze72h,
+      iceRiskTier: iceRisk.tier,
+      iceRiskLabel: iceRisk.label,
+      iceRiskColor: iceRisk.color,
+      iceRiskDetail,
+      changeoverLabel,
+      peakWindowLabel,
+      refreezeLabel,
+      thawLabel,
+      headline,
+      modelSpread,
+      wssi
+    }
   };
 }
 

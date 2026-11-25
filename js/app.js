@@ -1,6 +1,7 @@
 import {
   RADAR_PRODUCTS,
   STALE_THRESHOLD_MS,
+  WPC_WSSI_MODES,
   buildRadarFrames,
   evaluateDataStaleness,
   fetchIemStormIntel,
@@ -8,8 +9,11 @@ import {
   fetchNwsAlerts,
   fetchNwsPointBundle,
   fetchOpenMeteo,
+  fetchOpenMeteoWinterModels,
   fetchSpcOverlayLayer,
   fetchWpcFloodOutlook,
+  fetchWpcWssiBundle,
+  fetchWpcWssiLayer,
   formatCentralHour,
   formatCentralTime,
   getCentralHour24,
@@ -23,11 +27,14 @@ import {
   canonicalAlertId,
   classifyNwsAlert,
   evaluateMultiDayOutlooks,
+  evaluateWssiAtPoint,
   filterAndDeduplicateAlerts,
   isAlertExpired,
   mphToKt,
   resolveCurrentConditions,
-  wmoInfo
+  wmoInfo,
+  wssiImpactRank,
+  wssiMetaForRank
 } from './analyzers.js';
 import { findNearestNexradStation, getStationsSortedByDistance } from './nexradStations.js';
 import { degToCompass, geometryCentroid, haversineMiles, initialBearingDeg, isPointInGeometry, isValidLatLon } from './geoMath.js';
@@ -56,6 +63,7 @@ const DEFAULT_SETTINGS = {
   groundFreezeThresholdF: 32,
   radarProduct: 'CONUS_MOSAIC',
   spcOverlayLayerId: 1,
+  wssiOverlayLayerId: 4,
   radarOpacity: 0.78,
   basemap: 'dark'
 };
@@ -65,6 +73,35 @@ const DEFAULT_LOCATION = {
   name: 'Booneville, MS',
   lat: 34.6581,
   lon: -88.5667
+};
+
+let _svgUid = 0;
+
+const SPC_CAT_INFO = {
+  TSTM: { rank: 0, scale: '0/5', title: 'General Thunderstorms', color: '#81c784', desc: 'Non-severe lightning, brief heavy downpours, and gusty winds possible; organized severe storms not expected.' },
+  MRGL: { rank: 1, scale: '1/5', title: 'Marginal Risk', color: '#4caf50', desc: 'Isolated severe storms possible; limited in duration and coverage with localized hail or gusty winds.' },
+  SLGT: { rank: 2, scale: '2/5', title: 'Slight Risk', color: '#fdd835', desc: 'Scattered severe thunderstorms possible; short-lived or isolated intense storms with damaging winds, hail, or a brief tornado.' },
+  ENH: { rank: 3, scale: '3/5', title: 'Enhanced Risk', color: '#fb8c00', desc: 'Numerous severe storms possible; more persistent and widespread damaging winds, large hail, and tornadoes.' },
+  MDT: { rank: 4, scale: '4/5', title: 'Moderate Risk', color: '#ef5350', desc: 'Widespread severe weather outbreak likely; long-lived intense supercells, strong tornadoes, and destructive wind/hail swaths.' },
+  HIGH: { rank: 5, scale: '5/5', title: 'High Risk', color: '#d500f9', desc: 'Major severe weather outbreak expected; life-threatening violent tornadoes and/or widespread destructive derecho winds.' }
+};
+
+const WPC_ERO_INFO = {
+  MRGL: { rank: 1, scale: '1/4', pct: '5–15%', title: 'Marginal Flash Flood Risk', color: '#26a69a', desc: 'Localized rapid runoff and minor flooding possible in poor-drainage urban areas, creeks, and low-water crossings.' },
+  SLGT: { rank: 2, scale: '2/4', pct: '15–40%', title: 'Slight Flash Flood Risk', color: '#fdd835', desc: 'Scattered flash flooding expected with intense rainfall rates; low-water crossings and small streams may flood quickly.' },
+  MDT: { rank: 3, scale: '3/4', pct: '40–70%', title: 'Moderate Flash Flood Risk', color: '#ef5350', desc: 'Numerous significant flash floods likely; dangerous water rises across roads, creeks, and flood-prone communities.' },
+  HIGH: { rank: 4, scale: '4/4', pct: '≥70%', title: 'High Flash Flood Risk', color: '#d500f9', desc: 'Severe, widespread, and life-threatening flash flooding expected. Avoid travel and move to higher ground immediately.' }
+};
+
+const PTYPE_SEVERITY_ORDER = {
+  FREEZING_RAIN: 8,
+  SLEET: 7,
+  SNOW: 6,
+  WINTRY_MIX: 5,
+  REFREEZE: 4,
+  COLD_RAIN: 3,
+  DRY_FREEZE: 2,
+  CLEAR: 1
 };
 
 const state = {
@@ -89,6 +126,8 @@ const state = {
   staleness: null,
   stormCells: [],
   iemIntel: null,
+  winterModels: null,
+  wssiBundle: null,
   multiDaySpc: null,
   afd: null,
   activePlayingSoundId: null,
@@ -142,6 +181,7 @@ const radarMap = new RadarMapController('radar-map-container', {
   onInspectWatch: (watch, ctx) => openInspectSheet('watch', watch, ctx),
   onInspectMcd: (mcd, ctx) => openInspectSheet('mcd', mcd, ctx),
   onInspectWpc: (wpc, ctx) => openInspectSheet('wpc', wpc, ctx),
+  onInspectWssi: (wssi, ctx) => openInspectSheet('wssi', wssi, ctx),
   onInspectOutlook: (outlook, ctx) => openInspectSheet('outlook', outlook, ctx),
   onInspectPoint: (ctx) => openInspectSheet('point', ctx, ctx)
 });
@@ -608,6 +648,11 @@ function wireEvents() {
     btn.addEventListener('click', () => { void selectSpcOverlayLayer(Number(btn.dataset.spcLayer)); });
   });
 
+  document.querySelectorAll('#wssi-mode-row .wssi-mode-btn').forEach((btn) => {
+    btn.classList.toggle('active', Number(btn.dataset.wssiLayer) === (state.settings.wssiOverlayLayerId || 4));
+    btn.addEventListener('click', () => { void selectWssiOverlayLayer(Number(btn.dataset.wssiLayer)); });
+  });
+
   document.getElementById('btn-close-afd-modal')?.addEventListener('click', () => {
     document.getElementById('afd-modal')?.classList.add('hidden');
   });
@@ -659,7 +704,7 @@ function wireEvents() {
     document.getElementById('radar-inspect-sheet')?.classList.add('hidden');
   });
 
-  ['alerts', 'cells', 'watches', 'spc', 'flood', 'mcd', 'lsr'].forEach((key) => {
+  ['alerts', 'cells', 'watches', 'spc', 'flood', 'wssi', 'mcd', 'lsr'].forEach((key) => {
     document.getElementById(`layer-${key}`)?.addEventListener('change', async (e) => {
       radarMap.setLayerVisibility(key, e.target.checked);
       if (key === 'flood' && e.target.checked && !state.iemIntel?.wpcFloodGeoJson?.features?.length) {
@@ -667,6 +712,16 @@ function wireEvents() {
           const wpcFloodGeoJson = await fetchWpcFloodOutlook();
           state.iemIntel = { ...(state.iemIntel || {}), wpcFloodGeoJson };
           radarMap.setOverlayData({ wpcFloodGeoJson });
+        } catch {
+          // non-fatal when offline
+        }
+      }
+      if (key === 'wssi' && e.target.checked && !state.wssiBundle?.overlayGeoJson?.features?.length) {
+        try {
+          const lid = state.settings.wssiOverlayLayerId || 4;
+          const bundle = await fetchWpcWssiBundle(lid);
+          state.wssiBundle = bundle;
+          radarMap.setOverlayData({ wpcWssiGeoJson: bundle.overlayGeoJson });
         } catch {
           // non-fatal when offline
         }
@@ -944,6 +999,7 @@ function switchActiveLocation(newLoc, { fly = true } = {}) {
     state.regionalAlerts = [];
     state.radarFrames = [];
     state.stormCells = [];
+    state.winterModels = null;
     state.multiDaySpc = null;
     state.afd = null;
     state.lastUpdated = null;
@@ -998,10 +1054,13 @@ async function refreshAllData(silent = false) {
   const includeFlood = Boolean(document.getElementById('layer-flood')?.checked);
 
   try {
-    const [nwsRes, omRes, iemRes] = await Promise.allSettled([
+    const wssiLayerId = state.settings.wssiOverlayLayerId || 4;
+    const [nwsRes, omRes, iemRes, winModelRes, wssiRes] = await Promise.allSettled([
       fetchNwsPointBundle(lat, lon, force),
       fetchOpenMeteo(lat, lon),
-      fetchIemStormIntel(state.settings.spcOverlayLayerId || 1, { includeFlood, force })
+      fetchIemStormIntel(state.settings.spcOverlayLayerId || 1, { includeFlood, force }),
+      fetchOpenMeteoWinterModels(lat, lon, { force }).catch(() => null),
+      fetchWpcWssiBundle(wssiLayerId, force).catch(() => null)
     ]);
 
     // Abort stale write-back if user switched locations while requests were in flight
@@ -1018,12 +1077,36 @@ async function refreshAllData(silent = false) {
         ...nextNws,
         forecastPeriods: nextNws.forecastPeriods?.length ? nextNws.forecastPeriods : (prevNws?.forecastPeriods || []),
         hourlyPeriods: nextNws.hourlyPeriods?.length ? nextNws.hourlyPeriods : (prevNws?.hourlyPeriods || []),
+        gridData: nextNws.gridData || prevNws?.gridData || null,
         observations: nextNws.observations?.length ? nextNws.observations : (prevNws?.observations || [])
       };
     }
     if (omOk) state.openMeteo = omRes.value;
     if (iemRes.status === 'fulfilled' && iemRes.value) {
       state.iemIntel = mergeDegradedIemIntel(state.iemIntel, iemRes.value);
+    }
+    if (winModelRes.status === 'fulfilled' && winModelRes.value) {
+      state.winterModels = winModelRes.value;
+    }
+    if (wssiRes.status === 'fulfilled' && wssiRes.value) {
+      const nextWssi = wssiRes.value;
+      if (nextWssi._meta?.allFailed && state.wssiBundle) {
+        // Offline / total WSSI failure — preserve prior valid WSSI polygons
+      } else if (nextWssi._meta?.degraded && state.wssiBundle?.layers) {
+        const failedIds = new Set(nextWssi._meta.failedLayerIds || []);
+        const mergedLayers = { ...nextWssi.layers };
+        for (const fid of failedIds) {
+          if (state.wssiBundle.layers[fid]) mergedLayers[fid] = state.wssiBundle.layers[fid];
+        }
+        const activeId = nextWssi.overlayLayerId || wssiLayerId;
+        state.wssiBundle = {
+          ...nextWssi,
+          layers: mergedLayers,
+          overlayGeoJson: mergedLayers[activeId] || nextWssi.overlayGeoJson
+        };
+      } else {
+        state.wssiBundle = nextWssi;
+      }
     }
 
     if (state.nwsBundle?.cityLabel && state.activeLocation.id === 'gps_current') {
@@ -1083,12 +1166,22 @@ async function refreshAllData(silent = false) {
       state.current = resolveCurrentConditions(state.nwsBundle, state.openMeteo, nowMs);
     }
     const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
-    state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
-      convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
-      nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
-      nowMs
-    });
-    state.winter = analyzeWinterSuite(state.openMeteo, state.current, state.settings.groundFreezeThresholdF, nowMs);
+    if (state.openMeteo?.hourly || !state.environment) {
+      state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+        convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
+        nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
+        nowMs
+      });
+    }
+    if (state.openMeteo?.hourly || !state.winter) {
+      state.winter = analyzeWinterSuite(state.openMeteo, state.current, state.settings.groundFreezeThresholdF, nowMs, {
+        gridData: state.nwsBundle?.gridData || null,
+        winterModels: state.winterModels,
+        wssiBundle: state.wssiBundle,
+        lat,
+        lon
+      });
+    }
     state.stormCells = analyzeStormCells(state.iemIntel?.stormCellsGeoJson, lat, lon, 120, nowMs);
 
     if (anyFeedSucceeded) {
@@ -1306,9 +1399,41 @@ function checkAllLiveAlertTriggers() {
     }
   }
 
-  // 5. Winter / Black Ice / Freezing Fog Alerts
-  if (s.winterAlertsEnabled && state.winter?.winterAlerts?.length) {
-    const wa = state.winter.winterAlerts.find((w) => w.severity === 'high') || state.winter.winterAlerts[0];
+  // 5. Winter / Black Ice / Freezing Fog / Pro Winter Ice, Snow & Refreeze Alerts
+  if (s.winterAlertsEnabled && state.winter) {
+    const pw = state.winter.proWinter;
+    let wa = (state.winter.winterAlerts || []).find((w) => w.severity === 'high') || null;
+    if (!wa && pw) {
+      const ice72 = Number(pw.ice72hIn) || 0;
+      const snow72 = Number(pw.snow72hIn) || 0;
+      const hasHighIce = ice72 >= 0.25 || pw.iceRiskTier === 'HIGH' || pw.iceRiskTier === 'CATASTROPHIC';
+      const roadSnow = pw.roadSnow72hIn != null ? Number(pw.roadSnow72hIn) : snow72;
+      const hasHighSnow = pw.groundAccumStatus !== 'WARM_GROUND_MELTS' && roadSnow >= 4.0;
+      const hasRefreeze = (Array.isArray(pw.hourlySlots) && pw.hourlySlots.some((slot) => slot?.pType === 'REFREEZE')) ||
+        (typeof pw.refreezeLabel === 'string' && pw.refreezeLabel.length > 0 && !pw.refreezeLabel.startsWith('No '));
+      if (hasHighIce) {
+        wa = {
+          id: 'pro_winter_ice',
+          title: pw.headline || `Ice Storm Threat (${ice72.toFixed(2)}")`,
+          summary: [pw.iceRiskDetail || 'Damaging glaze accretion forecast.', pw.changeoverLabel].filter(Boolean).join(' • '),
+          severity: 'high'
+        };
+      } else if (hasHighSnow) {
+        wa = {
+          id: 'pro_winter_snow',
+          title: pw.headline || `Winter Storm (${snow72.toFixed(1)}" Snow)`,
+          summary: [`${fmtFixed(pw.snow24hIn, 1, '0.0')}" / 24h`, pw.peakWindowLabel].filter(Boolean).join(' • '),
+          severity: 'high'
+        };
+      } else if (hasRefreeze) {
+        wa = {
+          id: 'pro_winter_refreeze',
+          title: 'Black-Ice Refreeze Hazard',
+          summary: [pw.refreezeLabel || 'Wet-to-freeze refreeze detected', pw.thawLabel].filter(Boolean).join(' • '),
+          severity: 'high'
+        };
+      }
+    }
     if (wa && wa.severity === 'high') {
       const hourBucket = new Date(nowMs).toISOString().slice(0, 13);
       if (!hasBeenNotified(`win_${wa.id}`, hourBucket)) {
@@ -1420,6 +1545,7 @@ function syncRadarOverlays() {
     mcdGeoJson: state.iemIntel?.mcdGeoJson,
     spcWatchesGeoJson: state.iemIntel?.spcWatchesGeoJson,
     wpcFloodGeoJson: state.iemIntel?.wpcFloodGeoJson,
+    wpcWssiGeoJson: state.wssiBundle?.layers?.[state.settings.wssiOverlayLayerId || 4] || state.wssiBundle?.overlayGeoJson,
     spcDay1GeoJson: state.iemIntel?.spcOverlayGeoJson || state.iemIntel?.spcDay1GeoJson,
     spcDay1CatGeoJson: state.iemIntel?.spcDay1GeoJson,
     spcDay1TorGeoJson: state.iemIntel?.spcDay1TorGeoJson,
@@ -1482,6 +1608,36 @@ async function selectSpcOverlayLayer(layerId) {
     const geo = await fetchSpcOverlayLayer(layerId);
     if (state.iemIntel) state.iemIntel.spcOverlayGeoJson = geo;
     radarMap.setOverlayData({ spcDay1GeoJson: geo, spcOverlayLayerId: layerId });
+  } catch {
+    // non-fatal when offline
+  }
+}
+
+async function selectWssiOverlayLayer(layerId) {
+  const safeId = Number.isFinite(Number(layerId)) ? Number(layerId) : 4;
+  state.settings.wssiOverlayLayerId = safeId;
+  saveSettings();
+  document.querySelectorAll('#wssi-mode-row .wssi-mode-btn').forEach((b) => {
+    b.classList.toggle('active', Number(b.dataset.wssiLayer) === safeId);
+  });
+  const chk = document.getElementById('layer-wssi');
+  if (chk && !chk.checked) {
+    chk.checked = true;
+    radarMap.setLayerVisibility('wssi', true);
+  }
+  try {
+    const cached = !state.wssiBundle?._meta?.allFailed ? state.wssiBundle?.layers?.[safeId] : null;
+    const geo = (cached && Array.isArray(cached.features) && cached.features.length > 0)
+      ? cached
+      : await fetchWpcWssiLayer(safeId);
+    const resolvedGeo = (geo?.features?.length || !cached) ? geo : cached;
+    state.wssiBundle = {
+      ...(state.wssiBundle || { layers: {} }),
+      overlayLayerId: safeId,
+      overlayGeoJson: resolvedGeo,
+      layers: { ...(state.wssiBundle?.layers || {}), [safeId]: resolvedGeo }
+    };
+    radarMap.setOverlayData({ wpcWssiGeoJson: resolvedGeo });
   } catch {
     // non-fatal when offline
   }
@@ -1586,22 +1742,6 @@ function renderSegmentedRiskBar(levelIdx, maxSteps, activeColor, labelText) {
   `;
 }
 
-const SPC_CAT_INFO = {
-  TSTM: { rank: 0, scale: '0/5', title: 'General Thunderstorms', color: '#81c784', desc: 'Non-severe lightning, brief heavy downpours, and gusty winds possible; organized severe storms not expected.' },
-  MRGL: { rank: 1, scale: '1/5', title: 'Marginal Risk', color: '#4caf50', desc: 'Isolated severe storms possible; limited in duration and coverage with localized hail or gusty winds.' },
-  SLGT: { rank: 2, scale: '2/5', title: 'Slight Risk', color: '#fdd835', desc: 'Scattered severe thunderstorms possible; short-lived or isolated intense storms with damaging winds, hail, or a brief tornado.' },
-  ENH: { rank: 3, scale: '3/5', title: 'Enhanced Risk', color: '#fb8c00', desc: 'Numerous severe storms possible; more persistent and widespread damaging winds, large hail, and tornadoes.' },
-  MDT: { rank: 4, scale: '4/5', title: 'Moderate Risk', color: '#ef5350', desc: 'Widespread severe weather outbreak likely; long-lived intense supercells, strong tornadoes, and destructive wind/hail swaths.' },
-  HIGH: { rank: 5, scale: '5/5', title: 'High Risk', color: '#d500f9', desc: 'Major severe weather outbreak expected; life-threatening violent tornadoes and/or widespread destructive derecho winds.' }
-};
-
-const WPC_ERO_INFO = {
-  MRGL: { rank: 1, scale: '1/4', pct: '5–15%', title: 'Marginal Flash Flood Risk', color: '#26a69a', desc: 'Localized rapid runoff and minor flooding possible in poor-drainage urban areas, creeks, and low-water crossings.' },
-  SLGT: { rank: 2, scale: '2/4', pct: '15–40%', title: 'Slight Flash Flood Risk', color: '#fdd835', desc: 'Scattered flash flooding expected with intense rainfall rates; low-water crossings and small streams may flood quickly.' },
-  MDT: { rank: 3, scale: '3/4', pct: '40–70%', title: 'Moderate Flash Flood Risk', color: '#ef5350', desc: 'Numerous significant flash floods likely; dangerous water rises across roads, creeks, and flood-prone communities.' },
-  HIGH: { rank: 4, scale: '4/4', pct: '≥70%', title: 'High Flash Flood Risk', color: '#d500f9', desc: 'Severe, widespread, and life-threatening flash flooding expected. Avoid travel and move to higher ground immediately.' }
-};
-
 function buildSystemSwitcherHtml(activeType, ctx) {
   if (!ctx || !ctx.systems) return '';
   const sys = ctx.systems;
@@ -1617,6 +1757,9 @@ function buildSystemSwitcherHtml(activeType, ctx) {
   }
   if (sys.floods?.length) {
     pills.push(`<button type="button" class="inspect-switch-pill ${activeType === 'wpc' ? 'active' : ''}" data-switch-sys="wpc">Flood ERO</button>`);
+  }
+  if (sys.wssiFeatures?.length) {
+    pills.push(`<button type="button" class="inspect-switch-pill ${activeType === 'wssi' ? 'active' : ''}" data-switch-sys="wssi">Winter WSSI</button>`);
   }
   if (sys.outlooks?.length) {
     pills.push(`<button type="button" class="inspect-switch-pill ${activeType === 'outlook' ? 'active' : ''}" data-switch-sys="outlook">SPC Outlook</button>`);
@@ -1872,6 +2015,37 @@ function openInspectSheet(type, item, ctx = null) {
       </div>
       ${ctr ? `<div class="inspect-action-bar"><button type="button" class="btn-secondary-sm" data-inspect-fly="${ctr.lat},${ctr.lon},7.2">Center Flood Outlook</button></div>` : ''}
     `;
+  } else if (type === 'wssi' && item) {
+    const p = item.properties || item;
+    const impactStr = String(p.impact ?? p.IMPACT ?? 'WINTER WEATHER AREA').trim();
+    const validTime = p.valid_time ?? p.VALID_TIME;
+    const issueTime = p.issue_time ?? p.ISSUE_TIME;
+    const component = p.component ?? p.COMPONENT;
+    const rank = wssiImpactRank(impactStr);
+    const meta = wssiMetaForRank(rank);
+    const ctr = item.geometry ? geometryCentroid(item.geometry) : null;
+    const insideUser = item.geometry ? isPointInGeometry(loc.lat, loc.lon, item.geometry) : false;
+    const modeLabel = (WPC_WSSI_MODES.find((m) => m.id === (state.settings.wssiOverlayLayerId || 4)) || WPC_WSSI_MODES[0]).label;
+
+    toneClass = rank >= 4 ? 'sheet-tone-critical' : 'sheet-tone-cyan';
+    titleEl.textContent = `WPC Winter Storm Severity — ${meta.label}`;
+    subtitle = `Layer: ${modeLabel}${component ? ` • ${component}` : ''}`;
+
+    bodyEl.innerHTML = `
+      ${switcherHtml}
+      <div class="tag-row" style="margin-top:0;">
+        <span class="badge-blue">NOAA WPC WSSI (${escapeHtml(modeLabel)})</span>
+        <span class="badge-${rank >= 4 ? 'red' : rank >= 3 ? 'amber' : 'cyan'}">${escapeHtml(impactStr.toUpperCase())}</span>
+        ${insideUser ? '<span class="badge-cyan">COVERS YOUR LOCATION</span>' : ''}
+      </div>
+      ${renderSegmentedRiskBar(Math.max(1, rank), 6, meta.color, `${meta.label} • Rank ${rank}/6`)}
+      <div class="inspect-kv-card">
+        ${validTime ? `<div class="inspect-kv-row"><span>Valid Window</span><strong>${escapeHtml(String(validTime))}</strong></div>` : ''}
+        ${issueTime ? `<div class="inspect-kv-row"><span>Issued</span><strong>${escapeHtml(String(issueTime))}</strong></div>` : ''}
+        <div class="inspect-kv-row"><span>Component</span><strong>${escapeHtml(String(component || 'Overall Winter Severity'))}</strong></div>
+      </div>
+      ${ctr ? `<div class="inspect-action-bar"><button type="button" class="btn-secondary-sm" data-inspect-fly="${ctr.lat},${ctr.lon},6.8">Center WSSI Area</button></div>` : ''}
+    `;
   } else if (type === 'outlook' && item) {
     const p = item.properties || item;
     const rawLbl = String(p.LABEL || p.LABEL2 || p.OUTLOOK || '').trim().toUpperCase();
@@ -1971,6 +2145,10 @@ function openInspectSheet(type, item, ctx = null) {
     }
     if (ptOutlooks.wpcDay1FloodRisk !== 'NONE') {
       coveringChips.push(`<button type="button" class="inspect-sys-chip tone-blue" data-switch-sys="wpc">💧 WPC Flood: ${escapeHtml(ptOutlooks.wpcDay1FloodRisk)}</button>`);
+    }
+    const ptWssi = evaluateWssiAtPoint(ptLat, ptLon, state.wssiBundle);
+    if (ptWssi.highestRank > 0) {
+      coveringChips.push(`<button type="button" class="inspect-sys-chip tone-cyan" ${sys.wssiFeatures?.length ? 'data-switch-sys="wssi"' : ''}>❄️ WSSI: ${escapeHtml(ptWssi.highestImpact)}</button>`);
     }
 
     const nc = sys.nearestCell;
@@ -2085,6 +2263,7 @@ function openInspectSheet(type, item, ctx = null) {
       else if (target === 'watch' && sys?.watches?.[0]) openInspectSheet('watch', sys.watches[0], ctx);
       else if (target === 'mcd' && sys?.mcds?.[0]) openInspectSheet('mcd', sys.mcds[0], ctx);
       else if (target === 'wpc' && sys?.floods?.[0]) openInspectSheet('wpc', sys.floods[0], ctx);
+      else if (target === 'wssi' && sys?.wssiFeatures?.[0]) openInspectSheet('wssi', sys.wssiFeatures[0], ctx);
       else if (target === 'outlook' && sys?.outlooks?.[0]) openInspectSheet('outlook', sys.outlooks[0], ctx);
       else if (target === 'cell' && sys?.nearestCell) openInspectSheet('cell', sys.nearestCell, ctx);
     });
@@ -2109,8 +2288,6 @@ function openInspectSheet(type, item, ctx = null) {
 }
 
 /* ==================== GRAPHICS & TELEMETRY HELPERS ==================== */
-let _svgUid = 0;
-
 function skyAtmosphereClass(condText, isNight) {
   const s = String(condText || '').toLowerCase();
   if (s.includes('thunder') || s.includes('storm') || s.includes('tornado')) return 'cond-storm';
@@ -2341,6 +2518,231 @@ function severityMeter(pct, color) {
   return `<div class="metric-meter"><div class="metric-meter-fill" style="width:${clamped}%;background:${color};"></div></div>`;
 }
 
+function wssiPillColor(label) {
+  const s = String(label || 'NONE').toUpperCase();
+  if (s.includes('EXTREME')) return '#d946ef';
+  if (s.includes('MAJOR')) return '#ef4444';
+  if (s.includes('MODERATE')) return '#f97316';
+  if (s.includes('MINOR')) return '#facc15';
+  if (s.includes('LIMITED')) return '#60a5fa';
+  if (s.includes('WINTER')) return '#38bdf8';
+  return '#64748b';
+}
+
+function renderProWinterCardHtml(win) {
+  const safeWin = win || {
+    hazardLevel: 'CLEAR',
+    statusLabel: 'Clear / Above Freezing',
+    roadBridgeRiskLabel: 'Dry / Safe Road Surfaces',
+    ground0cmF: null,
+    ground6cmF: null,
+    freezingLevelFt: null,
+    hoursBelowFreezingNext24h: 0,
+    minTemp24h: null
+  };
+  const pw = safeWin.proWinter;
+  if (!pw) {
+    return `
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">${sectionIcon('winter', 'blue')}Winter, Ground Temp &amp; Fog Suite</div>
+          <span class="badge-${safeWin.hazardLevel === 'CRITICAL' ? 'red' : safeWin.hazardLevel === 'CLEAR' ? 'green' : 'blue'}">${escapeHtml(safeWin.statusLabel)}</span>
+        </div>
+        <div class="regime-banner ${safeWin.hazardLevel === 'CRITICAL' ? 'high' : safeWin.hazardLevel === 'CLEAR' ? 'low' : 'winter'}">
+          <strong>Road / Bridge Surface:</strong> ${escapeHtml(safeWin.roadBridgeRiskLabel)}
+        </div>
+        <div class="metrics-grid cols-2">
+          <div class="metric-box">
+            <div class="metric-label">Ground Temp (0cm / 6cm)</div>
+            <div class="metric-value">${safeWin.ground0cmF ?? '--'}°F / ${safeWin.ground6cmF ?? '--'}°F</div>
+            <div class="metric-sub">Freeze trigger ≤ ${state.settings.groundFreezeThresholdF}°F</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Freezing Level / 24h Low</div>
+            <div class="metric-value">${safeWin.freezingLevelFt != null ? `${safeWin.freezingLevelFt.toLocaleString()} ft` : '--'}</div>
+            <div class="metric-sub">${safeWin.hoursBelowFreezingNext24h ?? 0}h ≤ 32°F • Low ${safeWin.minTemp24h ?? '--'}°F</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  const tp = pw.thermalProfile || {};
+  const wssi = pw.wssi || {};
+  const spread = pw.modelSpread || { estimates: [], agreementLabel: 'N/A' };
+  const slots = Array.isArray(pw.hourlySlots) ? pw.hourlySlots : [];
+  const segs24 = [];
+  for (let i = 0; i < 24; i++) {
+    const sA = slots[i * 2];
+    const sB = slots[i * 2 + 1];
+    const rankA = PTYPE_SEVERITY_ORDER[sA?.pType] || 0;
+    const rankB = PTYPE_SEVERITY_ORDER[sB?.pType] || 0;
+    const s = rankB > rankA ? sB : (sA || sB);
+    const col = s?.pTypeColor || '#334155';
+    const title = s ? `${s.hourLabel}: ${s.pTypeLabel} (${s.airTempF}°F)` : 'No data';
+    segs24.push(`<div class="ptype-seg" style="background:${col};" title="${escapeHtml(title)}"></div>`);
+  }
+  const ice72Val = Number.isFinite(Number(pw.ice72hIn)) ? Number(pw.ice72hIn) : 0;
+  const icePct = Math.min(100, Math.round((Math.max(0, ice72Val) / 0.5) * 100));
+  const badgeTone = safeWin.hazardLevel === 'CRITICAL' || pw.iceRiskTier === 'CATASTROPHIC' || pw.iceRiskTier === 'HIGH'
+    ? 'red'
+    : safeWin.hazardLevel === 'HIGH' || pw.iceRiskTier === 'MODERATE'
+      ? 'amber'
+      : safeWin.hazardLevel === 'CLEAR'
+        ? 'green'
+        : 'blue';
+
+  const tVal = (v) => (v != null && Number.isFinite(Number(v)) ? `${Math.round(Number(v))}°F` : '--');
+  const wssiItems = [
+    { layer: 1, key: 'Day 1', val: wssi.day1 || 'NONE' },
+    { layer: 2, key: 'Day 2', val: wssi.day2 || 'NONE' },
+    { layer: 3, key: 'Day 3', val: wssi.day3 || 'NONE' },
+    { layer: 4, key: 'Overall', val: wssi.overall || 'NONE' },
+    { layer: 19, key: 'Ice', val: wssi.iceComponent || 'NONE' },
+    { layer: 9, key: 'Snow', val: wssi.snowComponent || 'NONE' }
+  ];
+
+  const isWarmGroundMelts = pw.groundAccumStatus === 'WARM_GROUND_MELTS';
+  const isMarginalSlushy = pw.groundAccumStatus === 'MARGINAL_SLUSHY';
+  const hasWarmFlux = isWarmGroundMelts && (Number(pw.snow72hIn || 0) > 0 || Number(spread.snowMaxIn || 0) > 0);
+  const snowHeroHtml = hasWarmFlux
+    ? `0.0"<span class="winter-hero-tag">Roads</span>`
+    : isMarginalSlushy && Number(pw.snow72hIn || 0) > 0
+      ? `${fmtFixed(Number(pw.roadSnow72hIn ?? pw.snow72hIn ?? 0), 1, '0.0')}"<span class="winter-hero-tag">Roads</span>`
+      : `${fmtFixed(Number(pw.snow72hIn ?? 0), 1, '0.0')}"`;
+  const groundMeltsTemp = Math.round(pw.minSoil0cmWintryF ?? safeWin.ground0cmF ?? 45);
+  const aloftSnowIn = Number(pw.snow72hIn || 0) > 0 ? Number(pw.snow72hIn) : Number(spread.snowMaxIn || 0);
+  const snowSubText = hasWarmFlux
+    ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" aloft • Melts on ${groundMeltsTemp}°F ground`
+    : isMarginalSlushy && Number(pw.snow72hIn || 0) > 0
+      ? `${fmtFixed(Number(pw.snow72hIn ?? 0), 1, '0.0')}" aloft • Slushy on ${groundMeltsTemp}°F ground • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`
+      : `24h: ${fmtFixed(Number(pw.snow24hIn ?? 0), 1, '0.0')}" • Depth: ${fmtFixed(Number(pw.maxSnowDepthIn ?? 0), 1, '0.0')}" • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`;
+  const showAccumBannerNote = Boolean(
+    pw.groundAccumNote &&
+    safeWin.hazardLevel !== 'CRITICAL' &&
+    (isWarmGroundMelts || isMarginalSlushy || safeWin.hazardLevel === 'CLEAR') &&
+    pw.groundAccumStatus !== 'NO_WINTRY_PRECIP'
+  );
+  const regimeBannerText = showAccumBannerNote ? pw.groundAccumNote : safeWin.roadBridgeRiskLabel;
+
+  return `
+    <div class="card pro-winter-card" id="pro-winter-card">
+      <div class="card-header">
+        <div class="card-title">${sectionIcon('winter', 'blue')}Pro Winter, Ice &amp; WSSI Suite</div>
+        <span class="badge-${badgeTone}">${escapeHtml(pw.headline || safeWin.statusLabel)}</span>
+      </div>
+      <div class="regime-banner ${safeWin.hazardLevel === 'CRITICAL' ? 'high' : safeWin.hazardLevel === 'CLEAR' ? 'low' : 'winter'}">
+        <strong>Road / Bridge Surface:</strong> ${escapeHtml(regimeBannerText)}
+      </div>
+
+      <div class="winter-hero-grid">
+        <div class="winter-hero-tile">
+          <div class="metric-label">72h Snow Est. (${escapeHtml(pw.slrLabel || '10:1')})</div>
+          <div class="winter-hero-num" style="color:#e0f2fe;">${snowHeroHtml}</div>
+          <div class="metric-sub">${escapeHtml(snowSubText)}</div>
+        </div>
+        <div class="winter-hero-tile">
+          <div class="metric-label">72h Glaze Ice (${escapeHtml(pw.iceRiskTier || 'NONE')})</div>
+          <div class="winter-hero-num" style="color:${pw.iceRiskColor || '#64748b'};">${fmtFixed(ice72Val, 2, '0.00')}"</div>
+          <div class="metric-sub">${escapeHtml(pw.iceRiskDetail || 'No measurable glaze')}</div>
+          ${severityMeter(icePct, pw.iceRiskColor || '#38bdf8')}
+        </div>
+      </div>
+
+      <div class="winter-subsection-label">
+        <span>5-Level Thermal Column &amp; Warm Nose</span>
+        ${tp.hasWarmNose ? `<span class="warm-nose-pill">WARM NOSE ALOFT ${tVal(tp.warmNosePeakF)}</span>` : `<span class="metric-sub">Frz Lvl ${tp.freezingLevelFt != null && Number.isFinite(Number(tp.freezingLevelFt)) ? `${Number(tp.freezingLevelFt).toLocaleString()} ft` : '--'}</span>`}
+      </div>
+      <div class="thermal-column-grid">
+        <div class="thermal-cell">
+          <div class="thermal-lvl">2m Air</div>
+          <div class="thermal-val">${tVal(tp.airTempF)}</div>
+        </div>
+        <div class="thermal-cell">
+          <div class="thermal-lvl">Wet-Bulb Tw</div>
+          <div class="thermal-val">${tVal(tp.wetBulbF)}</div>
+        </div>
+        <div class="thermal-cell ${tp.hasWarmNose && tp.temp925F != null && Number(tp.temp925F) > 33 ? 'warm-nose' : ''}">
+          <div class="thermal-lvl">925 hPa</div>
+          <div class="thermal-val">${tVal(tp.temp925F)}</div>
+        </div>
+        <div class="thermal-cell ${tp.hasWarmNose && tp.temp850F != null && Number(tp.temp850F) > 33 ? 'warm-nose' : ''}">
+          <div class="thermal-lvl">850 hPa</div>
+          <div class="thermal-val">${tVal(tp.temp850F)}</div>
+        </div>
+        <div class="thermal-cell">
+          <div class="thermal-lvl">0cm / 6cm</div>
+          <div class="thermal-val">${safeWin.ground0cmF ?? '--'}° / ${safeWin.ground6cmF ?? '--'}°</div>
+        </div>
+      </div>
+
+      <div class="winter-subsection-label">
+        <span>48h P-Type &amp; Refreeze Timeline</span>
+        <span class="metric-sub">${pw.hoursSubFreeze72h ?? 0}h ≤32°F • Min ${pw.minTemp72hF ?? '--'}°F (WC ${pw.minWindChill72hF ?? '--'}°F)</span>
+      </div>
+      <div class="ptype-strip" aria-label="48 hour precipitation type timeline">
+        ${segs24.join('')}
+      </div>
+      <div class="winter-timeline-legend">
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#e0f2fe"></i>Snow</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#a78bfa"></i>Sleet</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#f472b6"></i>Fz Rain</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#22d3ee"></i>Mix</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#818cf8"></i>Refreeze</span>
+      </div>
+
+      <div class="winter-milestones-grid">
+        <div class="winter-milestone-item">
+          <div class="winter-milestone-k">Changeover</div>
+          <div class="winter-milestone-v">${escapeHtml(pw.changeoverLabel || '--')}</div>
+        </div>
+        <div class="winter-milestone-item">
+          <div class="winter-milestone-k">Peak 6h Window</div>
+          <div class="winter-milestone-v">${escapeHtml(pw.peakWindowLabel || '--')}</div>
+        </div>
+        <div class="winter-milestone-item">
+          <div class="winter-milestone-k">Black-Ice Refreeze</div>
+          <div class="winter-milestone-v">${escapeHtml(pw.refreezeLabel || '--')}</div>
+        </div>
+        <div class="winter-milestone-item">
+          <div class="winter-milestone-k">Thaw-Out (&ge;34°F)</div>
+          <div class="winter-milestone-v">${escapeHtml(pw.thawLabel || '--')}</div>
+        </div>
+      </div>
+
+      <div class="winter-subsection-label">
+        <span>NOAA WPC WSSI Days 1–3 (Tap to Map)</span>
+        <span class="metric-sub" style="color:${wssi.highestColor || '#64748b'};font-weight:700;">Peak: ${escapeHtml(wssi.highestImpact || 'NONE')}</span>
+      </div>
+      <div class="wssi-pills-grid">
+        ${wssiItems.map((it) => `
+          <button type="button" class="wssi-pill-btn" data-jump-wssi="${it.layer}">
+            <span class="wssi-pill-k">${escapeHtml(it.key)}</span>
+            <span class="wssi-pill-v" style="color:${wssiPillColor(it.val)};">${escapeHtml(it.val)}</span>
+          </button>
+        `).join('')}
+      </div>
+
+      <div class="winter-subsection-label">
+        <span>3-Model + NWS Ensemble Spread</span>
+        <span class="badge-${spread.agreementLabel === 'HIGH' ? 'green' : spread.agreementLabel === 'MODERATE' ? 'amber' : 'muted'}">Agreement: ${escapeHtml(spread.agreementLabel || 'N/A')} (${spread.tempSpreadF ?? 0}°F)</span>
+      </div>
+      ${isWarmGroundMelts && Number(spread.snowMaxIn || 0) > 0 ? `<div class="metric-sub winter-spread-note">Raw snow flux aloft — melts on warm ground</div>` : ''}
+      ${spread.estimates?.length ? `
+        <div class="model-spread-grid">
+          ${spread.estimates.map((m) => `
+            <div class="model-spread-cell">
+              <div class="winter-milestone-k">${escapeHtml(m.modelName)}</div>
+              <div class="winter-milestone-v">${fmtFixed(Number(m.snow72hIn), 1, '0.0')}" sn • ${fmtFixed(Number(m.ice72hIn), 2, '0.00')}" ice</div>
+              <div class="metric-sub">Min ${Number.isFinite(Number(m.minTemp72hF)) ? `${Math.round(Number(m.minTemp72hF))}°F` : '--'}</div>
+            </div>
+          `).join('')}
+        </div>
+      ` : `<div class="metric-sub">HRRR / GFS / ECMWF comparison syncing...</div>`}
+    </div>
+  `;
+}
+
 /* ==================== RENDER: DASHBOARD ==================== */
 function renderDashboard() {
   const container = document.getElementById('dashboard-content');
@@ -2350,7 +2752,19 @@ function renderDashboard() {
 
   const c = state.current;
   const env = state.environment || analyzeEnvironment(state.openMeteo, c, 0);
-  const win = state.winter || analyzeWinterSuite(state.openMeteo, c, state.settings.groundFreezeThresholdF);
+  const win = state.winter || analyzeWinterSuite(
+    state.openMeteo,
+    c,
+    state.settings.groundFreezeThresholdF,
+    Date.now(),
+    {
+      gridData: state.nwsBundle?.gridData || null,
+      winterModels: state.winterModels,
+      wssiBundle: state.wssiBundle,
+      lat: state.activeLocation?.lat,
+      lon: state.activeLocation?.lon
+    }
+  );
 
   const topAlert = state.localAlerts[0];
   const topThreatCell = state.stormCells.find((sc) => sc.threatScore >= 2 && (sc.intercept.verdict === 'DIRECT_INTERCEPT' || sc.tvs));
@@ -2539,28 +2953,8 @@ function renderDashboard() {
       </div>
     ` : ''}
 
-    <!-- FULL WINTER / GROUND TEMP / FOG SUITE -->
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">${sectionIcon('winter', 'blue')}Winter, Ground Temp &amp; Fog Suite</div>
-        <span class="badge-${win.hazardLevel === 'CRITICAL' ? 'red' : win.hazardLevel === 'CLEAR' ? 'green' : 'blue'}">${escapeHtml(win.statusLabel)}</span>
-      </div>
-      <div class="regime-banner ${win.hazardLevel === 'CRITICAL' ? 'high' : win.hazardLevel === 'CLEAR' ? 'low' : 'winter'}">
-        <strong>Road / Bridge Surface:</strong> ${escapeHtml(win.roadBridgeRiskLabel)}
-      </div>
-      <div class="metrics-grid cols-2">
-        <div class="metric-box">
-          <div class="metric-label">Ground Temp (0cm / 6cm)</div>
-          <div class="metric-value">${win.ground0cmF ?? '--'}°F / ${win.ground6cmF ?? '--'}°F</div>
-          <div class="metric-sub">Freeze trigger ≤ ${state.settings.groundFreezeThresholdF}°F</div>
-        </div>
-        <div class="metric-box">
-          <div class="metric-label">Freezing Level / 24h Low</div>
-          <div class="metric-value">${win.freezingLevelFt != null ? `${win.freezingLevelFt.toLocaleString()} ft` : '--'}</div>
-          <div class="metric-sub">${win.hoursBelowFreezingNext24h}h ≤ 32°F • Low ${win.minTemp24h ?? '--'}°F</div>
-        </div>
-      </div>
-    </div>
+    <!-- PRO WINTER, THERMAL COLUMN, GLAZE ICE & WSSI SUITE -->
+    ${renderProWinterCardHtml(win)}
 
     <!-- HOURLY FORECAST -->
     <div class="card">
@@ -2621,6 +3015,12 @@ function renderDashboard() {
     el.addEventListener('click', async () => {
       switchTab('radar');
       await selectSpcOverlayLayer(Number(el.dataset.jumpSpc));
+    });
+  });
+  container.querySelectorAll('[data-jump-wssi]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      switchTab('radar');
+      await selectWssiOverlayLayer(Number(el.dataset.jumpWssi));
     });
   });
   container.querySelector('[data-jump-flood]')?.addEventListener('click', async () => {
@@ -3315,7 +3715,7 @@ function renderSettings() {
     btn.addEventListener('click', () => {
       state.settings.convectiveAlertThreshold = btn.dataset.convThresh;
       saveSettings();
-      if (state.openMeteo && state.current) {
+      if (state.openMeteo?.hourly && state.current) {
         const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
         state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
           convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
@@ -3330,7 +3730,7 @@ function renderSettings() {
   document.getElementById('set-nocturnal')?.addEventListener('change', (e) => {
     state.settings.nocturnalReadinessEnabled = e.target.checked;
     saveSettings();
-    if (state.openMeteo && state.current) {
+    if (state.openMeteo?.hourly && state.current) {
       const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
       state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
         convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
@@ -3351,8 +3751,22 @@ function renderSettings() {
     const row = e.target.closest('.setting-item');
     const titleEl = row?.querySelector('.setting-title');
     if (titleEl) titleEl.textContent = `Ground Freeze Trigger (${val}°F)`;
-    if (state.openMeteo && state.current) {
-      state.winter = analyzeWinterSuite(state.openMeteo, state.current, state.settings.groundFreezeThresholdF);
+    if (state.openMeteo?.hourly && state.current) {
+      state.winter = analyzeWinterSuite(
+        state.openMeteo,
+        state.current,
+        state.settings.groundFreezeThresholdF,
+        Date.now(),
+        {
+          gridData: state.nwsBundle?.gridData || null,
+          winterModels: state.winterModels,
+          wssiBundle: state.wssiBundle,
+          lat: state.activeLocation?.lat,
+          lon: state.activeLocation?.lon
+        }
+      );
+      updateHeaderAndBadges();
+      updateTelemetryRibbon();
       renderDashboard();
     }
   });

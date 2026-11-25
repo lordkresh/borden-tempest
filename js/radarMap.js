@@ -342,6 +342,8 @@ const OVERLAY_LAYER_IDS = [
   'tempest_watches_fill',
   'tempest_flood_line',
   'tempest_flood_fill',
+  'tempest_wssi_line',
+  'tempest_wssi_fill',
   'tempest_spc_line',
   'tempest_spc_fill'
 ];
@@ -359,6 +361,7 @@ const OVERLAY_SOURCE_IDS = [
   'tempest_mcd',
   'tempest_watches',
   'tempest_flood',
+  'tempest_wssi',
   'tempest_spc'
 ];
 
@@ -429,6 +432,7 @@ export class RadarMapController {
       mcdGeoJson: { type: 'FeatureCollection', features: [] },
       spcWatchesGeoJson: { type: 'FeatureCollection', features: [] },
       wpcFloodGeoJson: { type: 'FeatureCollection', features: [] },
+      wpcWssiGeoJson: { type: 'FeatureCollection', features: [] },
       spcDay1GeoJson: { type: 'FeatureCollection', features: [] },
       spcDay1CatGeoJson: { type: 'FeatureCollection', features: [] },
       spcDay1TorGeoJson: { type: 'FeatureCollection', features: [] },
@@ -444,6 +448,7 @@ export class RadarMapController {
       spc: true,
       watches: true,
       flood: false,
+      wssi: true,
       mcd: true,
       lsr: true
     };
@@ -690,6 +695,12 @@ export class RadarMapController {
           .sort((a, b) => this._spcRank(b.properties) - this._spcRank(a.properties))
       : [];
 
+    const wssiFeatures = validPt
+      ? (this.overlayData.wpcWssiGeoJson?.features || [])
+          .filter((f) => f && f.geometry && isPointInGeometry(lat, lon, f.geometry))
+          .sort((a, b) => this._wssiRank(b.properties) - this._wssiRank(a.properties))
+      : [];
+
     const outlooks = validPt
       ? (this.overlayData.spcDay1GeoJson?.features || [])
           .filter((f) => f && f.geometry && isPointInGeometry(lat, lon, f.geometry))
@@ -730,12 +741,36 @@ export class RadarMapController {
       watches,
       mcds,
       floods,
+      wssiFeatures,
       outlooks,
       nearestCell,
       nearestCellDistMi: Number.isFinite(nearestCellDistMi) ? nearestCellDistMi : null,
       nearestLsr,
       nearestLsrDistMi: Number.isFinite(nearestLsrDistMi) ? nearestLsrDistMi : null
     };
+  }
+
+  _wssiRank(props) {
+    const s = String(props?.impact ?? props?.IMPACT ?? '').trim().toUpperCase();
+    if (s.includes('EXTREME')) return 6;
+    if (s.includes('MAJOR')) return 5;
+    if (s.includes('MODERATE')) return 4;
+    if (s.includes('MINOR')) return 3;
+    if (s.includes('LIMITED')) return 2;
+    if (s.includes('WINTER WEATHER')) return 1;
+    return 0;
+  }
+
+  _wssiColor(props) {
+    switch (this._wssiRank(props)) {
+      case 6: return '#d946ef';
+      case 5: return '#ef4444';
+      case 4: return '#f97316';
+      case 3: return '#facc15';
+      case 2: return '#60a5fa';
+      case 1: return '#38bdf8';
+      default: return '#64748b';
+    }
   }
 
   _queryRenderedSafe(screenPoint, layerIds) {
@@ -897,10 +932,22 @@ export class RadarMapController {
       }
     }
 
+    // 6b. WPC Winter Storm Severity Index (WSSI)
+    if (this.layerVisibility.wssi) {
+      const wssiHits = this._queryRenderedSafe(screenPoint, ['tempest_wssi_fill', 'tempest_wssi_line']);
+      const matchedWssi = systems.wssiFeatures?.[0] || (wssiHits.length ? [...wssiHits].sort((a, b) => this._wssiRank(b.properties) - this._wssiRank(a.properties))[0] : null);
+      if (matchedWssi) {
+        if (typeof this.callbacks.onInspectWssi === 'function') {
+          this.callbacks.onInspectWssi(matchedWssi, context);
+        }
+        return { type: 'wssi', item: matchedWssi, context };
+      }
+    }
+
     // 7. SPC Convective Outlook
     if (this.layerVisibility.spc) {
       const spcHits = this._queryRenderedSafe(screenPoint, ['tempest_spc_fill', 'tempest_spc_line']);
-      const matchedOutlook = systems.outlooks[0] || (spcHits.length ? spcHits.sort((a, b) => this._spcRank(b.properties) - this._spcRank(a.properties))[0] : null);
+      const matchedOutlook = systems.outlooks[0] || (spcHits.length ? [...spcHits].sort((a, b) => this._spcRank(b.properties) - this._spcRank(a.properties))[0] : null);
       if (matchedOutlook) {
         if (typeof this.callbacks.onInspectOutlook === 'function') {
           this.callbacks.onInspectOutlook(matchedOutlook, context);
@@ -1012,6 +1059,7 @@ export class RadarMapController {
       spc: ['tempest_spc_fill', 'tempest_spc_line'],
       watches: ['tempest_watches_fill', 'tempest_watches_line'],
       flood: ['tempest_flood_fill', 'tempest_flood_line'],
+      wssi: ['tempest_wssi_fill', 'tempest_wssi_line'],
       mcd: ['tempest_mcd_fill', 'tempest_mcd_line'],
       lsr: ['tempest_lsr_circle']
     };
@@ -1368,6 +1416,24 @@ export class RadarMapController {
       type: 'line',
       source: 'tempest_flood',
       paint: { 'line-color': '#00e676', 'line-width': 1.8, 'line-dasharray': [2, 2] }
+    });
+
+    // WPC Winter Storm Severity Index (WSSI Days 1-3)
+    this._safeAddSource('tempest_wssi', { type: 'geojson', data: this._emptyFc() });
+    this._safeAddLayer({
+      id: 'tempest_wssi_fill',
+      type: 'fill',
+      source: 'tempest_wssi',
+      paint: {
+        'fill-color': ['coalesce', ['get', 'wssiColor'], '#38bdf8'],
+        'fill-opacity': 0.24
+      }
+    });
+    this._safeAddLayer({
+      id: 'tempest_wssi_line',
+      type: 'line',
+      source: 'tempest_wssi',
+      paint: { 'line-color': ['coalesce', ['get', 'wssiColor'], '#7dd3fc'], 'line-width': 1.7 }
     });
 
     // SPC Watch Boxes (PDS Tornado magenta, Tornado red, Severe amber)
@@ -1787,6 +1853,11 @@ export class RadarMapController {
 
       this.map.getSource('tempest_spc')?.setData(this.overlayData.spcDay1GeoJson || this._emptyFc());
       this.map.getSource('tempest_flood')?.setData(this.overlayData.wpcFloodGeoJson || this._emptyFc());
+      const wssiFeats = (this.overlayData.wpcWssiGeoJson?.features || []).map((f) => {
+        const p = f?.properties || {};
+        return { ...f, properties: { ...p, wssiColor: this._wssiColor(p) } };
+      });
+      this.map.getSource('tempest_wssi')?.setData({ type: 'FeatureCollection', features: wssiFeats });
       const watchFeats = (this.overlayData.spcWatchesGeoJson?.features || []).map((f) => {
         const p = f.properties || {};
         const isPds = Boolean(p.is_pds || String(p.pds || '').toUpperCase() === 'Y');
