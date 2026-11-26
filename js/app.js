@@ -1,29 +1,38 @@
 import {
+  DEFAULT_TIME_ZONE,
   RADAR_PRODUCTS,
   STALE_THRESHOLD_MS,
   WPC_WSSI_MODES,
   buildRadarFrames,
+  clearWeatherApiCache,
   evaluateDataStaleness,
   fetchIemStormIntel,
   fetchNwsAfd,
   fetchNwsAlerts,
   fetchNwsPointBundle,
   fetchOpenMeteo,
-  fetchOpenMeteoWinterModels,
+  fetchOpenMeteoEnsemble,
+  fetchOpenMeteoModelMeta,
   fetchSpcOverlayLayer,
+  fetchSpcPointOutlooks,
   fetchWpcFloodOutlook,
   fetchWpcWssiBundle,
   fetchWpcWssiLayer,
-  formatCentralHour,
-  formatCentralTime,
-  getCentralHour24,
+  formatLocalHour,
+  formatLocalTime,
+  getLocalHour24,
+  getTimeZoneShortName,
   parseUtcTimestampMs,
   searchLocations
 } from './weatherApi.js';
 import {
+  WOFS_ATTRIBUTION,
+  WOFS_VIEWER_URL,
   analyzeEnvironment,
   analyzeStormCells,
   analyzeWinterSuite,
+  buildLocationAnchor,
+  buildMultiModelConsensus,
   canonicalAlertId,
   classifyNwsAlert,
   evaluateMultiDayOutlooks,
@@ -32,12 +41,13 @@ import {
   isAlertExpired,
   mphToKt,
   resolveCurrentConditions,
+  resolveLocationTimeZone,
   wmoInfo,
   wssiImpactRank,
   wssiMetaForRank
 } from './analyzers.js';
 import { findNearestNexradStation, getStationsSortedByDistance } from './nexradStations.js';
-import { degToCompass, geometryCentroid, haversineMiles, initialBearingDeg, isPointInGeometry, isValidLatLon } from './geoMath.js';
+import { degToCompass, geometryCentroid, haversineKm, haversineMiles, initialBearingDeg, isPointInGeometry, isValidLatLon } from './geoMath.js';
 import { RadarMapController } from './radarMap.js';
 import { SIREN_CATALOG, audioEngine } from './audio.js';
 import { APP_LOCAL_VERSION, updater } from './updater.js';
@@ -71,7 +81,7 @@ const DEFAULT_SETTINGS = {
 const DEFAULT_LOCATION = {
   id: 'default_booneville',
   name: 'Booneville, MS',
-  lat: 34.6581,
+  lat: 34.6579,
   lon: -88.5667
 };
 
@@ -94,12 +104,15 @@ const WPC_ERO_INFO = {
 };
 
 const PTYPE_SEVERITY_ORDER = {
-  FREEZING_RAIN: 8,
-  SLEET: 7,
-  SNOW: 6,
-  WINTRY_MIX: 5,
-  REFREEZE: 4,
-  COLD_RAIN: 3,
+  FREEZING_RAIN: 10,
+  SLEET: 9,
+  ACCUMULATING_SNOW: 8,
+  SNOW: 8,
+  WINTRY_MIX: 7,
+  WET_SNOW_MELTING: 6,
+  REFREEZE: 5,
+  COLD_RAIN: 4,
+  RAIN: 3,
   DRY_FREEZE: 2,
   CLEAR: 1
 };
@@ -112,10 +125,21 @@ const state = {
   selectedRadarSite: null,
   isLoading: false,
   isLocatingGps: false,
+  gpsAccuracyM: null,
+  gpsAltitudeM: null,
+  gpsTimestampMs: null,
+  isApproxFix: false,
+  gpsRetryTimerId: null,
   isOffline: false,
   lastUpdated: null,
+  locationAnchor: null,
   nwsBundle: null,
   openMeteo: null,
+  openMeteoEnsemble: null,
+  modelMeta: null,
+  consensus: null,
+  asosMos: null,
+  spcPointOutlooks: null,
   current: null,
   environment: null,
   winter: null,
@@ -142,6 +166,18 @@ const state = {
   pendingRefresh: null,
   notifiedMap: loadNotifiedMap()
 };
+
+function activeTimeZone() {
+  return resolveLocationTimeZone(
+    state.nwsBundle,
+    state.openMeteoEnsemble || state.openMeteo,
+    state.locationAnchor?.timeZone || DEFAULT_TIME_ZONE
+  );
+}
+
+function activeTzShort(ms = Date.now()) {
+  return getTimeZoneShortName(ms, activeTimeZone());
+}
 
 function getSavedHomeLocation() {
   if (Array.isArray(state.savedLocations)) {
@@ -660,6 +696,16 @@ function wireEvents() {
     if (e.target.id === 'afd-modal') document.getElementById('afd-modal').classList.add('hidden');
   });
 
+  const closeWofsModal = () => {
+    document.getElementById('wofs-modal')?.classList.add('hidden');
+    const frame = document.getElementById('wofs-iframe');
+    if (frame) frame.src = 'about:blank';
+  };
+  document.getElementById('btn-close-wofs-modal')?.addEventListener('click', closeWofsModal);
+  document.getElementById('wofs-modal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'wofs-modal') closeWofsModal();
+  });
+
   document.getElementById('btn-radar-play')?.addEventListener('click', () => {
     const playing = radarMap.togglePlayback();
     const playBtn = document.getElementById('btn-radar-play');
@@ -820,17 +866,35 @@ function hydrateFromSnapshot() {
     const raw = localStorage.getItem(STORAGE_KEY_SNAPSHOT);
     if (!raw) return false;
     const snap = JSON.parse(raw);
-    if (!snap || snap.locId !== state.activeLocation?.id) return false;
-    if (!snap.savedAt || Date.now() - snap.savedAt > 6 * 3600 * 1000) return false;
+    const loc = state.activeLocation || getSavedHomeLocation();
+    if (!snap || snap.locId !== loc?.id) {
+      localStorage.removeItem(STORAGE_KEY_SNAPSHOT);
+      return false;
+    }
+    if (!snap.savedAt || Date.now() - snap.savedAt > 6 * 3600 * 1000) {
+      localStorage.removeItem(STORAGE_KEY_SNAPSHOT);
+      return false;
+    }
+    // Spec §3.2 #3: Verify snapshot coordinates match active location within <= 1.0 km
+    const snapLat = Number(snap.lat);
+    const snapLon = Number(snap.lon);
+    if (!isValidLatLon(snapLat, snapLon) || haversineKm(snapLat, snapLon, Number(loc.lat), Number(loc.lon)) > 1.0) {
+      localStorage.removeItem(STORAGE_KEY_SNAPSHOT);
+      return false;
+    }
 
     const nowMs = Date.now();
-    const loc = state.activeLocation || getSavedHomeLocation();
 
     state.nwsBundle = snap.nwsBundle || null;
     if (state.nwsBundle && !state.nwsBundle._meta && snap.savedAt) {
       state.nwsBundle._meta = { fetchedAtMs: snap.savedAt };
     }
     state.openMeteo = snap.openMeteo || (snap.openMeteoMeta ? { _meta: snap.openMeteoMeta } : null);
+    state.locationAnchor = snap.locationAnchor || null;
+    state.consensus = snap.consensus || null;
+    state.asosMos = snap.asosMos || snap.consensus?.asosMos || null;
+    state.spcPointOutlooks = snap.spcPointOutlooks || null;
+    state.modelMeta = snap.modelMeta || null;
     state.current = snap.current || null;
     state.environment = snap.environment || null;
     state.winter = snap.winter || null;
@@ -862,19 +926,38 @@ function saveSnapshot() {
     const compactBundle = state.nwsBundle ? {
       cityLabel: state.nwsBundle.cityLabel,
       stateCode: state.nwsBundle.stateCode,
+      countyName: state.nwsBundle.countyName,
       cwa: state.nwsBundle.cwa,
+      wfoId: state.nwsBundle.wfoId,
+      gridX: state.nwsBundle.gridX,
+      gridY: state.nwsBundle.gridY,
+      forecastZone: state.nwsBundle.forecastZone,
       radarStation: state.nwsBundle.radarStation,
+      timeZone: state.nwsBundle.timeZone,
+      elevationM: state.nwsBundle.elevationM,
+      elevationFt: state.nwsBundle.elevationFt,
       forecastPeriods: (state.nwsBundle.forecastPeriods || []).slice(0, 14),
       hourlyPeriods: (state.nwsBundle.hourlyPeriods || []).slice(0, 24),
-      observations: (state.nwsBundle.observations || []).slice(0, 2),
+      observations: (state.nwsBundle.observations || []).slice(0, 4),
       _meta: state.nwsBundle._meta || null
+    } : null;
+    const compactConsensus = state.consensus ? {
+      ...state.consensus,
+      hourly: (state.consensus.hourly || []).slice(0, 24)
     } : null;
     const compactSnap = {
       locId: state.activeLocation.id,
+      lat: Number(state.activeLocation.lat),
+      lon: Number(state.activeLocation.lon),
       savedAt: state.lastUpdated ? state.lastUpdated.getTime() : Date.now(),
       selectedRadarSite: state.selectedRadarSite,
+      locationAnchor: state.locationAnchor,
       nwsBundle: compactBundle,
       openMeteoMeta: state.openMeteo?._meta || null,
+      modelMeta: state.modelMeta,
+      consensus: compactConsensus,
+      asosMos: state.asosMos,
+      spcPointOutlooks: state.spcPointOutlooks,
       current: state.current,
       environment: state.environment,
       winter: state.winter,
@@ -957,6 +1040,7 @@ function mergeDegradedIemIntel(prev, next) {
     lsrGeoJson: degraded.has('lsr') ? (prev.lsrGeoJson || next.lsrGeoJson) : next.lsrGeoJson,
     mcdGeoJson: degraded.has('mcd') ? (prev.mcdGeoJson || next.mcdGeoJson) : next.mcdGeoJson,
     spcWatchesGeoJson: degraded.has('spcWatches') ? (prev.spcWatchesGeoJson || next.spcWatchesGeoJson) : next.spcWatchesGeoJson,
+    wpcMpdGeoJson: degraded.has('wpcMpd') ? (prev.wpcMpdGeoJson || next.wpcMpdGeoJson) : next.wpcMpdGeoJson,
     wpcFloodGeoJson: (degraded.has('wpcFlood') || (!next.wpcFloodGeoJson?.features?.length && prev.wpcFloodGeoJson?.features?.length))
       ? (prev.wpcFloodGeoJson || next.wpcFloodGeoJson)
       : next.wpcFloodGeoJson,
@@ -975,22 +1059,60 @@ function mergeDegradedIemIntel(prev, next) {
   };
 }
 
+function renderDashboardLoadingSkeleton(locName = 'Locating...') {
+  const container = document.getElementById('dashboard-content');
+  if (!container) return;
+  container.innerHTML = `
+    <div class="card skeleton-card">
+      <div class="header-status-sub">Syncing hyper-local NWS grid, 4-model ensemble &amp; live ASOS for ${escapeHtml(locName)}...</div>
+      <div class="skeleton-line lg"></div>
+      <div class="skeleton-line md"></div>
+      <div class="skeleton-line sm"></div>
+    </div>
+  `;
+}
+
 function switchActiveLocation(newLoc, { fly = true } = {}) {
   if (!newLoc || !isValidLatLon(Number(newLoc.lat), Number(newLoc.lon))) return;
   const prev = state.activeLocation;
-  const changed = !prev ||
-    prev.id !== newLoc.id ||
-    Math.abs(Number(prev.lat) - Number(newLoc.lat)) > 1e-4 ||
-    Math.abs(Number(prev.lon) - Number(newLoc.lon)) > 1e-4;
+  const newLat = Number(newLoc.lat);
+  const newLon = Number(newLoc.lon);
+  const moveKm = prev && isValidLatLon(Number(prev.lat), Number(prev.lon))
+    ? haversineKm(Number(prev.lat), Number(prev.lon), newLat, newLon)
+    : Infinity;
+  // Spec §3.2: Mandatory Full Location Purge whenever prev == null || id changed || moveKm > 1.0
+  const changed = !prev || prev.id !== newLoc.id || moveKm > 1.0;
 
-  state.activeLocation = { ...newLoc, lat: Number(newLoc.lat), lon: Number(newLoc.lon) };
-  state.selectedRadarSite = findNearestNexradStation(state.activeLocation.lat, state.activeLocation.lon).id;
+  state.activeLocation = { ...newLoc, lat: newLat, lon: newLon };
+  if (newLoc.id !== 'gps_current') {
+    state.gpsAccuracyM = null;
+    state.gpsAltitudeM = null;
+    state.gpsTimestampMs = null;
+    state.isApproxFix = false;
+    if (state.gpsRetryTimerId != null) {
+      clearTimeout(state.gpsRetryTimerId);
+      state.gpsRetryTimerId = null;
+    }
+  }
+  state.selectedRadarSite = findNearestNexradStation(newLat, newLon).id;
 
   if (changed) {
-    // Invalidate any in-flight refresh for the prior location & clear location-scoped data
+    // Invalidate any in-flight refresh, flush all weatherApi caches & persisted snapshot, and clear stale UI
     state.refreshSeq += 1;
+    clearWeatherApiCache();
+    try {
+      localStorage.removeItem(STORAGE_KEY_SNAPSHOT);
+    } catch {
+      // ignore storage errors
+    }
+    state.locationAnchor = null;
     state.nwsBundle = null;
     state.openMeteo = null;
+    state.openMeteoEnsemble = null;
+    state.modelMeta = null;
+    state.consensus = null;
+    state.asosMos = null;
+    state.spcPointOutlooks = null;
     state.current = null;
     state.environment = null;
     state.winter = null;
@@ -1009,9 +1131,12 @@ function switchActiveLocation(newLoc, { fly = true } = {}) {
       stopVoiceBriefing();
       document.getElementById('alert-popup-modal')?.classList.add('hidden');
     }
+    document.getElementById('dashboard-alert-strip')?.classList.add('hidden');
+    renderDashboardLoadingSkeleton(state.activeLocation.name);
     updateHeaderAndBadges();
     updateTelemetryRibbon();
     updateRadarStormHud();
+    if (state.tab === 'alerts') renderAlerts();
   }
 
   if (fly) {
@@ -1048,18 +1173,23 @@ async function refreshAllData(silent = false) {
   if (locNameEl) locNameEl.textContent = state.activeLocation.name;
   const statusSubEl = document.getElementById('header-status-sub');
   if (!silent && !state.current && statusSubEl) {
-    statusSubEl.textContent = 'Syncing NWS, HRRR/GFS & NEXRAD...';
+    statusSubEl.textContent = 'Syncing NWS Grid, HRRR/NBM/ECMWF/GFS & ASOS...';
   }
 
   const includeFlood = Boolean(document.getElementById('layer-flood')?.checked);
+  const initialTz = activeTimeZone();
 
   try {
     const wssiLayerId = state.settings.wssiOverlayLayerId || 4;
-    const [nwsRes, omRes, iemRes, winModelRes, wssiRes] = await Promise.allSettled([
+    const ensembleFetch = fetchOpenMeteoEnsemble(lat, lon, { force, timeZone: initialTz })
+      .catch(() => fetchOpenMeteo(lat, lon, { timeZone: initialTz }));
+
+    const [nwsRes, omRes, metaRes, iemRes, spcPipRes, wssiRes] = await Promise.allSettled([
       fetchNwsPointBundle(lat, lon, force),
-      fetchOpenMeteo(lat, lon),
-      fetchIemStormIntel(state.settings.spcOverlayLayerId || 1, { includeFlood, force }),
-      fetchOpenMeteoWinterModels(lat, lon, { force }).catch(() => null),
+      ensembleFetch,
+      fetchOpenMeteoModelMeta({ force, timeZone: initialTz }).catch(() => null),
+      fetchIemStormIntel(state.settings.spcOverlayLayerId || 1, { includeFlood, force, timeZone: initialTz }),
+      fetchSpcPointOutlooks(lat, lon, { force }).catch(() => null),
       fetchWpcWssiBundle(wssiLayerId, force).catch(() => null)
     ]);
 
@@ -1081,12 +1211,19 @@ async function refreshAllData(silent = false) {
         observations: nextNws.observations?.length ? nextNws.observations : (prevNws?.observations || [])
       };
     }
-    if (omOk) state.openMeteo = omRes.value;
+    if (omOk) {
+      state.openMeteo = omRes.value;
+      state.openMeteoEnsemble = omRes.value;
+      state.winterModels = omRes.value;
+    }
+    if (metaRes.status === 'fulfilled' && metaRes.value) {
+      state.modelMeta = metaRes.value;
+    }
     if (iemRes.status === 'fulfilled' && iemRes.value) {
       state.iemIntel = mergeDegradedIemIntel(state.iemIntel, iemRes.value);
     }
-    if (winModelRes.status === 'fulfilled' && winModelRes.value) {
-      state.winterModels = winModelRes.value;
+    if (spcPipRes.status === 'fulfilled' && spcPipRes.value) {
+      state.spcPointOutlooks = spcPipRes.value;
     }
     if (wssiRes.status === 'fulfilled' && wssiRes.value) {
       const nextWssi = wssiRes.value;
@@ -1113,9 +1250,11 @@ async function refreshAllData(silent = false) {
       state.activeLocation.name = `${state.nwsBundle.cityLabel} (GPS)`;
     }
 
+    const tz = resolveLocationTimeZone(state.nwsBundle, state.openMeteo, state.locationAnchor?.timeZone || DEFAULT_TIME_ZONE);
+
     let alertsSucceeded = false;
     const [alertsRes, afdRes] = await Promise.all([
-      fetchNwsAlerts(lat, lon, state.nwsBundle?.stateCode)
+      fetchNwsAlerts(lat, lon, state.nwsBundle?.stateCode, { timeZone: tz })
         .then((res) => {
           alertsSucceeded = !res?._meta?.degraded;
           return res || { localFeatures: [], regionalFeatures: [] };
@@ -1130,10 +1269,10 @@ async function refreshAllData(silent = false) {
 
     if (reqSeq !== state.refreshSeq) return;
 
-    if (afdRes) state.afd = afdRes;
-    state.multiDaySpc = evaluateMultiDayOutlooks(lat, lon, state.iemIntel);
-
     const nowMs = Date.now();
+    if (afdRes) state.afd = afdRes;
+    state.multiDaySpc = evaluateMultiDayOutlooks(lat, lon, state.iemIntel, state.spcPointOutlooks, nowMs);
+
     const anyFeedSucceeded = nwsOk || omOk || iemOk || alertsSucceeded;
     state.isOffline = !anyFeedSucceeded;
 
@@ -1162,28 +1301,65 @@ async function refreshAllData(silent = false) {
       document.getElementById('alert-popup-modal')?.classList.add('hidden');
     }
 
+    // Analyze storm cells first so severe engine knows local rotating/severe cell state
+    state.stormCells = analyzeStormCells(state.iemIntel?.stormCellsGeoJson, lat, lon, 120, nowMs);
+    const hasLocalSevereCell = state.stormCells.some((c) => c.threatScore >= 2);
+
+    // Build v2.0 Multi-Model Consensus, Real-Time ASOS MOS, & Hyper-Local Anchor
     if (state.nwsBundle || state.openMeteo) {
-      state.current = resolveCurrentConditions(state.nwsBundle, state.openMeteo, nowMs);
+      state.consensus = buildMultiModelConsensus({
+        nwsBundle: state.nwsBundle,
+        openMeteo: state.openMeteo,
+        userLat: lat,
+        userLon: lon,
+        localAlerts: state.localAlerts,
+        multiDaySpc: state.multiDaySpc,
+        nowMs,
+        timeZone: tz
+      });
+      state.asosMos = state.consensus?.asosMos || null;
+      state.locationAnchor = buildLocationAnchor({
+        lat,
+        lon,
+        activeLocation: state.activeLocation,
+        nwsBundle: state.nwsBundle,
+        openMeteo: state.openMeteo,
+        asosMos: state.asosMos,
+        gpsAccuracyM: state.gpsAccuracyM,
+        isApproxFix: state.isApproxFix
+      });
+      state.current = resolveCurrentConditions(state.nwsBundle, state.openMeteo, nowMs, {
+        consensus: state.consensus,
+        asosMos: state.asosMos,
+        locationAnchor: state.locationAnchor
+      });
     }
-    const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
+
+    // Strictly local point-in-polygon CONVECTIVE MDs only (Spec §6.1 #2)
+    const localConvMcdCount = state.multiDaySpc?.localConvectiveMcdCount ?? 0;
     if (state.openMeteo?.hourly || !state.environment) {
-      state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+      state.environment = analyzeEnvironment(state.openMeteo, state.current, localConvMcdCount, {
         convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
         nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
         multiDaySpc: state.multiDaySpc,
+        consensus: state.consensus,
+        modelMeta: state.modelMeta,
+        timeZone: tz,
+        hasLocalSevereCell,
         nowMs
       });
     }
     if (state.openMeteo?.hourly || !state.winter) {
       state.winter = analyzeWinterSuite(state.openMeteo, state.current, state.settings.groundFreezeThresholdF, nowMs, {
         gridData: state.nwsBundle?.gridData || null,
-        winterModels: state.winterModels,
+        winterModels: state.openMeteo,
+        consensus: state.consensus,
         wssiBundle: state.wssiBundle,
         lat,
-        lon
+        lon,
+        timeZone: tz
       });
     }
-    state.stormCells = analyzeStormCells(state.iemIntel?.stormCellsGeoJson, lat, lon, 120, nowMs);
 
     if (anyFeedSucceeded) {
       state.lastUpdated = new Date(nowMs);
@@ -1233,13 +1409,15 @@ function updateHeaderAndBadges() {
   const loc = state.activeLocation || getSavedHomeLocation();
   const locEl = document.getElementById('header-location-name');
   if (locEl) locEl.textContent = loc.name;
-  const clock = state.lastUpdated ? formatCentralTime(state.lastUpdated) : '--';
+  const tz = activeTimeZone();
+  const clock = state.lastUpdated ? formatLocalTime(state.lastUpdated, tz) : '--';
   const site = state.selectedRadarSite || findNearestNexradStation(loc.lat, loc.lon).id;
   const watchTag = (state.settings.adaptiveStormModeEnabled && state.isStormWatchActive) ? '⚡ STORM WATCH (45s) • ' : '';
   const offlineTag = state.isOffline ? 'OFFLINE • ' : '';
+  const approxTag = (state.isApproxFix && Number.isFinite(state.gpsAccuracyM)) ? `Approx GPS (±${Math.round(state.gpsAccuracyM)}m) • ` : '';
   const subEl = document.getElementById('header-status-sub');
   if (subEl) {
-    subEl.textContent = `${offlineTag}${watchTag}Updated ${clock} • Radar ${site} • v${APP_LOCAL_VERSION.versionName}`;
+    subEl.textContent = `${offlineTag}${approxTag}${watchTag}Updated ${clock} • Radar ${site} • v${APP_LOCAL_VERSION.versionName}`;
   }
 
   updateDataStalenessBanner();
@@ -1474,17 +1652,22 @@ function fallbackToSavedHomeLocation(reasonLabel) {
   }
 }
 
-function requestGpsLocation() {
+function requestGpsLocation(isAccuracyRetry = false) {
   if (state.isLocatingGps) return;
   if (typeof navigator === 'undefined' || !navigator.geolocation || typeof navigator.geolocation.getCurrentPosition !== 'function') {
     fallbackToSavedHomeLocation('GPS unavailable on this browser');
     return;
   }
 
+  if (state.gpsRetryTimerId != null) {
+    clearTimeout(state.gpsRetryTimerId);
+    state.gpsRetryTimerId = null;
+  }
+
   state.isLocatingGps = true;
   const gpsBtn = document.getElementById('btn-gps');
   gpsBtn?.classList.add('spinning');
-  showToast('Requesting GPS location...');
+  if (!isAccuracyRetry) showToast('Requesting high-accuracy GPS location...');
 
   let settled = false;
   const watchdogId = setTimeout(() => {
@@ -1511,12 +1694,36 @@ function requestGpsLocation() {
           fallbackToSavedHomeLocation('GPS returned invalid coordinates');
           return;
         }
+        const accuracyM = Number.isFinite(Number(pos?.coords?.accuracy)) ? Number(pos.coords.accuracy) : null;
+        const altitudeM = Number.isFinite(Number(pos?.coords?.altitude)) ? Number(pos.coords.altitude) : null;
+        state.gpsAccuracyM = accuracyM;
+        state.gpsAltitudeM = altitudeM;
+        state.gpsTimestampMs = Number.isFinite(Number(pos?.timestamp)) ? Number(pos.timestamp) : Date.now();
+        state.isApproxFix = accuracyM != null && accuracyM > 500;
+
+        if (state.isApproxFix) {
+          showToast(`Approx GPS (±${Math.round(accuracyM)}m) — refining fix...`);
+          if (!isAccuracyRetry && !document.hidden) {
+            state.gpsRetryTimerId = setTimeout(() => {
+              state.gpsRetryTimerId = null;
+              if (!document.hidden && state.activeLocation?.id === 'gps_current') {
+                requestGpsLocation(true);
+              }
+            }, 3000);
+          }
+        }
+
         switchActiveLocation({ id: 'gps_current', name: 'Current Location (GPS)', lat, lon }, { fly: true });
       },
       (err) => {
         if (settled) return;
         settled = true;
         clearTimeout(watchdogId);
+        if (isAccuracyRetry) {
+          state.isLocatingGps = false;
+          gpsBtn?.classList.remove('spinning');
+          return;
+        }
         const code = err?.code;
         const reason = code === 1
           ? 'Location permission denied'
@@ -1527,7 +1734,8 @@ function requestGpsLocation() {
               : 'GPS unavailable';
         fallbackToSavedHomeLocation(reason);
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+      // Spec §3.1: Strictly maximumAge: 0 (never return stale cached coordinates)
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
   } catch {
     if (!settled) {
@@ -1655,7 +1863,7 @@ async function loadRadarFramesForCurrentProduct() {
     frameTimeEl.textContent = 'Loading radar scans...';
   }
   try {
-    const frames = await buildRadarFrames(prod, site);
+    const frames = await buildRadarFrames(prod, site, { timeZone: activeTimeZone() });
     const nextFrames = Array.isArray(frames) ? frames : [];
     const sameExisting =
       state.radarFrames.length > 0 &&
@@ -1782,13 +1990,15 @@ function openInspectSheet(type, item, ctx = null) {
   if (!sheet || !titleEl || !bodyEl) return;
 
   const loc = state.activeLocation || getSavedHomeLocation();
+  const tz = activeTimeZone();
+  const tzShort = activeTzShort();
   const switcherHtml = buildSystemSwitcherHtml(type, ctx);
   let toneClass = 'sheet-tone-cyan';
   let subtitle = '';
 
   if (type === 'cell' && item) {
     const speedKt = Math.round(mphToKt(item.speedMph || 0) ?? 0);
-    const scanCentral = item.valid ? formatCentralTime(item.valid) : 'Live NEXRAD';
+    const scanCentral = item.valid ? formatLocalTime(item.valid, tz) : 'Live NEXRAD';
     const radarConfirmText = item.confirmingRadars?.length > 1
       ? `Multi-radar (${item.confirmingRadars.length}): ${item.confirmingRadars.join(' · ')}`
       : `Single-site NEXRAD: ${item.nexrad}`;
@@ -1872,7 +2082,7 @@ function openInspectSheet(type, item, ctx = null) {
     const isWind = evUp.includes('WIND');
     const isFlood = evUp.includes('FLOOD') || evUp.includes('RAIN');
     const glyph = isTor ? '🌪️' : isHail ? '🧊' : isWind ? '💨' : isFlood ? '🌊' : '⚡';
-    const reportedCt = (p.valid || p.utcvalid) ? formatCentralTime(p.valid || p.utcvalid) : 'Recent';
+    const reportedCt = (p.valid || p.utcvalid) ? formatLocalTime(p.valid || p.utcvalid, tz) : 'Recent';
 
     toneClass = isTor ? 'sheet-tone-critical' : isHail || isWind ? 'sheet-tone-severe' : 'sheet-tone-watch';
     titleEl.textContent = `${evType}${mag ? ` • ${mag}` : ''}`;
@@ -1891,7 +2101,7 @@ function openInspectSheet(type, item, ctx = null) {
         </div>
       </div>
       <div class="inspect-kv-card">
-        <div class="inspect-kv-row"><span>Reported (CT)</span><strong>${escapeHtml(reportedCt)}</strong></div>
+        <div class="inspect-kv-row"><span>Reported (${escapeHtml(tzShort)})</span><strong>${escapeHtml(reportedCt)}</strong></div>
         <div class="inspect-kv-row"><span>Magnitude / Type</span><strong>${escapeHtml(mag || evType)}</strong></div>
         ${p.source ? `<div class="inspect-kv-row"><span>Source</span><strong>${escapeHtml(p.source)}</strong></div>` : ''}
         <div class="inspect-kv-row"><span>Coordinates</span><strong>${formatCoordPair(lat, lon)}</strong></div>
@@ -1931,8 +2141,8 @@ function openInspectSheet(type, item, ctx = null) {
         ${countdown ? `<span class="badge-muted">${escapeHtml(countdown)}</span>` : ''}
       </div>
       <div class="inspect-kv-card">
-        <div class="inspect-kv-row"><span>Issued (CT)</span><strong>${issueRaw ? escapeHtml(formatCentralTime(issueRaw)) : '--'}</strong></div>
-        <div class="inspect-kv-row"><span>Expires (CT)</span><strong>${expireRaw ? escapeHtml(formatCentralTime(expireRaw)) : '--'}</strong></div>
+        <div class="inspect-kv-row"><span>Issued (${escapeHtml(tzShort)})</span><strong>${issueRaw ? escapeHtml(formatLocalTime(issueRaw, tz)) : '--'}</strong></div>
+        <div class="inspect-kv-row"><span>Expires (${escapeHtml(tzShort)})</span><strong>${expireRaw ? escapeHtml(formatLocalTime(expireRaw, tz)) : '--'}</strong></div>
         ${p.max_hail ? `<div class="inspect-kv-row"><span>Max Hail Threat</span><strong>${escapeHtml(String(p.max_hail))}"</strong></div>` : ''}
         ${p.max_gust ? `<div class="inspect-kv-row"><span>Max Wind Gust</span><strong>${escapeHtml(String(p.max_gust))} mph</strong></div>` : ''}
         ${p.states ? `<div class="inspect-kv-row"><span>States</span><strong>${escapeHtml(String(p.states))}</strong></div>` : ''}
@@ -1972,8 +2182,8 @@ function openInspectSheet(type, item, ctx = null) {
       </div>
       <div class="inspect-kv-card">
         <div class="inspect-kv-row"><span>Concerning</span><strong>${escapeHtml(p.concerning || 'Developing Severe Weather')}</strong></div>
-        <div class="inspect-kv-row"><span>Valid (CT)</span><strong>${validRaw ? escapeHtml(formatCentralTime(validRaw)) : '--'}</strong></div>
-        <div class="inspect-kv-row"><span>Expires (CT)</span><strong>${expireRaw ? escapeHtml(formatCentralTime(expireRaw)) : '--'}${countdown ? ` (${escapeHtml(countdown)})` : ''}</strong></div>
+        <div class="inspect-kv-row"><span>Valid (${escapeHtml(tzShort)})</span><strong>${validRaw ? escapeHtml(formatLocalTime(validRaw, tz)) : '--'}</strong></div>
+        <div class="inspect-kv-row"><span>Expires (${escapeHtml(tzShort)})</span><strong>${expireRaw ? escapeHtml(formatLocalTime(expireRaw, tz)) : '--'}${countdown ? ` (${escapeHtml(countdown)})` : ''}</strong></div>
         ${p.areas_affected || p.states ? `<div class="inspect-kv-row"><span>Affected Area</span><strong>${escapeHtml(p.areas_affected || p.states)}</strong></div>` : ''}
         ${p.most_prob_tornado ? `<div class="inspect-kv-row"><span>Most Likely Tornado</span><strong>${escapeHtml(String(p.most_prob_tornado))}</strong></div>` : ''}
         ${p.most_prob_gust ? `<div class="inspect-kv-row"><span>Most Likely Gust</span><strong>${escapeHtml(String(p.most_prob_gust))}</strong></div>` : ''}
@@ -2007,8 +2217,8 @@ function openInspectSheet(type, item, ctx = null) {
       ${renderSegmentedRiskBar(meta.rank, 4, meta.color, `${norm} • ${meta.scale}`)}
       ${(validRaw || expireRaw) ? `
         <div class="inspect-kv-card">
-          ${validRaw ? `<div class="inspect-kv-row"><span>Valid (CT)</span><strong>${escapeHtml(formatCentralTime(validRaw))}</strong></div>` : ''}
-          ${expireRaw ? `<div class="inspect-kv-row"><span>Expires (CT)</span><strong>${escapeHtml(formatCentralTime(expireRaw))}</strong></div>` : ''}
+          ${validRaw ? `<div class="inspect-kv-row"><span>Valid (${escapeHtml(tzShort)})</span><strong>${escapeHtml(formatLocalTime(validRaw, tz))}</strong></div>` : ''}
+          ${expireRaw ? `<div class="inspect-kv-row"><span>Expires (${escapeHtml(tzShort)})</span><strong>${escapeHtml(formatLocalTime(expireRaw, tz))}</strong></div>` : ''}
         </div>
       ` : ''}
       <div class="inspect-guidance ${norm === 'HIGH' || norm === 'MDT' ? 'critical' : 'info'}">
@@ -2104,8 +2314,8 @@ function openInspectSheet(type, item, ctx = null) {
       </div>
       ${(validRaw || expireRaw) ? `
         <div class="inspect-kv-card">
-          ${validRaw ? `<div class="inspect-kv-row"><span>Valid (CT)</span><strong>${escapeHtml(formatCentralTime(validRaw))}</strong></div>` : ''}
-          ${expireRaw ? `<div class="inspect-kv-row"><span>Expires (CT)</span><strong>${escapeHtml(formatCentralTime(expireRaw))}</strong></div>` : ''}
+          ${validRaw ? `<div class="inspect-kv-row"><span>Valid (${escapeHtml(tzShort)})</span><strong>${escapeHtml(formatLocalTime(validRaw, tz))}</strong></div>` : ''}
+          ${expireRaw ? `<div class="inspect-kv-row"><span>Expires (${escapeHtml(tzShort)})</span><strong>${escapeHtml(formatLocalTime(expireRaw, tz))}</strong></div>` : ''}
           <div class="inspect-kv-row"><span>Day 2 / Day 3</span><strong>${escapeHtml(ptOutlooks.day2Category)} / ${escapeHtml(ptOutlooks.day3Category)}</strong></div>
         </div>
       ` : ''}
@@ -2125,7 +2335,7 @@ function openInspectSheet(type, item, ctx = null) {
     const site = state.selectedRadarSite || findNearestNexradStation(loc.lat, loc.lon).id;
     const prodMeta = RADAR_PRODUCTS.find((rp) => rp.code === (item.productCode || state.settings.radarProduct)) || RADAR_PRODUCTS[0];
     const frameTimeStr = item.activeFrame?.timestampMs
-      ? formatCentralTime(item.activeFrame.timestampMs)
+      ? formatLocalTime(item.activeFrame.timestampMs, tz)
       : (item.activeFrame?.label || 'Live Feed');
     const env = state.environment || {};
 
@@ -2188,7 +2398,7 @@ function openInspectSheet(type, item, ctx = null) {
       <div class="inspect-section-label">NEXRAD Feed &amp; Synoptic Environment</div>
       <div class="inspect-kv-card">
         <div class="inspect-kv-row"><span>Active Radar</span><strong>${escapeHtml(site)} • ${escapeHtml(prodMeta.shortLabel)}</strong></div>
-        <div class="inspect-kv-row"><span>Frame Time (CT)</span><strong>${escapeHtml(frameTimeStr)}</strong></div>
+        <div class="inspect-kv-row"><span>Frame Time (${escapeHtml(tzShort)})</span><strong>${escapeHtml(frameTimeStr)}</strong></div>
         <div class="inspect-kv-row"><span>Synoptic Regime</span><strong>${escapeHtml(env.regime || 'Quiet / Stable')}</strong></div>
         <div class="inspect-kv-row"><span>CAPE / CIN • Shear</span><strong>${env.peakCape12h ?? 0} / ${env.cinNow ?? 0} • ${env.bulkShear0to6KmKt ?? 0} kt</strong></div>
         <div class="inspect-kv-row"><span>STP / SCP • 0–1km SRH</span><strong>${fmtFixed(env.stp ?? 0, 1)} / ${fmtFixed(env.scp ?? 0, 1)} • ${env.srh0to1Km ?? 0} m²/s²</strong></div>
@@ -2230,8 +2440,8 @@ function openInspectSheet(type, item, ctx = null) {
       ${item.stormMotion ? `<div class="cell-motion-banner"><span>${escapeHtml(item.stormMotion.summary)}</span><span>NWS CAP Vector</span></div>` : ''}
       <div class="inspect-kv-card">
         <div class="inspect-kv-row"><span>Issuing WFO</span><strong>${escapeHtml(item.senderName || 'NWS')}</strong></div>
-        <div class="inspect-kv-row"><span>Effective (CT)</span><strong>${effRaw ? escapeHtml(formatCentralTime(effRaw)) : '--'}</strong></div>
-        <div class="inspect-kv-row"><span>Expires (CT)</span><strong>${expRaw ? escapeHtml(formatCentralTime(expRaw)) : '--'}${countdown ? ` (${escapeHtml(countdown)})` : ''}</strong></div>
+        <div class="inspect-kv-row"><span>Effective (${escapeHtml(tzShort)})</span><strong>${effRaw ? escapeHtml(formatLocalTime(effRaw, tz)) : '--'}</strong></div>
+        <div class="inspect-kv-row"><span>Expires (${escapeHtml(tzShort)})</span><strong>${expRaw ? escapeHtml(formatLocalTime(expRaw, tz)) : '--'}${countdown ? ` (${escapeHtml(countdown)})` : ''}</strong></div>
         ${item.areaDesc ? `<div class="inspect-kv-row"><span>Counties / Area</span><strong>${escapeHtml(item.areaDesc.slice(0, 140))}</strong></div>` : ''}
       </div>
       ${item.instruction ? `
@@ -2606,7 +2816,9 @@ function renderProWinterCardHtml(win) {
   const isWarmGroundMelts = pw.groundAccumStatus === 'WARM_GROUND_MELTS';
   const isGrassSlushOnly = pw.groundAccumStatus === 'GRASS_SLUSH_ONLY';
   const isMarginalSlushy = pw.groundAccumStatus === 'MARGINAL_SLUSHY';
-  const aloftSnowIn = Number(pw.snow72hIn || 0) > 0 ? Number(pw.snow72hIn) : Number(spread.snowMaxIn || 0);
+  const aloftSnowIn = Number(pw.consensusAloftSnow72hIn ?? pw.snow72hIn ?? 0) > 0
+    ? Number(pw.consensusAloftSnow72hIn ?? pw.snow72hIn ?? 0)
+    : Number(spread.snowMaxIn || 0);
   const roadSnowIn = Number(pw.roadSnow72hIn ?? 0);
   const grassSnowIn = Number(pw.grassSnow72hIn ?? roadSnowIn);
   const hasWarmFlux = isWarmGroundMelts && aloftSnowIn > 0;
@@ -2621,9 +2833,9 @@ function renderProWinterCardHtml(win) {
   const groundMeltsTemp = Math.round(pw.minSoil0cmWintryF ?? safeWin.ground0cmF ?? 45);
   const twMeltsStr = pw.minWetBulbWintryF != null ? ` (Tw ${Math.round(Number(pw.minWetBulbWintryF))}°F)` : '';
   const snowSubText = hasWarmFlux
-    ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" falling aloft • Melts on ${groundMeltsTemp}°F ground${twMeltsStr}${nwsSnowTag}`
+    ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" consensus aloft • Melts on ${groundMeltsTemp}°F ground${twMeltsStr}${nwsSnowTag}`
     : isGrassSlushOnly
-      ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" falling aloft • Wet roads, slushy grass/decks${nwsSnowTag}`
+      ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" consensus aloft • Wet roads, slushy grass/decks${nwsSnowTag}`
       : isMarginalSlushy && aloftSnowIn > 0
         ? `${fmtFixed(aloftSnowIn, 1, '0.0')}" aloft • Slushy on ${groundMeltsTemp}°F ground${nwsSnowTag}`
         : `24h: ${fmtFixed(Number(pw.roadSnow24hIn ?? pw.snow24hIn ?? 0), 1, '0.0')}" • Depth: ${fmtFixed(Number(pw.maxSnowDepthIn ?? 0), 1, '0.0')}"${nwsSnowTag || ` • NWS: ${fmtFixed(Number(pw.nwsSnow72hIn ?? 0), 1, '0.0')}"`}`;
@@ -2634,11 +2846,12 @@ function renderProWinterCardHtml(win) {
     pw.groundAccumStatus !== 'NO_WINTRY_PRECIP'
   );
   const regimeBannerText = showAccumBannerNote ? pw.groundAccumNote : safeWin.roadBridgeRiskLabel;
+  const paJkg = Number.isFinite(Number(tp.warmNosePaJkg)) ? Number(tp.warmNosePaJkg) : 0;
 
   return `
     <div class="card pro-winter-card" id="pro-winter-card">
       <div class="card-header">
-        <div class="card-title">${sectionIcon('winter', 'blue')}Pro Winter, Ice &amp; WSSI Suite</div>
+        <div class="card-title">${sectionIcon('winter', 'blue')}Bourgouin Winter &amp; Surface Suite</div>
         <span class="badge-${badgeTone}">${escapeHtml(pw.headline || safeWin.statusLabel)}</span>
       </div>
       <div class="regime-banner ${safeWin.hazardLevel === 'CRITICAL' ? 'high' : safeWin.hazardLevel === 'CLEAR' ? 'low' : 'winter'}">
@@ -2647,7 +2860,7 @@ function renderProWinterCardHtml(win) {
 
       <div class="winter-hero-grid">
         <div class="winter-hero-tile">
-          <div class="metric-label">72h Snow Est. (${escapeHtml(pw.slrLabel || '10:1')})</div>
+          <div class="metric-label">72h Sticking Snow (${escapeHtml(pw.slrLabel || '10:1')})</div>
           <div class="winter-hero-num" style="color:#e0f2fe;">${snowHeroHtml}</div>
           <div class="metric-sub">${escapeHtml(snowSubText)}</div>
         </div>
@@ -2660,10 +2873,12 @@ function renderProWinterCardHtml(win) {
       </div>
 
       <div class="winter-subsection-label">
-        <span>5-Level Thermal Column &amp; Warm Nose</span>
-        ${tp.hasWarmNose ? `<span class="warm-nose-pill">WARM NOSE ALOFT ${tVal(tp.warmNosePeakF)}</span>` : `<span class="metric-sub">Frz Lvl ${tp.freezingLevelFt != null && Number.isFinite(Number(tp.freezingLevelFt)) ? `${Number(tp.freezingLevelFt).toLocaleString()} ft` : '--'}</span>`}
+        <span>6-Level Bourgouin Column &amp; Warm Nose</span>
+        ${tp.hasWarmNose
+          ? `<span class="warm-nose-pill">WARM NOSE ${tVal(tp.warmNosePeakF)}${paJkg > 0 ? ` · PA ${paJkg.toFixed(0)} J/kg` : ''}</span>`
+          : `<span class="metric-sub">Frz Lvl ${tp.freezingLevelFt != null && Number.isFinite(Number(tp.freezingLevelFt)) ? `${Number(tp.freezingLevelFt).toLocaleString()} ft` : '--'}</span>`}
       </div>
-      <div class="thermal-column-grid">
+      <div class="thermal-column-grid cols-6">
         <div class="thermal-cell">
           <div class="thermal-lvl">2m Air</div>
           <div class="thermal-val">${tVal(tp.airTempF)}</div>
@@ -2680,9 +2895,13 @@ function renderProWinterCardHtml(win) {
           <div class="thermal-lvl">850 hPa</div>
           <div class="thermal-val">${tVal(tp.temp850F)}</div>
         </div>
+        <div class="thermal-cell ${tp.hasWarmNose && tp.temp700F != null && Number(tp.temp700F) > 33 ? 'warm-nose' : ''}">
+          <div class="thermal-lvl">700 hPa</div>
+          <div class="thermal-val">${tVal(tp.temp700F)}</div>
+        </div>
         <div class="thermal-cell">
-          <div class="thermal-lvl">0cm / 6cm</div>
-          <div class="thermal-val">${safeWin.ground0cmF ?? '--'}° / ${safeWin.ground6cmF ?? '--'}°</div>
+          <div class="thermal-lvl">Soil 0/6cm</div>
+          <div class="thermal-val">${safeWin.ground0cmF ?? '--'}°/${safeWin.ground6cmF ?? '--'}°</div>
         </div>
       </div>
 
@@ -2694,7 +2913,8 @@ function renderProWinterCardHtml(win) {
         ${segs24.join('')}
       </div>
       <div class="winter-timeline-legend">
-        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#e0f2fe"></i>Snow</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#e0f2fe"></i>Accum Snow</span>
+        <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#7dd3fc"></i>Wet Snow (Melts)</span>
         <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#a78bfa"></i>Sleet</span>
         <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#f472b6"></i>Fz Rain</span>
         <span class="winter-timeline-dot"><i class="winter-timeline-swatch" style="background:#22d3ee"></i>Mix</span>
@@ -2734,10 +2954,10 @@ function renderProWinterCardHtml(win) {
       </div>
 
       <div class="winter-subsection-label">
-        <span>3-Model + NWS Ensemble Spread</span>
+        <span>5-Model Snow / Ice Consensus (NWS · HRRR · NBM · ECMWF · GFS)</span>
         <span class="badge-${spread.agreementLabel === 'HIGH' ? 'green' : spread.agreementLabel === 'MODERATE' ? 'amber' : 'muted'}">Agreement: ${escapeHtml(spread.agreementLabel || 'N/A')} (${spread.tempSpreadF ?? 0}°F)</span>
       </div>
-      ${(isWarmGroundMelts || isGrassSlushOnly) && Number(spread.snowMaxIn || 0) > 0 ? `<div class="metric-sub winter-spread-note">Model column shows raw falling snow aloft (NWS reflects actual expected sticking snow)</div>` : ''}
+      ${(isWarmGroundMelts || isGrassSlushOnly) && Number(spread.snowMaxIn || 0) > 0 ? `<div class="metric-sub winter-spread-note">NWP models show raw aloft snow; NWS &amp; Sticking tile reflect actual ground accumulation</div>` : ''}
       ${spread.estimates?.length ? `
         <div class="model-spread-grid">
           ${spread.estimates.map((m) => `
@@ -2748,9 +2968,106 @@ function renderProWinterCardHtml(win) {
             </div>
           `).join('')}
         </div>
-      ` : `<div class="metric-sub">HRRR / GFS / ECMWF comparison syncing...</div>`}
+      ` : `<div class="metric-sub">NWS / HRRR / NBM / ECMWF / GFS comparison syncing...</div>`}
     </div>
   `;
+}
+
+function renderConsensusCardHtml(consensus, asosMos) {
+  if (!consensus) return '';
+  const pct = Number.isFinite(Number(consensus.confidencePct)) ? Number(consensus.confidencePct) : 70;
+  const tier = consensus.confidenceTier || (pct >= 80 ? 'HIGH' : pct >= 60 ? 'MODERATE' : 'LOW');
+  const tierTone = tier === 'HIGH' ? 'green' : tier === 'MODERATE' ? 'amber' : 'red';
+  const barColor = tier === 'HIGH' ? '#10b981' : tier === 'MODERATE' ? '#f59e0b' : '#f43f5e';
+  const models = Array.isArray(consensus.perModelSummary) ? consensus.perModelSummary : [];
+  const aw = consensus.allWeatherHazards || {};
+
+  const hazardClass = (val) => {
+    const u = String(val || 'NONE').toUpperCase();
+    if (u === 'EXTREME' || u === 'HIGH' || u === 'HIGH_WIND' || u === 'EXCESSIVE_HEAT' || u === 'FREEZING_FOG') return 'critical';
+    if (u === 'MODERATE' || u === 'LOW' || u === 'WIND_ADVISORY' || u === 'DENSE_FOG' || u === 'FOG_MIST' || u === 'HEAT_ADVISORY' || u === 'HEAT_CAUTION' || u === 'BREEZY') return 'elevated';
+    return '';
+  };
+  const fmtHazardVal = (k, val) => {
+    const u = String(val || 'NONE').toUpperCase();
+    if (k === 'flood') return u === 'NONE' ? `Clear (${fmtFixed(aw.peakQpf24hIn ?? 0, 2, '0.00')}")` : `${u} (${fmtFixed(aw.peakQpf24hIn ?? 0, 2, '0.00')}")`;
+    if (k === 'wind') return u === 'CALM' ? `Calm (${Math.round(aw.peakGust24hMph ?? 0)} mph)` : `${u.replace('_', ' ')} (${Math.round(aw.peakGust24hMph ?? 0)} mph)`;
+    if (k === 'fog') return u === 'CLEAR' ? `Clear (${fmtFixed(aw.minVisibilityMi ?? 10, 1, '10.0')} mi)` : `${u.replace('_', ' ')} (${fmtFixed(aw.minVisibilityMi ?? 0, 1)} mi)`;
+    return u === 'NONE' ? `Normal (${aw.maxHeatIndex24hF != null ? `${Math.round(aw.maxHeatIndex24hF)}°F` : '--'})` : `${u.replace('_', ' ')} (${aw.maxHeatIndex24hF != null ? `${Math.round(aw.maxHeatIndex24hF)}°F` : '--'})`;
+  };
+
+  return `
+    <div class="card" id="consensus-card">
+      <div class="card-header">
+        <div class="card-title">${sectionIcon('shield')}Multi-Model Consensus &amp; Confidence</div>
+        <span class="badge-${tierTone}">${pct}% ${escapeHtml(tier)}</span>
+      </div>
+      <div class="consensus-bar-wrap">
+        <div class="consensus-bar-head">
+          <span>${consensus.activeModels?.length || models.length} Models · ${escapeHtml(asosMos?.mosSummaryBadge || 'Horizon-Weighted Blend')}</span>
+          <span>±${fmtFixed(consensus.tempSpreadF ?? 0, 1, '0.0')}°F · ±${fmtFixed(consensus.qpfSpreadIn ?? 0, 2, '0.00')}" QPF</span>
+        </div>
+        <div class="consensus-bar-track">
+          <div class="consensus-bar-fill" style="width:${Math.max(5, Math.min(100, pct))}%;background:${barColor};"></div>
+        </div>
+      </div>
+      <div class="consensus-spread-note ${consensus.phaseDisagreement ? 'phase-split' : ''}">
+        ${consensus.phaseDisagreement ? '<strong>Phase Split Detected:</strong> ' : ''}${escapeHtml(consensus.spreadSummary || 'Horizon-weighted multi-model consensus active.')}
+      </div>
+      ${models.length ? `
+        <div class="consensus-models-grid">
+          ${models.map((m) => `
+            <div class="consensus-model-tile">
+              <div class="consensus-model-head">
+                <span class="consensus-model-name">${escapeHtml(m.name)}</span>
+                <span class="consensus-model-res">${escapeHtml(m.resolution || '')}</span>
+              </div>
+              <div class="consensus-model-temps">${m.minTemp48hF != null ? `${Math.round(m.minTemp48hF)}°` : '--'} / ${m.maxTemp48hF != null ? `${Math.round(m.maxTemp48hF)}°` : '--'}</div>
+              <div class="consensus-model-precip">${fmtFixed(m.qpf48hIn ?? 0, 2, '0.00')}" QPF · ${fmtFixed(m.snow48hIn ?? 0, 1, '0.0')}" sn</div>
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div class="all-weather-hazards-row">
+        <div class="aw-hazard-pill ${hazardClass(aw.floodRisk)}">
+          <span class="aw-hazard-k">Flood</span>
+          <span class="aw-hazard-v">${escapeHtml(fmtHazardVal('flood', aw.floodRisk))}</span>
+        </div>
+        <div class="aw-hazard-pill ${hazardClass(aw.windRisk)}">
+          <span class="aw-hazard-k">Wind</span>
+          <span class="aw-hazard-v">${escapeHtml(fmtHazardVal('wind', aw.windRisk))}</span>
+        </div>
+        <div class="aw-hazard-pill ${hazardClass(aw.fogRisk)}">
+          <span class="aw-hazard-k">Fog/Vis</span>
+          <span class="aw-hazard-v">${escapeHtml(fmtHazardVal('fog', aw.fogRisk))}</span>
+        </div>
+        <div class="aw-hazard-pill ${hazardClass(aw.heatRisk)}">
+          <span class="aw-hazard-k">Heat</span>
+          <span class="aw-hazard-v">${escapeHtml(fmtHazardVal('heat', aw.heatRisk))}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function openWofsModal(env) {
+  const modal = document.getElementById('wofs-modal');
+  if (!modal) return;
+  const e = env || state.environment || {};
+  const timingEl = document.getElementById('wofs-modal-timing');
+  const statusEl = document.getElementById('wofs-modal-status');
+  const extLink = document.getElementById('wofs-external-link');
+  const frame = document.getElementById('wofs-iframe');
+  const viewerUrl = e.wofsViewerUrl || WOFS_VIEWER_URL;
+  if (timingEl) {
+    timingEl.innerHTML = `<span class="model-timing-tag">MODEL GUIDANCE</span><span>${escapeHtml(e.modelTimingBanner || 'HRRR 3km Operational Storm-Scale Guidance')}</span>`;
+  }
+  if (statusEl) {
+    statusEl.textContent = e.wofsStandbyReason || 'WoFS Standby — Experimental NSSL runs operate select severe days 17:00–03:00 UTC. Active 24/7 storm-scale guidance: Operational HRRR 3 km + NBM + SPC.';
+  }
+  if (extLink) extLink.href = viewerUrl;
+  if (frame) frame.src = viewerUrl;
+  modal.classList.remove('hidden');
 }
 
 /* ==================== RENDER: DASHBOARD ==================== */
@@ -2760,8 +3077,26 @@ function renderDashboard() {
   updateDataStalenessBanner();
   if (!container || !state.current) return;
 
+  const tz = activeTimeZone();
   const c = state.current;
-  const env = state.environment || analyzeEnvironment(state.openMeteo, c, 0, { multiDaySpc: state.multiDaySpc });
+  const cons = state.consensus;
+  const mos = state.asosMos || cons?.asosMos || null;
+  const anchor = state.locationAnchor || buildLocationAnchor({
+    lat: state.activeLocation?.lat,
+    lon: state.activeLocation?.lon,
+    activeLocation: state.activeLocation,
+    nwsBundle: state.nwsBundle,
+    openMeteo: state.openMeteo,
+    asosMos: mos,
+    gpsAccuracyM: state.gpsAccuracyM,
+    isApproxFix: state.isApproxFix
+  });
+  const env = state.environment || analyzeEnvironment(state.openMeteo, c, state.multiDaySpc?.localConvectiveMcdCount || 0, {
+    multiDaySpc: state.multiDaySpc,
+    consensus: cons,
+    modelMeta: state.modelMeta,
+    timeZone: tz
+  });
   const win = state.winter || analyzeWinterSuite(
     state.openMeteo,
     c,
@@ -2769,10 +3104,12 @@ function renderDashboard() {
     Date.now(),
     {
       gridData: state.nwsBundle?.gridData || null,
-      winterModels: state.winterModels,
+      winterModels: state.openMeteo || state.winterModels,
+      consensus: cons,
       wssiBundle: state.wssiBundle,
       lat: state.activeLocation?.lat,
-      lon: state.activeLocation?.lon
+      lon: state.activeLocation?.lon,
+      timeZone: tz
     }
   );
 
@@ -2822,13 +3159,31 @@ function renderDashboard() {
   const pTrendSign = c.pressureTrend3h > 0 ? '+' : '';
   const nearestRadar = findNearestNexradStation(state.activeLocation.lat, state.activeLocation.lon);
   const firstHourDay = state.nwsBundle?.hourlyPeriods?.[0]?.isDaytime;
-  const hrNow = getCentralHour24(Date.now()) ?? new Date().getUTCHours();
+  const hrNow = getLocalHour24(Date.now(), tz) ?? new Date().getUTCHours();
   const isNightNow = firstHourDay != null ? !firstHourDay : (hrNow < 6 || hrNow >= 18);
   const atmClass = skyAtmosphereClass(c.conditionText, isNightNow);
 
+  const confChipText = cons
+    ? `${cons.confidencePct}% ${cons.confidenceTier}`
+    : `${c.confidence} Consensus`;
+  const mosChipText = mos?.mosSummaryBadge || (c.spreadF != null ? `±${c.spreadF}°F spread` : 'Model Consensus');
+  const localWatches = state.multiDaySpc?.localWatches || [];
+  const localConvMcds = state.multiDaySpc?.localConvectiveMcds || [];
+  const wofsActive = env.wofsGuidanceMode === 'ACTIVE_WINDOW';
+  const wofsUrl = env.wofsViewerUrl || WOFS_VIEWER_URL;
+  const wofsAttr = env.wofsAttribution || WOFS_ATTRIBUTION;
+  const hourlySourceBadge = cons?.hourly?.length >= 6
+    ? `${(cons.activeModels || ['NWS', 'HRRR', 'NBM', 'ECMWF', 'GFS']).slice(0, 5).join('+')} · MOS`
+    : 'NWS NDFD / HRRR-GFS';
+
   container.innerHTML = `
-    <!-- HERO CURRENT CONDITIONS -->
+    <!-- HERO CURRENT CONDITIONS & HYPER-LOCAL ANCHOR -->
     <div class="card hero-card ${atmClass}">
+      <div class="hero-anchor-bar" id="hero-anchor-bar">
+        <span class="anchor-dot" aria-hidden="true"></span>
+        <span class="hero-anchor-text">${escapeHtml(anchor.anchorBadge || `${nearestRadar.id} · ${state.activeLocation.name}`)}</span>
+        ${anchor.isApproxFix && anchor.gpsAccuracyM != null ? `<span class="badge-amber">Approx GPS ±${Math.round(anchor.gpsAccuracyM)}m</span>` : ''}
+      </div>
       <div class="hero-top">
         <div class="hero-temp-wrap">
           <div class="hero-temp">${c.tempF != null ? `${c.tempF}<span class="hero-deg">°</span>` : '--'}</div>
@@ -2843,8 +3198,8 @@ function renderDashboard() {
       </div>
 
       <div class="hero-status-strip">
-        <span class="hero-meta-chip accent">${c.confidence} Consensus</span>
-        <span class="hero-meta-chip">±${c.spreadF}°F spread</span>
+        <span class="hero-meta-chip accent">${escapeHtml(mosChipText)}</span>
+        <span class="hero-meta-chip">${escapeHtml(confChipText)}</span>
         <span class="hero-meta-chip">${nearestRadar.id} · ${nearestRadar.distanceMi.toFixed(0)} mi</span>
       </div>
 
@@ -2882,11 +3237,24 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- CONVECTIVE & SUPERCELL ENVIRONMENT (PRO 5-LEVEL SOUNDING + STP/SCP/SHIP/QLCS + LIVE HODOGRAPH) -->
-    <div class="card">
+    <!-- MULTI-MODEL CONSENSUS & CALIBRATED CONFIDENCE CARD -->
+    ${renderConsensusCardHtml(cons, mos)}
+
+    <!-- CONVECTIVE, SPC & WOFS-GRADE STORM-SCALE ENGINE -->
+    <div class="card" id="severe-engine-card">
       <div class="card-header">
-        <div class="card-title">${sectionIcon('sounding', env.level === 'high' ? 'amber' : '')}Pro Severe Sounding &amp; HSLC</div>
+        <div class="card-title">${sectionIcon('sounding', env.level === 'high' ? 'amber' : '')}Storm-Scale Severe &amp; WoFS Engine</div>
         <span class="badge-${env.level === 'high' ? 'red' : env.level === 'mod' ? 'amber' : 'green'}">${escapeHtml(env.regime)}</span>
+      </div>
+      <div class="model-timing-banner" id="model-timing-banner">
+        <span class="model-timing-tag">MODEL GUIDANCE</span>
+        <span>${escapeHtml(env.modelTimingBanner || 'HRRR 3km Storm-Scale Guidance')}</span>
+      </div>
+      <div class="convective-mode-row">
+        <span class="badge-${env.convectiveMode && env.convectiveMode !== 'NONE' ? 'amber' : 'muted'}">Mode: ${escapeHtml(env.convectiveModeLabel || 'Stable / Non-Convective')}</span>
+        ${env.nwsThunderProb12h > 0 ? `<span class="badge-cyan">NWS T-Storm ${env.nwsThunderProb12h}%</span>` : ''}
+        ${localWatches.map((w) => `<span class="badge-red">${w.isPds ? 'PDS ' : ''}${escapeHtml(w.type)} Watch${w.num ? ` #${escapeHtml(w.num)}` : ''}</span>`).join('')}
+        ${localConvMcds.map((m) => `<span class="badge-magenta">Local SPC MD${m.num ? ` #${escapeHtml(m.num)}` : ''}</span>`).join('')}
       </div>
       <div class="regime-banner ${env.level}">
         ${escapeHtml(env.nocturnalRisk)}
@@ -2910,9 +3278,9 @@ function renderDashboard() {
       </div>
       <div class="metrics-grid">
         <div class="metric-box">
-          <div class="metric-label">Sig Tor · STP</div>
-          <div class="metric-value">${(env.peakStp12h ?? env.stp ?? 0).toFixed(1)}</div>
-          <div class="metric-sub">Now ${(env.stp ?? 0).toFixed(1)} · 12h Peak</div>
+          <div class="metric-label">Sig Tor · STP / EHI</div>
+          <div class="metric-value">${(env.peakStp12h ?? env.stp ?? 0).toFixed(1)} · ${(env.peakEhi0to1_12h ?? env.ehi0to1Km ?? 0).toFixed(1)}</div>
+          <div class="metric-sub">Now STP ${(env.stp ?? 0).toFixed(1)} · 0–3 EHI ${(env.peakEhi0to3_12h ?? env.ehi0to3Km ?? 0).toFixed(1)}</div>
           ${severityMeter((((env.peakStp12h ?? env.stp ?? 0)) / 3) * 100, (env.peakStp12h ?? env.stp ?? 0) >= 1 ? '#f43f5e' : '#10b981')}
         </div>
         <div class="metric-box">
@@ -2930,9 +3298,9 @@ function renderDashboard() {
       </div>
       <div class="metrics-grid" style="margin-top:8px;">
         <div class="metric-box">
-          <div class="metric-label">CAPE / CIN</div>
+          <div class="metric-label">CAPE / CIN / LI</div>
           <div class="metric-value">${env.peakCape12h}</div>
-          <div class="metric-sub">Now ${env.capeNow} · CIN ${env.cinNow}</div>
+          <div class="metric-sub">CIN ${env.cinNow} · LI ${env.liftedIndexNow != null ? env.liftedIndexNow : '--'}</div>
           ${severityMeter(((env.peakCape12h ?? 0) / 3000) * 100, Math.abs(env.cinNow ?? 0) >= 200 ? '#facc15' : (env.peakCape12h ?? 0) >= 1500 ? '#f59e0b' : '#38bdf8')}
         </div>
         <div class="metric-box">
@@ -2942,9 +3310,9 @@ function renderDashboard() {
           ${severityMeter(((env.bulkShear0to6KmKt ?? 0) / 60) * 100, (env.bulkShear0to6KmKt ?? 0) >= 40 ? '#d946ef' : '#38bdf8')}
         </div>
         <div class="metric-box">
-          <div class="metric-label">LCL / Lapse</div>
-          <div class="metric-value">${env.lclMeters ?? '--'} m</div>
-          <div class="metric-sub">7–5mb: ${env.lapseRate700to500 ?? 5.8}°/km · Peak ${escapeHtml(env.peakThreatTimeLabel || '--')}</div>
+          <div class="metric-label">DCAPE / LCL / LR</div>
+          <div class="metric-value">${env.peakDcape12h ?? env.dcapeProxy ?? 0}</div>
+          <div class="metric-sub">LCL ${env.lclMeters ?? '--'}m · LR ${env.lapseRate700to500 ?? 5.8}°/km</div>
           ${severityMeter((((env.lapseRate700to500 ?? 5.8) - 4) / 5) * 100, (env.lapseRate700to500 ?? 5.8) >= 7.0 ? '#f59e0b' : '#10b981')}
         </div>
       </div>
@@ -2963,6 +3331,18 @@ function renderDashboard() {
           <span>${env.veeringDeg >= 0 ? `+${env.veeringDeg}°` : `${env.veeringDeg}°`} veer · ${state.stormCells.length} verified cell${state.stormCells.length === 1 ? '' : 's'}</span>
         </div>
       </div>
+      <div class="wofs-guidance-box ${wofsActive ? 'active-window' : ''}" id="wofs-guidance-box">
+        <div class="wofs-guidance-head">
+          <span class="wofs-guidance-title">NSSL Cb-WoFS Experimental Storm-Scale</span>
+          <span class="badge-${wofsActive ? 'red' : 'muted'}">${wofsActive ? 'ACTIVE WINDOW 17–03Z' : 'WOFS STANDBY'}</span>
+        </div>
+        <div class="wofs-standby-banner">${escapeHtml(env.wofsStandbyReason || 'WoFS Standby — Experimental NSSL runs operate select severe days 17:00–03:00 UTC.')}</div>
+        <div class="wofs-actions-row">
+          <button type="button" id="btn-open-wofs-modal" class="btn-secondary-sm">Launch WoFS Sheet</button>
+          <a href="${escapeHtml(wofsUrl)}" target="_blank" rel="noopener noreferrer" class="btn-primary-sm wofs-open-btn">Open in NSSL Viewer ↗</a>
+        </div>
+        <div class="wofs-attribution-line">${escapeHtml(wofsAttr)}</div>
+      </div>
     </div>
 
     <!-- 3-DAY SPC SEVERE & WPC FLASH FLOOD STRIP -->
@@ -2980,14 +3360,14 @@ function renderDashboard() {
       </div>
     ` : ''}
 
-    <!-- PRO WINTER, THERMAL COLUMN, GLAZE ICE & WSSI SUITE -->
+    <!-- BOURGOUIN WINTER, THERMAL COLUMN, GLAZE ICE & WSSI SUITE -->
     ${renderProWinterCardHtml(win)}
 
-    <!-- HOURLY FORECAST -->
+    <!-- HOURLY FORECAST (MOS-CORRECTED 5-MODEL CONSENSUS) -->
     <div class="card">
       <div class="card-header">
         <div class="card-title">${sectionIcon('hourly')}Next 18 Hours</div>
-        <span class="badge-muted">NWS NDFD / HRRR-GFS</span>
+        <span class="badge-muted">${escapeHtml(hourlySourceBadge)}</span>
       </div>
       <div class="hourly-strip">
         ${hourlyItems.map((h, i) => `
@@ -3029,8 +3409,9 @@ function renderDashboard() {
     ` : ''}
   `;
 
-  // Draw live 5-level Hodograph canvas & wire SPC/Flood/AFD taps
+  // Draw live 5-level Hodograph canvas & wire SPC/Flood/AFD/WoFS taps
   drawHodographCanvas(env);
+  document.getElementById('btn-open-wofs-modal')?.addEventListener('click', () => openWofsModal(env));
   document.getElementById('afd-preview-card')?.addEventListener('click', () => {
     if (!state.afd) return;
     document.getElementById('afd-modal-title').textContent = `${state.afd.office} Forecast Discussion`;
@@ -3081,8 +3462,9 @@ function outlookColor(cat, isFlood = false) {
 function renderMultiDayOutlookCard(md) {
   const m = md || {
     day1Category: 'NONE', day1TornadoProb: 'NONE', day1HailProb: 'NONE',
-    day1WindProb: 'NONE', day2Category: 'NONE', day3Category: 'NONE',
-    wpcDay1FloodRisk: 'NONE', activeWatches: []
+    day1WindProb: 'NONE', day2Category: 'NONE', day2TornadoProb: 'NONE',
+    day2HailProb: 'NONE', day2WindProb: 'NONE', day3Category: 'NONE',
+    day3Prob: 'NONE', wpcDay1FloodRisk: 'NONE', activeWatches: [], localWatches: [], localMpds: []
   };
   const pill = (title, val, attr, color) => `
     <div class="outlook-pill" ${attr} style="border-color:${val === 'NONE' ? 'rgba(148,163,184,0.16)' : color};">
@@ -3090,11 +3472,27 @@ function renderMultiDayOutlookCard(md) {
       <div class="outlook-pill-val" style="color:${color};">${escapeHtml(val)}</div>
     </div>
   `;
+  const watches = m.localWatches || m.activeWatches || [];
+  const mpds = m.localMpds || [];
+  const showExtendedProbs = (m.day2TornadoProb && m.day2TornadoProb !== 'NONE') ||
+    (m.day2HailProb && m.day2HailProb !== 'NONE') ||
+    (m.day2WindProb && m.day2WindProb !== 'NONE') ||
+    (m.day3Prob && m.day3Prob !== 'NONE');
+  const day2ProbSummary = [
+    m.day2TornadoProb && m.day2TornadoProb !== 'NONE' ? `Tor ${m.day2TornadoProb}` : null,
+    m.day2HailProb && m.day2HailProb !== 'NONE' ? `Hail ${m.day2HailProb}` : null,
+    m.day2WindProb && m.day2WindProb !== 'NONE' ? `Wind ${m.day2WindProb}` : null
+  ].filter(Boolean).join(' · ') || 'NONE';
+
   return `
     <div class="card">
       <div class="card-header">
         <div class="card-title">${sectionIcon('spc', 'amber')}SPC 3-Day Severe &amp; WPC Flood</div>
-        ${m.activeWatches?.length ? `<span class="badge-red">${m.activeWatches.length} ACTIVE WATCH</span>` : '<span class="badge-muted">Tap to View Layer</span>'}
+        ${watches.length
+          ? `<span class="badge-red">${watches.length} LOCAL WATCH</span>`
+          : mpds.length
+            ? `<span class="badge-blue">${mpds.length} LOCAL MPD</span>`
+            : '<span class="badge-muted">Exact Point-in-Polygon</span>'}
       </div>
       <div class="outlook-grid">
         ${pill('Day 1', m.day1Category, 'data-jump-spc="1"', outlookColor(m.day1Category))}
@@ -3107,6 +3505,12 @@ function renderMultiDayOutlookCard(md) {
         ${pill('Day 1 Hail', m.day1HailProb, 'data-jump-spc="5"', m.day1HailProb === 'NONE' ? '#94a3b8' : '#10b981')}
         ${pill('Day 1 Wind', m.day1WindProb, 'data-jump-spc="7"', m.day1WindProb === 'NONE' ? '#94a3b8' : '#facc15')}
       </div>
+      ${showExtendedProbs ? `
+        <div class="prob-sub-row">
+          ${pill('Day 2 Hazards', day2ProbSummary, 'data-jump-spc="9"', day2ProbSummary === 'NONE' ? '#94a3b8' : '#fb8c00')}
+          ${pill('Day 3 Prob / CIG', m.day3Prob || 'NONE', 'data-jump-spc="17"', (m.day3Prob || 'NONE') === 'NONE' ? '#94a3b8' : '#fdd835')}
+        </div>
+      ` : ''}
     </div>
   `;
 }
@@ -3254,10 +3658,50 @@ function drawHodographCanvas(env) {
 }
 
 function buildHourlyItems() {
+  const tz = activeTimeZone();
+  // Spec §9.2 #2: Prefer MOS-corrected 5-model consensus hourly slots
+  const consHourly = state.consensus?.hourly || [];
+  const winterSlots = state.winter?.proWinter?.hourlySlots || [];
+  if (consHourly.length >= 6) {
+    const nwsByHour = new Map();
+    for (const p of state.nwsBundle?.hourlyPeriods || []) {
+      const ms = parseUtcTimestampMs(p.startTime);
+      if (ms != null) nwsByHour.set(Math.floor(ms / 3600000), p);
+    }
+    return consHourly.slice(0, 18).map((slot, i) => {
+      const hrKey = Math.floor(slot.epochMs / 3600000);
+      const nwsMatch = nwsByHour.get(hrKey);
+      const wSlot = winterSlots[i];
+      const hr = getLocalHour24(slot.epochMs, tz) ?? 12;
+      let condText = nwsMatch?.shortForecast || '';
+      if (!condText) {
+        if (wSlot?.pType === 'FREEZING_RAIN') condText = 'Freezing Rain';
+        else if (wSlot?.pType === 'SLEET') condText = 'Sleet';
+        else if (wSlot?.pType === 'ACCUMULATING_SNOW') condText = 'Snow';
+        else if (wSlot?.pType === 'WET_SNOW_MELTING') condText = 'Wet Snow';
+        else if (wSlot?.pType === 'WINTRY_MIX') condText = 'Wintry Mix';
+        else if (slot.thunderProbPct >= 30) condText = 'Thunderstorm';
+        else if (slot.qpfIn >= 0.01 || slot.popPct >= 45) condText = 'Rain';
+        else if (slot.visibilityMi != null && slot.visibilityMi < 1.5) condText = 'Fog';
+        else if (slot.skyCoverPct != null && slot.skyCoverPct >= 75) condText = 'Overcast';
+        else if (slot.skyCoverPct != null && slot.skyCoverPct >= 35) condText = 'Partly Cloudy';
+        else condText = 'Clear';
+      }
+      const isNight = nwsMatch?.isDaytime != null ? !nwsMatch.isDaytime : (hr < 6 || hr >= 18);
+      return {
+        time: i === 0 ? 'Now' : (slot.hourLabel || formatLocalHour(slot.epochMs, tz)),
+        condText,
+        isNight,
+        temp: Math.round(slot.tempF ?? 0),
+        pop: Math.round(slot.popPct ?? 0)
+      };
+    });
+  }
+
   const nwsHourly = state.nwsBundle?.hourlyPeriods || [];
   if (nwsHourly.length >= 6) {
     return nwsHourly.slice(0, 18).map((p, i) => {
-      const label = i === 0 ? 'Now' : formatCentralHour(p.startTime);
+      const label = i === 0 ? 'Now' : formatLocalHour(p.startTime, tz);
       const condText = p.shortForecast || '';
       return {
         time: label,
@@ -3280,14 +3724,14 @@ function buildHourlyItems() {
   if (start < 0) start = 0;
   return om.time.slice(start, start + 18).map((t, i) => {
     const ms = parseUtcTimestampMs(t, { utcOffsetSeconds });
-    const [condText] = wmoInfo(om.weather_code?.[start + i]);
-    const hr = getCentralHour24(ms) ?? 12;
+    const [condText] = wmoInfo(om.weather_code?.[start + i] ?? om.weather_code_ncep_hrrr_conus?.[start + i] ?? om.weather_code_gfs_global?.[start + i]);
+    const hr = getLocalHour24(ms, tz) ?? 12;
     return {
-      time: i === 0 ? 'Now' : formatCentralHour(ms),
+      time: i === 0 ? 'Now' : formatLocalHour(ms, tz),
       condText,
       isNight: hr < 6 || hr >= 18,
-      temp: Math.round(om.temperature_2m?.[start + i] ?? 0),
-      pop: Math.round(om.precipitation_probability?.[start + i] ?? 0)
+      temp: Math.round(om.temperature_2m?.[start + i] ?? om.temperature_2m_ncep_hrrr_conus?.[start + i] ?? 0),
+      pop: Math.round(om.precipitation_probability?.[start + i] ?? om.precipitation_probability_ncep_nbm_conus?.[start + i] ?? 0)
     };
   });
 }
@@ -3297,11 +3741,14 @@ function renderAlerts() {
   const el = document.getElementById('alerts-content');
   if (!el) return;
 
+  const tz = activeTimeZone();
   const localAlerts = state.localAlerts || [];
   const convAlerts = state.environment?.proactiveAlerts || [];
   const winAlerts = state.winter?.winterAlerts || [];
   const cells = state.stormCells || [];
-  const mcds = state.iemIntel?.mcdGeoJson?.features || [];
+  const localMcds = state.multiDaySpc?.localMcds || [];
+  const nearbyMcds = state.multiDaySpc?.nearbyMcds || [];
+  const localMpds = state.multiDaySpc?.localMpds || [];
 
   const parts = [];
 
@@ -3313,7 +3760,7 @@ function renderAlerts() {
         <div class="card alert-card ${cls}">
           <div class="card-header" style="margin-bottom:4px;">
             <span class="badge-${a.tier === 'CRITICAL' ? 'red' : a.tier === 'WINTER' ? 'blue' : 'amber'}">${a.isTornadoEmergency ? 'TORNADO EMERGENCY' : a.isPdsOrObserved ? 'OBSERVED / PDS' : a.tier}</span>
-            <span class="metric-sub">${(a.expiresMs ?? a.expires) ? `Exp ${formatCentralTime(a.expiresMs ?? a.expires)}` : ''}</span>
+            <span class="metric-sub">${(a.expiresMs ?? a.expires) ? `Exp ${formatLocalTime(a.expiresMs ?? a.expires, tz)}` : ''}</span>
           </div>
           <div class="alert-title">${escapeHtml(a.event)}</div>
           <div class="alert-meta">${escapeHtml(a.headline)}</div>
@@ -3411,15 +3858,31 @@ function renderAlerts() {
     }
   }
 
-  if (mcds.length) {
-    parts.push(`<div class="section-mini-label">Active SPC Mesoscale Discussions (${mcds.length})</div>`);
-    for (const m of mcds.slice(0, 6)) {
-      const mp = m.properties || {};
+  if (localMcds.length || nearbyMcds.length) {
+    parts.push(`<div class="section-mini-label">Local &amp; Nearby SPC Mesoscale Discussions (${localMcds.length} local · ${nearbyMcds.length} nearby)</div>`);
+    for (const m of [...localMcds, ...nearbyMcds].slice(0, 6)) {
+      const isWin = m.mdType === 'WINTER';
       parts.push(`
-        <div class="card alert-card tier-supercell">
-          <span class="badge-magenta">SPC MCD #${escapeHtml(mp.num || '')}</span>
-          <div class="alert-title">${escapeHtml(mp.concerning || 'Mesoscale Discussion')}</div>
-          <div class="alert-meta">${escapeHtml(mp.watch_confidence ? `Watch probability: ${mp.watch_confidence}` : 'Active SPC mesoscale analysis polygon shown on Radar.')}</div>
+        <div class="card alert-card ${isWin ? 'tier-winter' : 'tier-supercell'}">
+          <div class="tag-row" style="margin-top:0;">
+            <span class="badge-${isWin ? 'blue' : 'magenta'}">SPC ${isWin ? 'WINTER ' : ''}MD${m.num ? ` #${escapeHtml(m.num)}` : ''}</span>
+            <span class="badge-${m.isLocal ? 'red' : 'muted'}">${m.isLocal ? 'COVERS YOUR LOCATION' : `${fmtFixed(m.distMi, 0)} mi away`}</span>
+          </div>
+          <div class="alert-title">${escapeHtml(m.concerning || 'Mesoscale Discussion')}</div>
+          <div class="alert-meta">${escapeHtml(m.watchConfidence ? `Watch probability: ${m.watchConfidence}` : 'Active SPC mesoscale polygon shown on Radar.')}</div>
+        </div>
+      `);
+    }
+  }
+
+  if (localMpds.length) {
+    parts.push(`<div class="section-mini-label">Local WPC Mesoscale Precipitation Discussions (${localMpds.length})</div>`);
+    for (const m of localMpds.slice(0, 4)) {
+      parts.push(`
+        <div class="card alert-card tier-winter">
+          <span class="badge-blue">WPC FLOOD MPD${m.num ? ` #${escapeHtml(m.num)}` : ''}</span>
+          <div class="alert-title">${escapeHtml(m.concerning || 'Heavy Rain / Flash Flood Threat')}</div>
+          <div class="alert-meta">Covers your location — monitor creek &amp; low-water crossing levels.</div>
         </div>
       `);
     }
@@ -3743,10 +4206,16 @@ function renderSettings() {
       state.settings.convectiveAlertThreshold = btn.dataset.convThresh;
       saveSettings();
       if (state.openMeteo?.hourly && state.current) {
-        const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
-        state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+        const localConvMcdCount = state.multiDaySpc?.localConvectiveMcdCount ?? 0;
+        const hasLocalSevereCell = (state.stormCells || []).some((c) => c.threatScore >= 2);
+        state.environment = analyzeEnvironment(state.openMeteo, state.current, localConvMcdCount, {
           convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
-          nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled
+          nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
+          multiDaySpc: state.multiDaySpc,
+          consensus: state.consensus,
+          modelMeta: state.modelMeta,
+          timeZone: activeTimeZone(),
+          hasLocalSevereCell
         });
         renderDashboard();
         renderAlerts();
@@ -3758,10 +4227,16 @@ function renderSettings() {
     state.settings.nocturnalReadinessEnabled = e.target.checked;
     saveSettings();
     if (state.openMeteo?.hourly && state.current) {
-      const mcdCount = state.iemIntel?.mcdGeoJson?.features?.length || 0;
-      state.environment = analyzeEnvironment(state.openMeteo, state.current, mcdCount, {
+      const localConvMcdCount = state.multiDaySpc?.localConvectiveMcdCount ?? 0;
+      const hasLocalSevereCell = (state.stormCells || []).some((c) => c.threatScore >= 2);
+      state.environment = analyzeEnvironment(state.openMeteo, state.current, localConvMcdCount, {
         convectiveAlertThreshold: state.settings.convectiveAlertThreshold,
-        nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled
+        nocturnalReadinessEnabled: state.settings.nocturnalReadinessEnabled,
+        multiDaySpc: state.multiDaySpc,
+        consensus: state.consensus,
+        modelMeta: state.modelMeta,
+        timeZone: activeTimeZone(),
+        hasLocalSevereCell
       });
       renderDashboard();
     }
@@ -3786,10 +4261,12 @@ function renderSettings() {
         Date.now(),
         {
           gridData: state.nwsBundle?.gridData || null,
-          winterModels: state.winterModels,
+          winterModels: state.openMeteo || state.winterModels,
+          consensus: state.consensus,
           wssiBundle: state.wssiBundle,
           lat: state.activeLocation?.lat,
-          lon: state.activeLocation?.lon
+          lon: state.activeLocation?.lon,
+          timeZone: activeTimeZone()
         }
       );
       updateHeaderAndBadges();

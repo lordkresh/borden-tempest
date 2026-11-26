@@ -1,11 +1,65 @@
+import { haversineMiles } from './geoMath.js';
+
 const NWS_BASE = 'https://api.weather.gov';
 const OPEN_METEO_BASE = 'https://api.open-meteo.com/v1/forecast';
+const OPEN_METEO_HRRR_META_URL = 'https://api.open-meteo.com/data/ncep_hrrr_conus/static/meta.json';
 const GEOCODE_BASE = 'https://geocoding-api.open-meteo.com/v1/search';
 const IEM_BASE = 'https://mesonet.agron.iastate.edu';
+const IEM_SPC_MCD_URL = `${IEM_BASE}/api/1/nws/spc_mcd.geojson`;
+const NOAA_SPC_MCD_URL = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/spc_mesoscale_discussion/MapServer/0/query?where=1%3D1&outFields=*&f=geojson';
+const IEM_SPC_WATCH_URL = `${IEM_BASE}/api/1/spc_watch_outline.geojson`;
+const NWS_WATCH_FALLBACK_URL = `${NWS_BASE}/alerts/active?event=Tornado%20Watch,Severe%20Thunderstorm%20Watch`;
+const IEM_WPC_MPD_URL = `${IEM_BASE}/api/1/nws/wpc_mpd.geojson`;
 const SPC_MAPSERVER_BASE = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer';
 const WPC_ERO_URL = 'https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/0/query?where=1%3D1&outFields=*&f=geojson';
 const WPC_WSSI_BASE = 'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/wpc_wssi/MapServer';
 const SPC_DAY1_FALLBACK_URL = 'https://www.spc.noaa.gov/products/outlook/day1otlk_cat.nolyr.geojson';
+
+export const OPEN_METEO_ENSEMBLE_MODELS = 'ncep_hrrr_conus,ncep_nbm_conus,ecmwf_ifs025,gfs_global';
+export const OPEN_METEO_ENSEMBLE_HOURLY_FIELDS = [
+  'temperature_2m',
+  'dew_point_2m',
+  'wet_bulb_temperature_2m',
+  'relative_humidity_2m',
+  'apparent_temperature',
+  'precipitation',
+  'rain',
+  'showers',
+  'snowfall',
+  'snow_depth',
+  'precipitation_probability',
+  'weather_code',
+  'cloud_cover',
+  'visibility',
+  'wind_speed_10m',
+  'wind_direction_10m',
+  'wind_gusts_10m',
+  'pressure_msl',
+  'surface_pressure',
+  'shortwave_radiation',
+  'freezing_level_height',
+  'soil_temperature_0cm',
+  'soil_temperature_6cm',
+  'cape',
+  'lifted_index',
+  'convective_inhibition',
+  'temperature_925hPa',
+  'temperature_850hPa',
+  'temperature_700hPa',
+  'temperature_500hPa',
+  'geopotential_height_700hPa',
+  'geopotential_height_500hPa',
+  'wind_speed_925hPa',
+  'wind_direction_925hPa',
+  'wind_speed_850hPa',
+  'wind_direction_850hPa',
+  'wind_speed_700hPa',
+  'wind_direction_700hPa',
+  'wind_speed_500hPa',
+  'wind_direction_500hPa',
+  'is_day'
+];
+export const SPC_PIP_LAYERS = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19];
 
 export const DEFAULT_TIME_ZONE = 'America/Chicago';
 export const STALE_THRESHOLD_MS = 15 * 60 * 1000;
@@ -612,6 +666,21 @@ export function getCentralHour24(msOrIso, timeZone = DEFAULT_TIME_ZONE) {
     }
   }
   return date.getUTCHours();
+}
+
+export const formatLocalTime = formatCentralTime;
+export const formatLocalHour = formatCentralHour;
+export const getLocalHour24 = getCentralHour24;
+
+export function getTimeZoneShortName(msOrIso = Date.now(), timeZone = DEFAULT_TIME_ZONE) {
+  const ms = parseUtcTimestampMs(msOrIso) ?? Date.now();
+  const tz = (typeof timeZone === 'string' && timeZone.trim()) ? timeZone.trim() : DEFAULT_TIME_ZONE;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date(ms));
+    return parts.find((p) => p.type === 'timeZoneName')?.value || 'LT';
+  } catch {
+    return 'LT';
+  }
 }
 
 function formatUtcCompact12(ms) {
@@ -1476,21 +1545,56 @@ function assertValidCoords(lat, lon, context = 'lookup') {
   return { lat: numLat, lon: numLon };
 }
 
+function extractElevationMeters(elevObj) {
+  if (!elevObj || typeof elevObj !== 'object') return null;
+  const val = Number(elevObj.value);
+  if (!Number.isFinite(val)) return null;
+  const unit = String(elevObj.unitCode || '').toLowerCase();
+  if (unit.includes('ft') || unit.includes('foot') || unit.includes('feet')) {
+    return val * 0.3048;
+  }
+  return val;
+}
+
+function formatCountyLabel(rawName) {
+  const clean = String(rawName || '').trim();
+  if (!clean) return null;
+  if (/(county|parish|borough|census area|municipality|city)$/i.test(clean)) return clean;
+  return `${clean} County`;
+}
+
+function extractZoneCode(zoneUrl) {
+  const s = String(zoneUrl || '').trim();
+  if (!s) return null;
+  const parts = s.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : null;
+}
+
 export function trimNwsGridData(gridPayload) {
   const props = gridPayload?.properties;
   if (!props || typeof props !== 'object') return null;
   const pickSeries = (key) => {
     const s = props[key];
     if (!s || typeof s !== 'object' || !Array.isArray(s.values)) return null;
-    return { uom: s.uom || '', values: s.values.slice(0, 120) };
+    return { uom: s.uom || '', values: s.values.slice(0, 160) };
   };
   return {
+    elevation: props.elevation || null,
+    temperature: pickSeries('temperature'),
+    dewpoint: pickSeries('dewpoint'),
+    apparentTemperature: pickSeries('apparentTemperature'),
+    probabilityOfPrecipitation: pickSeries('probabilityOfPrecipitation'),
+    quantitativePrecipitation: pickSeries('quantitativePrecipitation'),
     snowfallAmount: pickSeries('snowfallAmount'),
     iceAccumulation: pickSeries('iceAccumulation'),
+    windSpeed: pickSeries('windSpeed'),
+    windGust: pickSeries('windGust'),
     windChill: pickSeries('windChill'),
+    probabilityOfThunder: pickSeries('probabilityOfThunder'),
+    skyCover: pickSeries('skyCover'),
+    visibility: pickSeries('visibility'),
     weather: pickSeries('weather'),
-    snowLevel: pickSeries('snowLevel'),
-    quantitativePrecipitation: pickSeries('quantitativePrecipitation')
+    snowLevel: pickSeries('snowLevel')
   };
 }
 
@@ -1503,7 +1607,6 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
 
   const rLat = numLat.toFixed(4);
   const rLon = numLon.toFixed(4);
-  const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
   const fetchOpts = {
     maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
     retryBaseDelayMs: options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_MS,
@@ -1517,6 +1620,7 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
     6 * 3600 * 1000,
     {
       headers: { Accept: 'application/geo+json' },
+      timeoutMs: options.timeoutMs ?? 10000,
       force,
       validate: (d) => Boolean(d && typeof d === 'object' && d.properties),
       ...fetchOpts
@@ -1524,13 +1628,14 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
   );
   const pointData = pointRes.data;
   const props = pointData?.properties || {};
+  const timeZone = options.timeZone || props.timeZone || DEFAULT_TIME_ZONE;
 
-  const [forecastRes, hourlyRes, stationsRes, gridRes] = await Promise.allSettled([
+  const [forecastRes, hourlyRes, stationsRes, gridRes, countyRes] = await Promise.allSettled([
     props.forecast
-      ? fetchJson(props.forecast, { Accept: 'application/geo+json' }, options.timeoutMs ?? 12000, fetchOpts)
+      ? fetchJson(props.forecast, { Accept: 'application/geo+json' }, options.timeoutMs ?? 10000, fetchOpts)
       : Promise.resolve(null),
     props.forecastHourly
-      ? fetchJson(props.forecastHourly, { Accept: 'application/geo+json' }, options.timeoutMs ?? 12000, fetchOpts)
+      ? fetchJson(props.forecastHourly, { Accept: 'application/geo+json' }, options.timeoutMs ?? 10000, fetchOpts)
       : Promise.resolve(null),
     props.observationStations
       ? ttlFetchJsonWithMeta(
@@ -1539,6 +1644,7 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
           3600 * 1000,
           {
             headers: { Accept: 'application/geo+json' },
+            timeoutMs: options.timeoutMs ?? 8000,
             force,
             validate: (d) => Boolean(d && typeof d === 'object' && Array.isArray(d.features)),
             ...fetchOpts
@@ -1547,6 +1653,20 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
       : Promise.resolve(null),
     props.forecastGridData
       ? fetchJson(props.forecastGridData, { Accept: 'application/geo+json' }, options.timeoutMs ?? 12000, fetchOpts)
+      : Promise.resolve(null),
+    props.county
+      ? ttlFetchJsonWithMeta(
+          `nws_county:${props.county}`,
+          props.county,
+          24 * 3600 * 1000,
+          {
+            headers: { Accept: 'application/geo+json' },
+            timeoutMs: options.countyTimeoutMs ?? 6000,
+            force,
+            validate: (d) => Boolean(d && typeof d === 'object' && d.properties),
+            ...fetchOpts
+          }
+        )
       : Promise.resolve(null)
   ]);
 
@@ -1564,18 +1684,30 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
       const obs = await fetchJson(
         `${NWS_BASE}/stations/${encodeURIComponent(sid)}/observations/latest`,
         { Accept: 'application/geo+json' },
-        options.obsTimeoutMs ?? 8000,
+        options.obsTimeoutMs ?? 7000,
         fetchOpts
       );
       const obsProps = obs?.properties || null;
       const obsMs = parseUtcTimestampMs(obsProps?.timestamp);
+      const coords = Array.isArray(sf.geometry?.coordinates) && sf.geometry.coordinates.length >= 2
+        ? sf.geometry.coordinates
+        : null;
+      const distanceMi = coords
+        ? Number(haversineMiles(numLat, numLon, Number(coords[1]), Number(coords[0])).toFixed(2))
+        : null;
+      const stnElevM = extractElevationMeters(obsProps?.elevation) ?? extractElevationMeters(sf.properties?.elevation);
+      const stnElevFt = stnElevM != null ? Math.round(stnElevM / 0.3048) : null;
       return {
         stationId: sid,
         stationName: sf.properties?.name || sid,
-        coords: sf.geometry?.coordinates || null,
+        coords,
+        distanceMi,
+        elevationM: stnElevM != null ? Number(stnElevM.toFixed(1)) : null,
+        elevationFt: stnElevFt,
         timestampMs: obsMs,
         timestampUtc: obsMs != null ? new Date(obsMs).toISOString() : null,
         timeCentral: formatCentralTime(obsMs, timeZone),
+        timeLocal: formatCentralTime(obsMs, timeZone),
         props: obsProps
       };
     })
@@ -1613,15 +1745,32 @@ export async function fetchNwsPointBundle(lat, lon, force = false, options = {})
   const ageMs = 0;
   const relLoc = props.relativeLocation?.properties;
   const cityLabel = relLoc ? `${relLoc.city}, ${relLoc.state}` : null;
+  const trimmedGrid = gridRes.status === 'fulfilled' ? trimNwsGridData(gridRes.value) : null;
+  const gridElevM = extractElevationMeters(trimmedGrid?.elevation);
+  const countyRawName = countyRes.status === 'fulfilled' ? countyRes.value?.data?.properties?.name : null;
+  const countyName = formatCountyLabel(countyRawName);
+  const wfoId = props.gridId || props.cwa || null;
+  const gridX = Number.isFinite(Number(props.gridX)) ? Number(props.gridX) : null;
+  const gridY = Number.isFinite(Number(props.gridY)) ? Number(props.gridY) : null;
+  const forecastZone = extractZoneCode(props.forecastZone);
 
   return {
     cityLabel,
     stateCode: relLoc?.state || null,
-    cwa: props.cwa || null,
+    countyName,
+    cwa: props.cwa || wfoId,
+    wfoId,
+    gridId: wfoId,
+    gridX,
+    gridY,
+    forecastZone,
     radarStation: props.radarStation || null,
+    timeZone,
+    elevationM: gridElevM != null ? Number(gridElevM.toFixed(1)) : null,
+    elevationFt: gridElevM != null ? Math.round(gridElevM / 0.3048) : null,
     forecastPeriods: forecastRes.status === 'fulfilled' ? (forecastRes.value?.properties?.periods || []) : [],
     hourlyPeriods: hourlyRes.status === 'fulfilled' ? (hourlyRes.value?.properties?.periods || []) : [],
-    gridData: gridRes.status === 'fulfilled' ? trimNwsGridData(gridRes.value) : null,
+    gridData: trimmedGrid,
     observations,
     _meta: {
       source: 'nws-point-bundle',
@@ -1806,7 +1955,9 @@ export async function fetchOpenMeteo(lat, lon, options = {}) {
       'geopotential_height_700hPa',
       'geopotential_height_500hPa',
       'wind_gusts_10m',
+      'cloud_cover',
       'cape',
+      'lifted_index',
       'convective_inhibition',
       'freezing_level_height',
       'soil_temperature_0cm',
@@ -1940,46 +2091,349 @@ export async function fetchWpcFloodOutlook(force = false, options = {}) {
   }
 }
 
-export async function fetchOpenMeteoWinterModels(lat, lon, force = false, options = {}) {
+/**
+ * Single-call 4-model Open-Meteo ensemble (HRRR 3km, NBM 2.5km, ECMWF IFS 0.25°, GFS Global 0.25°)
+ * with all 41 surface, upper-air, convective, and soil fields (Spec §2.1 & §2.2).
+ */
+export async function fetchOpenMeteoEnsemble(lat, lon, force = false, options = {}) {
   if (typeof force === 'object' && force !== null) {
     options = force;
     force = Boolean(options.force);
   } else {
     force = Boolean(force || options?.force);
   }
-  const { lat: rLat, lon: rLon } = assertValidCoords(lat, lon, 'Open-Meteo winter models lookup');
+  const { lat: rLat, lon: rLon } = assertValidCoords(lat, lon, 'Open-Meteo 4-model ensemble lookup');
   const qLat = rLat.toFixed(4);
   const qLon = rLon.toFixed(4);
+  const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
+
   const params = new URLSearchParams({
     latitude: qLat,
     longitude: qLon,
-    models: 'gfs_hrrr,gfs_seamless,ecmwf_ifs025',
+    models: OPEN_METEO_ENSEMBLE_MODELS,
+    hourly: OPEN_METEO_ENSEMBLE_HOURLY_FIELDS.join(','),
     temperature_unit: 'fahrenheit',
+    wind_speed_unit: 'mph',
     precipitation_unit: 'inch',
     timezone: 'UTC',
-    forecast_days: '3',
-    hourly: [
-      'temperature_2m',
-      'wet_bulb_temperature_2m',
-      'precipitation',
-      'rain',
-      'snowfall',
-      'snow_depth',
-      'weather_code',
-      'temperature_925hPa',
-      'temperature_850hPa'
-    ].join(',')
+    past_hours: '6',
+    forecast_days: '5'
   });
   const url = `${OPEN_METEO_BASE}?${params.toString()}`;
-  return ttlFetchJson(`om_wint_models:${qLat},${qLon}`, url, 10 * 60 * 1000, {
+  const res = await ttlFetchJsonWithMeta(`om_ens4:${qLat},${qLon}`, url, 5 * 60 * 1000, {
     timeoutMs: options.timeoutMs ?? 12000,
     force,
-    validate: (d) => Boolean(d && typeof d === 'object' && d.hourly && typeof d.hourly === 'object'),
+    validate: (d) => Boolean(d && typeof d === 'object' && d.hourly && Array.isArray(d.hourly.time)),
     maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
     retryBaseDelayMs: options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_MS,
     fetchImpl: options.fetchImpl ?? null,
     signal: options.signal ?? null
   });
+
+  const data = res.data;
+  const fetchedAtMs = parseUtcTimestampMs(options.nowMs) ?? res.fetchedAtMs ?? Date.now();
+  const utcOffsetSeconds = Number.isFinite(data.utc_offset_seconds) ? data.utc_offset_seconds : 0;
+  const timeMs = [];
+  const normalizedTimes = (data.hourly.time || []).map((t) => {
+    const ms = parseUtcTimestampMs(t, { utcOffsetSeconds });
+    timeMs.push(ms);
+    return ms != null ? new Date(ms).toISOString() : t;
+  });
+
+  let latestModelTimeMs = null;
+  if (data.current?.time != null) {
+    latestModelTimeMs = parseUtcTimestampMs(data.current.time, { utcOffsetSeconds });
+  }
+  if (latestModelTimeMs == null) {
+    let latestPastHourlyMs = null;
+    for (const ms of timeMs) {
+      if (ms != null && ms <= fetchedAtMs && (latestPastHourlyMs == null || ms > latestPastHourlyMs)) {
+        latestPastHourlyMs = ms;
+      }
+    }
+    // Hourly model grids step on the top of each hour (:00); treat as fresh when current hour is covered (<= 65m)
+    if (latestPastHourlyMs != null) {
+      latestModelTimeMs = (fetchedAtMs - latestPastHourlyMs <= 65 * 60000) ? fetchedAtMs : latestPastHourlyMs;
+    }
+  }
+  const effectiveMs = latestModelTimeMs != null ? Math.min(fetchedAtMs, latestModelTimeMs) : fetchedAtMs;
+  const ageMs = Math.max(0, fetchedAtMs - effectiveMs);
+  const ageMinutes = Number((ageMs / 60000).toFixed(1));
+
+  return {
+    ...data,
+    hourly: {
+      ...data.hourly,
+      time: normalizedTimes,
+      timeMs
+    },
+    _meta: {
+      source: 'open-meteo-ensemble-4model',
+      models: OPEN_METEO_ENSEMBLE_MODELS.split(','),
+      fetchedAtMs,
+      fetchedAtUtc: new Date(fetchedAtMs).toISOString(),
+      fetchedAtCentral: formatCentralTime(fetchedAtMs, timeZone),
+      latestModelTimeMs,
+      latestModelTimeUtc: latestModelTimeMs != null ? new Date(latestModelTimeMs).toISOString() : null,
+      latestModelTimeCentral: formatCentralTime(latestModelTimeMs, timeZone),
+      ageMs,
+      ageMinutes,
+      isStale: ageMs > STALE_THRESHOLD_MS
+    }
+  };
+}
+
+export async function fetchOpenMeteoWinterModels(lat, lon, force = false, options = {}) {
+  return fetchOpenMeteoEnsemble(lat, lon, force, options);
+}
+
+/**
+ * Formats a UTC epoch ms / ISO timestamp strictly in 24-hour UTC ("22:00 UTC").
+ */
+export function formatUtcClock(msOrIso) {
+  const ms = parseUtcTimestampMs(msOrIso);
+  if (ms == null) return '-- UTC';
+  const d = new Date(ms);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${hh}:${mm} UTC`;
+}
+
+/**
+ * Lightweight (~400 B) operational model initialization metadata from Open-Meteo static/meta.json
+ * (Spec §2.4: HRRR 3 km init time, strict 5s timeout, async non-blocking, graceful null fallback).
+ */
+export async function fetchOpenMeteoModelMeta(force = false, options = {}) {
+  if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  } else {
+    force = Boolean(force || options?.force);
+  }
+  const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
+  try {
+    const res = await ttlFetchJsonWithMeta('om_hrrr_meta', OPEN_METEO_HRRR_META_URL, 5 * 60 * 1000, {
+      timeoutMs: options.timeoutMs ?? 5000,
+      force,
+      maxRetries: options.maxRetries ?? 1,
+      retryBaseDelayMs: options.retryBaseDelayMs ?? 200,
+      validate: (d) => Boolean(d && typeof d === 'object' && Number.isFinite(Number(d.last_run_initialisation_time))),
+      fetchImpl: options.fetchImpl ?? null,
+      signal: options.signal ?? null
+    });
+    const raw = res?.data;
+    const initSec = Number(raw?.last_run_initialisation_time);
+    const initTimeMs = Number.isFinite(initSec) ? parseUtcTimestampMs(initSec) : null;
+    if (initTimeMs == null) return null;
+    const updateIntervalSec = Number.isFinite(Number(raw?.update_interval_seconds))
+      ? Number(raw.update_interval_seconds)
+      : 3600;
+    return {
+      model: 'HRRR 3km',
+      modelSlug: 'ncep_hrrr_conus',
+      initTimeMs,
+      initTimeUtc: new Date(initTimeMs).toISOString(),
+      initTimeUtcLabel: formatUtcClock(initTimeMs),
+      initTimeLocalLabel: formatCentralTime(initTimeMs, timeZone),
+      updateIntervalSec,
+      fetchedAtMs: res.fetchedAtMs ?? Date.now(),
+      source: 'open-meteo-static-meta'
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getAttrCI(attrs, ...keys) {
+  if (!attrs || typeof attrs !== 'object') return null;
+  for (const k of keys) {
+    if (attrs[k] !== undefined && attrs[k] !== null && attrs[k] !== '') return attrs[k];
+  }
+  const lowerMap = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    lowerMap[k.toLowerCase()] = v;
+  }
+  for (const k of keys) {
+    const v = lowerMap[k.toLowerCase()];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return null;
+}
+
+function parseSpcCatLabel(raw) {
+  const s = String(raw || '').trim().toUpperCase();
+  if (!s) return 'NONE';
+  if (s.includes('HIGH')) return 'HIGH';
+  if (s.includes('MDT') || s.includes('MODERATE')) return 'MDT';
+  if (s.includes('ENH')) return 'ENH';
+  if (s.includes('SLGT') || s.includes('SLIGHT')) return 'SLGT';
+  if (s.includes('MRGL') || s.includes('MARGINAL')) return 'MRGL';
+  if (s.includes('TSTM')) return 'TSTM';
+  return 'NONE';
+}
+
+function parseSpcCigLabel(raw) {
+  const s = String(raw || '').trim().toUpperCase();
+  if (!s) return 'NONE';
+  if (s.includes('CIG3')) return 'CIG3';
+  if (s.includes('CIG2')) return 'CIG2';
+  if (s.includes('CIG1')) return 'CIG1';
+  if (s.includes('SIGN') || s.includes('SIG')) return 'SIGN';
+  return 'NONE';
+}
+
+function spcCigRank(cig) {
+  if (cig === 'CIG3') return 3;
+  if (cig === 'CIG2') return 2;
+  if (cig === 'CIG1' || cig === 'SIGN') return 1;
+  return 0;
+}
+
+function extractSpcCatFromArcGis(payload) {
+  const rankMap = { NONE: 0, TSTM: 1, MRGL: 2, SLGT: 3, ENH: 4, MDT: 5, HIGH: 6 };
+  let best = 'NONE';
+  for (const f of payload?.features || []) {
+    const attrs = f?.attributes || f?.properties || {};
+    const raw = getAttrCI(attrs, 'label', 'label2', 'outlook');
+    const norm = parseSpcCatLabel(raw);
+    if ((rankMap[norm] || 0) > (rankMap[best] || 0)) best = norm;
+  }
+  return best;
+}
+
+function extractSpcProbFromArcGis(payload) {
+  let bestPct = 0;
+  let inlineCig = 'NONE';
+  for (const f of payload?.features || []) {
+    const attrs = f?.attributes || f?.properties || {};
+    const raw = String(getAttrCI(attrs, 'label', 'label2', 'dn') ?? '').trim().toUpperCase();
+    if (!raw) continue;
+    const cig = parseSpcCigLabel(raw);
+    if (spcCigRank(cig) > spcCigRank(inlineCig)) inlineCig = cig;
+    const n = parseFloat(raw.replace('%', ''));
+    if (Number.isFinite(n) && n > 0) {
+      const pct = n <= 1 ? Math.round(n * 100) : Math.round(n);
+      if (pct > bestPct) bestPct = pct;
+    }
+  }
+  return { pct: bestPct, inlineCig };
+}
+
+function extractSpcCigFromArcGis(payload) {
+  let best = 'NONE';
+  for (const f of payload?.features || []) {
+    const attrs = f?.attributes || f?.properties || {};
+    const raw = getAttrCI(attrs, 'label', 'label2', 'dn');
+    const cig = parseSpcCigLabel(raw);
+    if (spcCigRank(cig) > spcCigRank(best)) best = cig;
+  }
+  return best;
+}
+
+function formatSpcProbWithCig(pct, cig) {
+  if (!pct || pct <= 0) return 'NONE';
+  if (cig && cig !== 'NONE') return `${pct}% ${cig}`;
+  return `${pct}%`;
+}
+
+/**
+ * Exact server-side ArcGIS Point-in-Polygon SPC Day 1–3 Cat/Prob/2026 CIG queries (Spec §2.1, §2.3, §6.1).
+ */
+export async function fetchSpcPointOutlooks(lat, lon, force = false, options = {}) {
+  if (typeof force === 'object' && force !== null) {
+    options = force;
+    force = Boolean(options.force);
+  }
+  const { lat: numLat, lon: numLon } = assertValidCoords(lat, lon, 'SPC point-in-polygon lookup');
+  const rLat = numLat.toFixed(4);
+  const rLon = numLon.toFixed(4);
+  const cacheKey = `spc_pip:${rLat},${rLon}`;
+  if (!force) {
+    const cached = RESPONSE_CACHE.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) return cached.data;
+  }
+
+  const sharedOpts = {
+    timeoutMs: options.timeoutMs ?? 9000,
+    maxRetries: options.maxRetries ?? 1,
+    retryBaseDelayMs: options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_MS,
+    fetchImpl: options.fetchImpl ?? null,
+    signal: options.signal ?? null
+  };
+
+  const results = await Promise.allSettled(
+    SPC_PIP_LAYERS.map((layerId) => {
+      const url = `${SPC_MAPSERVER_BASE}/${layerId}/query?geometry=${encodeURIComponent(`${rLon},${rLat}`)}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=*&returnGeometry=false&f=json`;
+      return fetchJson(url, {}, sharedOpts.timeoutMs, sharedOpts);
+    })
+  );
+
+  const byLayer = {};
+  let succeededCount = 0;
+  SPC_PIP_LAYERS.forEach((layerId, i) => {
+    const r = results[i];
+    if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.features)) {
+      byLayer[layerId] = r.value;
+      succeededCount += 1;
+    } else {
+      byLayer[layerId] = null;
+    }
+  });
+
+  const d1Tor = extractSpcProbFromArcGis(byLayer[3]);
+  const d1TorCig = spcCigRank(extractSpcCigFromArcGis(byLayer[2])) >= spcCigRank(d1Tor.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[2]) : d1Tor.inlineCig;
+  const d1Hail = extractSpcProbFromArcGis(byLayer[5]);
+  const d1HailCig = spcCigRank(extractSpcCigFromArcGis(byLayer[4])) >= spcCigRank(d1Hail.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[4]) : d1Hail.inlineCig;
+  const d1Wind = extractSpcProbFromArcGis(byLayer[7]);
+  const d1WindCig = spcCigRank(extractSpcCigFromArcGis(byLayer[6])) >= spcCigRank(d1Wind.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[6]) : d1Wind.inlineCig;
+
+  const d2Tor = extractSpcProbFromArcGis(byLayer[11]);
+  const d2TorCig = spcCigRank(extractSpcCigFromArcGis(byLayer[10])) >= spcCigRank(d2Tor.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[10]) : d2Tor.inlineCig;
+  const d2Hail = extractSpcProbFromArcGis(byLayer[13]);
+  const d2HailCig = spcCigRank(extractSpcCigFromArcGis(byLayer[12])) >= spcCigRank(d2Hail.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[12]) : d2Hail.inlineCig;
+  const d2Wind = extractSpcProbFromArcGis(byLayer[15]);
+  const d2WindCig = spcCigRank(extractSpcCigFromArcGis(byLayer[14])) >= spcCigRank(d2Wind.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[14]) : d2Wind.inlineCig;
+
+  const d3Prob = extractSpcProbFromArcGis(byLayer[19]);
+  const d3Cig = spcCigRank(extractSpcCigFromArcGis(byLayer[18])) >= spcCigRank(d3Prob.inlineCig)
+    ? extractSpcCigFromArcGis(byLayer[18]) : d3Prob.inlineCig;
+
+  const out = {
+    day1Category: extractSpcCatFromArcGis(byLayer[1]),
+    day1TornadoProb: formatSpcProbWithCig(d1Tor.pct, d1TorCig),
+    day1TornadoCig: d1TorCig,
+    day1HailProb: formatSpcProbWithCig(d1Hail.pct, d1HailCig),
+    day1HailCig: d1HailCig,
+    day1WindProb: formatSpcProbWithCig(d1Wind.pct, d1WindCig),
+    day1WindCig: d1WindCig,
+    day2Category: extractSpcCatFromArcGis(byLayer[9]),
+    day2TornadoProb: formatSpcProbWithCig(d2Tor.pct, d2TorCig),
+    day2TornadoCig: d2TorCig,
+    day2HailProb: formatSpcProbWithCig(d2Hail.pct, d2HailCig),
+    day2HailCig: d2HailCig,
+    day2WindProb: formatSpcProbWithCig(d2Wind.pct, d2WindCig),
+    day2WindCig: d2WindCig,
+    day3Category: extractSpcCatFromArcGis(byLayer[17]),
+    day3Prob: formatSpcProbWithCig(d3Prob.pct, d3Cig),
+    day3Cig: d3Cig,
+    _meta: {
+      source: 'spc-mapserver-pip',
+      fetchedAtMs: Date.now(),
+      succeededCount,
+      totalLayers: SPC_PIP_LAYERS.length,
+      degraded: succeededCount === 0
+    }
+  };
+  if (succeededCount > 0) {
+    setCacheEntry(cacheKey, out, 15 * 60 * 1000, out._meta.fetchedAtMs);
+  }
+  return out;
 }
 
 async function fetchWpcWssiLayerWithStatus(layerId = 4, force = false, options = {}) {
@@ -2119,6 +2573,56 @@ export async function fetchNwsAfd(cwa, force = false, options = {}) {
   }
 }
 
+function normalizeNwsWatchesToFeatureCollection(nwsFc) {
+  if (!isValidFeatureCollection(nwsFc)) return { type: 'FeatureCollection', features: [] };
+  return {
+    type: 'FeatureCollection',
+    features: nwsFc.features.map((f) => {
+      const p = f?.properties || {};
+      const ev = String(p.event || '').toUpperCase();
+      const desc = `${p.headline || ''} ${p.description || ''}`.toUpperCase();
+      const isTor = ev.includes('TORNADO');
+      const isPds = desc.includes('PARTICULARLY DANGEROUS SITUATION');
+      const numMatch = desc.match(/WATCH\s+(?:NUMBER\s+|#)?(\d{1,4})/i);
+      return {
+        type: 'Feature',
+        geometry: f.geometry || null,
+        properties: {
+          ...p,
+          num: p.num || (numMatch ? numMatch[1] : ''),
+          type: isTor ? 'TOR' : 'SVR',
+          is_pds: isPds,
+          pds: isPds ? 'Y' : 'N',
+          issue: p.effective || p.sent || null,
+          expire: p.expires || p.ends || null
+        }
+      };
+    })
+  };
+}
+
+async function fetchSpcMcdsWithFallback(force, sharedOpts) {
+  try {
+    return await ttlFetchJson('iem_mcd_v1', IEM_SPC_MCD_URL, 60000, { ...sharedOpts, timeoutMs: Math.min(sharedOpts.timeoutMs, 9000), force });
+  } catch {
+    return ttlFetchJson('noaa_mcd_fb', NOAA_SPC_MCD_URL, 60000, { ...sharedOpts, timeoutMs: Math.min(sharedOpts.timeoutMs, 9000), force });
+  }
+}
+
+async function fetchSpcWatchesWithFallback(force, sharedOpts) {
+  try {
+    return await ttlFetchJson('iem_watch_v1', IEM_SPC_WATCH_URL, 60000, { ...sharedOpts, timeoutMs: Math.min(sharedOpts.timeoutMs, 9000), force });
+  } catch {
+    const raw = await ttlFetchJson('nws_watch_fb', NWS_WATCH_FALLBACK_URL, 120000, {
+      ...sharedOpts,
+      headers: { Accept: 'application/geo+json' },
+      timeoutMs: Math.min(sharedOpts.timeoutMs, 8000),
+      force
+    });
+    return normalizeNwsWatchesToFeatureCollection(raw);
+  }
+}
+
 export async function fetchIemStormIntel(spcOverlayLayerId = 1, options = {}) {
   const includeFlood = typeof options === 'boolean' ? options : Boolean(options?.includeFlood);
   const force = typeof options === 'object' ? Boolean(options?.force) : false;
@@ -2139,13 +2643,14 @@ export async function fetchIemStormIntel(spcOverlayLayerId = 1, options = {}) {
   const validCachedWpc = (cachedWpc && Date.now() < cachedWpc.expiresAt) ? cachedWpc.data : empty;
 
   const [
-    cellsRes, lsrRes, mcdRes, watchRes, wpcRes,
+    cellsRes, lsrRes, mcdRes, watchRes, mpdRes, wpcRes,
     spcOverlayRes, spcDay1Res, spcTorRes, spcHailRes, spcWindRes, spcDay2Res, spcDay3Res
   ] = await Promise.allSettled([
     ttlFetchJsonWithMeta('iem_cells', `${IEM_BASE}/geojson/nexrad_attr.geojson`, 40000, sharedOpts),
-    ttlFetchJson('iem_lsr', `${IEM_BASE}/geojson/lsr.geojson?hours=6`, 40000, sharedOpts),
-    ttlFetchJson('iem_mcd', `${IEM_BASE}/geojson/mcd.geojson`, 40000, sharedOpts),
-    ttlFetchJson('iem_watch', `${IEM_BASE}/geojson/spc_watch.geojson`, 40000, sharedOpts),
+    ttlFetchJson('iem_lsr', `${IEM_BASE}/geojson/lsr.geojson?hours=6`, 60000, sharedOpts),
+    fetchSpcMcdsWithFallback(force, sharedOpts),
+    fetchSpcWatchesWithFallback(force, sharedOpts),
+    ttlFetchJson('iem_wpc_mpd_v1', IEM_WPC_MPD_URL, 120000, { ...sharedOpts, timeoutMs: Math.min(sharedOpts.timeoutMs, 9000) }),
     includeFlood ? fetchWpcFloodOutlook(force, sharedOpts) : Promise.resolve(validCachedWpc),
     fetchSpcOverlayLayer(spcOverlayLayerId, force, sharedOpts),
     spcOverlayLayerId === 1 ? Promise.resolve(null) : fetchSpcOverlayLayer(1, force, sharedOpts),
@@ -2186,6 +2691,7 @@ export async function fetchIemStormIntel(spcOverlayLayerId = 1, options = {}) {
   if (lsrRes.status !== 'fulfilled') degradedFeeds.push('lsr');
   if (mcdRes.status !== 'fulfilled') degradedFeeds.push('mcd');
   if (watchRes.status !== 'fulfilled') degradedFeeds.push('spcWatches');
+  if (mpdRes.status !== 'fulfilled') degradedFeeds.push('wpcMpd');
   if (wpcRes.status !== 'fulfilled') degradedFeeds.push('wpcFlood');
   if (spcOverlayRes.status !== 'fulfilled') degradedFeeds.push('spcOverlay');
 
@@ -2194,6 +2700,7 @@ export async function fetchIemStormIntel(spcOverlayLayerId = 1, options = {}) {
   if (lsrRes.status === 'fulfilled') succeededFeeds.push('lsr');
   if (mcdRes.status === 'fulfilled') succeededFeeds.push('mcd');
   if (watchRes.status === 'fulfilled') succeededFeeds.push('spcWatches');
+  if (mpdRes.status === 'fulfilled') succeededFeeds.push('wpcMpd');
   if (includeFlood && wpcRes.status === 'fulfilled' && wpcRes.value?.features?.length) succeededFeeds.push('wpcFlood');
   if (spcOverlayRes.status === 'fulfilled' && overlayGeo?.features?.length) succeededFeeds.push('spcOverlay');
 
@@ -2202,6 +2709,7 @@ export async function fetchIemStormIntel(spcOverlayLayerId = 1, options = {}) {
     lsrGeoJson: lsrRes.status === 'fulfilled' ? lsrRes.value : empty,
     mcdGeoJson: mcdRes.status === 'fulfilled' ? mcdRes.value : empty,
     spcWatchesGeoJson: watchRes.status === 'fulfilled' ? watchRes.value : empty,
+    wpcMpdGeoJson: mpdRes.status === 'fulfilled' ? mpdRes.value : empty,
     wpcFloodGeoJson: wpcRes.status === 'fulfilled' ? wpcRes.value : empty,
     spcOverlayGeoJson: overlayGeo,
     spcDay1GeoJson: day1CatGeo,

@@ -1501,6 +1501,7 @@ export class RadarMapController {
       source: 'tempest_range_rings_labels',
       layout: {
         'text-field': ['get', 'label'],
+        'text-font': ['Noto Sans Regular'],
         'text-size': 10,
         'text-anchor': 'bottom'
       },
@@ -1597,6 +1598,7 @@ export class RadarMapController {
       source: 'tempest_cells',
       layout: {
         'text-field': ['get', 'label'],
+        'text-font': ['Noto Sans Regular'],
         'text-size': 11,
         'text-offset': [0, 1.45],
         'text-anchor': 'top',

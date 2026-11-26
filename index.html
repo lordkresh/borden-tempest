@@ -332,6 +332,33 @@
     </div>
   </div>
 
+  <!-- NSSL Cb-WoFS Storm-Scale Viewer Modal (Spec §2.4: Framing Fallback + Verbatim NSSL Attribution) -->
+  <div id="wofs-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="NSSL Cb-WoFS Storm-Scale Viewer">
+    <div class="modal-card wofs-modal-card">
+      <div class="sheet-header">
+        <div>
+          <h3>NSSL Cb-WoFS Viewer</h3>
+          <div id="wofs-modal-sub" class="header-status-sub">Experimental 0–6h Storm-Scale Guidance (17:00–03:00 UTC)</div>
+        </div>
+        <button id="btn-close-wofs-modal" type="button" class="icon-btn-sm" aria-label="Close WoFS Viewer">✕</button>
+      </div>
+      <div id="wofs-modal-timing" class="model-timing-banner"></div>
+      <div id="wofs-modal-status" class="wofs-standby-banner"></div>
+      <div class="wofs-fallback-bar">
+        <div class="wofs-fallback-copy">
+          NSSL enforces <code>X-Frame-Options: DENY</code> on <code>cbwofs.nssl.noaa.gov</code>, so browsers may block inline embedding. Open directly in Safari/Browser for full interactive WoFS maps:
+        </div>
+        <a id="wofs-external-link" href="https://cbwofs.nssl.noaa.gov/forecast" target="_blank" rel="noopener noreferrer" class="btn-primary-sm wofs-open-btn">
+          Open in NSSL Viewer ↗
+        </a>
+      </div>
+      <div class="wofs-iframe-wrap">
+        <iframe id="wofs-iframe" class="wofs-iframe" title="NSSL Cb-WoFS Forecast Viewer" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+      </div>
+      <div class="wofs-attribution-line">WoFS data courtesy of the National Severe Storms Laboratory using federal funding.</div>
+    </div>
+  </div>
+
   <!-- Active Test / Live Alert Overlay Modal -->
   <div id="alert-popup-modal" class="modal-backdrop hidden" role="alertdialog" aria-modal="true">
     <div class="modal-card alert-popup-card" id="alert-popup-card">

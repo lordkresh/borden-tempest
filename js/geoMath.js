@@ -29,6 +29,11 @@ export function haversineMiles(lat1, lon1, lat2, lon2) {
   return 2 * EARTH_RADIUS_MI * Math.asin(Math.sqrt(clamped));
 }
 
+export function haversineKm(lat1, lon1, lat2, lon2) {
+  const mi = haversineMiles(lat1, lon1, lat2, lon2);
+  return Number.isFinite(mi) ? mi * 1.609344 : NaN;
+}
+
 export function initialBearingDeg(lat1, lon1, lat2, lon2) {
   if (!isValidLatLon(lat1, lon1) || !isValidLatLon(lat2, lon2)) return NaN;
   const phi1 = lat1 * DEG2RAD;
